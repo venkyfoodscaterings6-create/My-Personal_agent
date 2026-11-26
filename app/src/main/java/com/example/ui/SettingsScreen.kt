@@ -47,6 +47,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -62,6 +63,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -90,8 +92,11 @@ import com.example.AgentQuickSettingsTileService
 import com.example.AgentUiState
 import com.example.AiProvider
 import com.example.ApiFormat
+import com.example.BuiltInGeminiSettings
 import com.example.DefaultQuickChips
 import com.example.EndpointResolver
+import com.example.GeminiBuiltInModel
+import com.example.GeminiVoicePersona
 import com.example.ProviderPresets
 import com.example.R
 import com.example.SafetyRules
@@ -99,16 +104,21 @@ import com.example.SettingsFocusSection
 import com.example.ThemePreference
 import com.example.VoiceLanguage
 import com.example.VoiceSettings
+import com.example.WakeSensitivity
 import com.example.ui.theme.MonoCodeStyle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     uiState: AgentUiState,
     onBack: () -> Unit,
+    onSelectBuiltInGemini: (GeminiBuiltInModel) -> Unit,
+    onUpdateBuiltInGeminiSettings: ((BuiltInGeminiSettings) -> BuiltInGeminiSettings) -> Unit,
+    onOpenMemoryDatabase: () -> Unit,
     onSaveProvider: (
         existingId: String?,
         displayName: String,
@@ -128,6 +138,7 @@ fun SettingsScreen(
     onToggleWakeWord: (Boolean) -> Unit,
     onUpdateWakePhrase: (String) -> Unit,
     onTestVoiceWakeUp: () -> Unit,
+    onTestVoice: () -> Unit,
     onShowMessage: (String) -> Unit,
     onOpenPermissionsCenter: () -> Unit,
     onSetThemePreference: (ThemePreference) -> Unit,
@@ -192,6 +203,65 @@ fun SettingsScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // SECTION 0: Built-in Gemini AI, Google Search Grounding & SQL Memory
+            item(key = "section_builtin_gemini") {
+                FlatSettingsSection(
+                    title = "Built-in Gemini AI & SQL Memory",
+                    subtitle = "Works instantly with Firebase AI Logic (no API key needed) alongside your custom providers.",
+                    headerAction = {
+                        FilledTonalButton(
+                            onClick = onOpenMemoryDatabase,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.testTag("settings_open_sql_db_button")
+                        ) {
+                            Text("SQL DB")
+                        }
+                    }
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            GeminiBuiltInModel.entries.forEach { model ->
+                                val selected = uiState.isUsingBuiltInGemini &&
+                                    uiState.builtInGeminiSettings.selectedModel == model
+                                InputChip(
+                                    selected = selected,
+                                    onClick = { onSelectBuiltInGemini(model) },
+                                    label = { Text(model.displayName) },
+                                    modifier = Modifier.testTag("settings_gemini_${model.name.lowercase()}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                        FlatSafetyToggle(
+                            title = "Google Search Grounding (Live Web Facts)",
+                            subtitle = "Grounds Gemini chat and Live Voice answers in real-time Google Search with clickable source citations.",
+                            checked = uiState.builtInGeminiSettings.googleSearchEnabled,
+                            onCheckedChange = { checked ->
+                                onUpdateBuiltInGeminiSettings { it.copy(googleSearchEnabled = checked) }
+                            },
+                            testTag = "toggle_google_search_grounding"
+                        )
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                        FlatSafetyToggle(
+                            title = "Personalize with on-device SQL Memory & Tasks",
+                            subtitle = "${uiState.memories.size} memories · ${uiState.openTasksCount} open tasks · ${uiState.sqlLogs.size} SQL logs stored locally.",
+                            checked = uiState.builtInGeminiSettings.injectSqlMemory,
+                            onCheckedChange = { checked ->
+                                onUpdateBuiltInGeminiSettings { it.copy(injectSqlMemory = checked) }
+                            },
+                            testTag = "toggle_inject_sql_memory"
+                        )
+                    }
+                }
+            }
+
             // SECTION 1: Custom AI Providers
             item(key = "section_providers") {
                 FlatSettingsSection(
@@ -360,6 +430,47 @@ fun SettingsScreen(
                                 }
                             }
 
+                            Text(
+                                text = "Background Mic Sensitivity (Adaptive Noise Filter)",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
+                                    .padding(3.dp),
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                WakeSensitivity.entries.forEach { preset ->
+                                    val selected = uiState.voiceSettings.wakeSensitivity == preset
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(36.dp)
+                                            .clip(RoundedCornerShape(9.dp))
+                                            .background(
+                                                if (selected) MaterialTheme.colorScheme.primary
+                                                else MaterialTheme.colorScheme.surface.copy(alpha = 0f)
+                                            )
+                                            .clickable {
+                                                onUpdateVoiceSettings { it.copy(wakeSensitivity = preset) }
+                                            }
+                                            .testTag("wake_sensitivity_${preset.name.lowercase()}"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = preset.displayName,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (selected) MaterialTheme.colorScheme.onPrimary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -511,6 +622,100 @@ fun SettingsScreen(
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
 
+                        // Voice Studio: Gemini Neural Voice, Persona, Speech Speed & Test Voice
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+                                .border(
+                                    width = 1.dp,
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            FlatSafetyToggle(
+                                title = stringResource(R.string.settings_neural_voice_title),
+                                subtitle = stringResource(R.string.settings_neural_voice_subtitle),
+                                checked = uiState.voiceSettings.useGeminiNeuralVoice,
+                                onCheckedChange = { checked ->
+                                    onUpdateVoiceSettings { it.copy(useGeminiNeuralVoice = checked) }
+                                },
+                                testTag = "toggle_neural_voice"
+                            )
+
+                            Text(
+                                text = "Voice Persona",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                GeminiVoicePersona.entries.forEach { persona ->
+                                    val selected = uiState.voiceSettings.voicePersona == persona
+                                    InputChip(
+                                        selected = selected,
+                                        onClick = {
+                                            onUpdateVoiceSettings { it.copy(voicePersona = persona) }
+                                        },
+                                        label = { Text("${persona.displayName} · ${persona.styleHint}") },
+                                        modifier = Modifier.testTag("voice_persona_${persona.name.lowercase()}")
+                                    )
+                                }
+                            }
+
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "Speech Speed",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        text = String.format(Locale.US, "%.2fx", uiState.voiceSettings.speechRate),
+                                        style = MonoCodeStyle,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                Slider(
+                                    value = uiState.voiceSettings.speechRate.coerceIn(0.85f, 1.30f),
+                                    onValueChange = { value ->
+                                        val snapped = (Math.round(value * 20f) / 20f).coerceIn(0.85f, 1.30f)
+                                        onUpdateVoiceSettings { it.copy(speechRate = snapped) }
+                                    },
+                                    valueRange = 0.85f..1.30f,
+                                    steps = 8,
+                                    modifier = Modifier.testTag("speech_speed_slider")
+                                )
+                            }
+
+                            FilledTonalButton(
+                                onClick = onTestVoice,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("test_voice_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VolumeUp,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(stringResource(R.string.settings_test_voice_button))
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
                         Text(
                             text = "Voice Recognition Language",
                             style = MaterialTheme.typography.bodyMedium,
@@ -542,13 +747,19 @@ fun SettingsScreen(
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
-                                        text = lang.displayName,
+                                        text = when (lang) {
+                                            VoiceLanguage.AUTO -> "Auto"
+                                            VoiceLanguage.EN_IN -> "English"
+                                            VoiceLanguage.TE_IN -> "తెలుగు"
+                                        },
                                         style = MaterialTheme.typography.labelLarge,
                                         color = if (selected) {
                                             MaterialTheme.colorScheme.onPrimary
                                         } else {
                                             MaterialTheme.colorScheme.onSurfaceVariant
-                                        }
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             }
@@ -584,26 +795,23 @@ fun SettingsScreen(
             item(key = "section_safety") {
                 FlatSettingsSection(
                     title = "Safety & Approval Rules",
-                    subtitle = "Protections stay on by default. Calls, messages, and general screen automation always ask for approval."
+                    subtitle = "LOW and MEDIUM risk actions run immediately without approval. HIGH risk actions always ask for approval, and financial/OTP/password actions stay hard-blocked."
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         FlatSafetyToggle(
-                            title = "Always ask for my approval before running phone actions",
-                            checked = uiState.safetyRules.alwaysAskApproval,
+                            title = "Auto-run LOW & MEDIUM risk actions without approval",
+                            subtitle = "Runs app launches, media, alarms, calls, messages, and routine automation immediately. HIGH risk actions still require your Approval Card.",
+                            checked = uiState.safetyRules.autoRunLowAndMediumRisk,
                             onCheckedChange = { checked ->
-                                onUpdateSafetyRules { it.copy(alwaysAskApproval = checked) }
+                                onUpdateSafetyRules {
+                                    it.copy(
+                                        autoRunLowAndMediumRisk = checked,
+                                        alwaysAskApproval = !checked,
+                                        instantRunLowRiskAppLaunch = checked
+                                    )
+                                }
                             },
-                            testTag = "toggle_always_ask_approval"
-                        )
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-                        FlatSafetyToggle(
-                            title = "Instant-run LOW risk app launches (skip approval for opening apps)",
-                            subtitle = "When ON, simple commands like \"open YouTube\" launch immediately in 1 tap. Banking, UPI, OTP, and password apps remain blocked.",
-                            checked = uiState.safetyRules.instantRunLowRiskAppLaunch,
-                            onCheckedChange = { checked ->
-                                onUpdateSafetyRules { it.copy(instantRunLowRiskAppLaunch = checked) }
-                            },
-                            testTag = "toggle_instant_run_low_risk"
+                            testTag = "toggle_auto_run_low_medium_risk"
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                         FlatSafetyToggle(
@@ -617,7 +825,7 @@ fun SettingsScreen(
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                         FlatSafetyToggle(
-                            title = "Show step-by-step plan before executing",
+                            title = "Show step-by-step plan in action cards",
                             checked = uiState.safetyRules.showStepPlan,
                             onCheckedChange = { checked ->
                                 onUpdateSafetyRules { it.copy(showStepPlan = checked) }

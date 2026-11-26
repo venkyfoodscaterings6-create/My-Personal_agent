@@ -56,9 +56,8 @@ object InstalledAppCache {
         sorted
     }
 
-    fun findBestMatch(context: Context, query: String): InstalledAppInfo? {
-        if (cachedApps.isEmpty()) {
-            // Synchronous warm-up fallback if called before async init completed
+    fun findBestMatch(context: Context, query: String, forceRefresh: Boolean = false): InstalledAppInfo? {
+        if (cachedApps.isEmpty() || forceRefresh) {
             val pm = context.packageManager
             val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val resolved = runCatching {
@@ -191,8 +190,9 @@ object NativeToolExecutor {
             }
         }
 
-        // 2. Fuzzy search across cached installed launcher apps
-        val matched = InstalledAppCache.findBestMatch(context, query)
+        // 2. Fuzzy search across cached installed launcher apps (re-querying fresh if not in cache)
+        val matched = InstalledAppCache.findBestMatch(context, query, forceRefresh = false)
+            ?: InstalledAppCache.findBestMatch(context, query, forceRefresh = true)
             ?: return ActionExecutionResult(false, "Could not find installed app matching \"$query\".")
 
         val launchIntent = pm.getLaunchIntentForPackage(matched.packageName)?.apply {

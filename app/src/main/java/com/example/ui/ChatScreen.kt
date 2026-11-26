@@ -46,19 +46,29 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
+import androidx.compose.material.icons.outlined.BookmarkAdd
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.PhoneAndroid
+import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.StopCircle
@@ -112,14 +122,19 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
 import com.example.ActionPlan
 import com.example.AgentMode
 import com.example.AiProvider
 import com.example.ApprovalStatus
+import com.example.BuiltInGeminiSettings
 import com.example.ChatMessage
+import com.example.GeminiBuiltInModel
+import com.example.MemorySuggestion
 import com.example.MessageSender
 import com.example.R
 import com.example.RiskLevel
+import com.example.SuggestionKind
 import com.example.VoiceLanguage
 import com.example.ui.theme.LocalAgentSemanticColors
 import com.example.ui.theme.MonoCodeStyle
@@ -148,6 +163,10 @@ fun ChatScreen(
     messages: List<ChatMessage>,
     providers: List<AiProvider>,
     activeProvider: AiProvider?,
+    activeHeaderLabel: String,
+    isUsingBuiltInGemini: Boolean,
+    builtInGeminiSettings: BuiltInGeminiSettings,
+    streamingAssistantText: String,
     agentMode: AgentMode,
     quickActionChips: List<String>,
     showStepPlan: Boolean,
@@ -161,12 +180,15 @@ fun ChatScreen(
     voicePartialText: String,
     voiceFinalEvent: Pair<Long, String>?,
     onToggleMic: () -> Unit,
+    onOpenLiveVoice: () -> Unit,
+    onToggleGoogleSearch: () -> Unit,
     onToggleVoiceLanguage: () -> Unit,
     onStopSpeaking: () -> Unit,
     onConsumeVoiceFinal: () -> Unit,
     onStopAgent: () -> Unit,
     onOpenDrawer: () -> Unit,
     onNewChat: () -> Unit,
+    onSelectBuiltInGemini: (GeminiBuiltInModel) -> Unit,
     onSelectProvider: (String) -> Unit,
     onToggleMode: (AgentMode) -> Unit,
     onSendMessage: (String) -> Unit,
@@ -175,6 +197,10 @@ fun ChatScreen(
     onCancelAction: (String) -> Unit,
     onOpenSettingsProviders: () -> Unit,
     onCopyMessage: (String) -> Unit,
+    memorySuggestions: Map<String, MemorySuggestion> = emptyMap(),
+    onSaveToMemory: (ChatMessage) -> Unit = {},
+    onAcceptSuggestion: (MemorySuggestion) -> Unit = {},
+    onDismissSuggestion: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var showProviderSheet by remember { mutableStateOf(false) }
@@ -192,7 +218,8 @@ fun ChatScreen(
                 .statusBarsPadding()
         ) {
             MinimalChatTopBar(
-                activeProvider = activeProvider,
+                activeHeaderLabel = activeHeaderLabel,
+                isUsingBuiltInGemini = isUsingBuiltInGemini,
                 isSpeakingTts = isSpeakingTts,
                 onStopSpeaking = onStopSpeaking,
                 onOpenDrawer = onOpenDrawer,
@@ -213,11 +240,16 @@ fun ChatScreen(
                 } else {
                     ChatMessageFeed(
                         messages = messages,
+                        memorySuggestions = memorySuggestions,
                         showStepPlan = showStepPlan,
                         isSending = isSending,
+                        streamingAssistantText = streamingAssistantText,
                         livePhaseText = liveAgentStatusText,
                         livePhaseStartMillis = livePhaseStartMillis,
                         onCopyMessage = onCopyMessage,
+                        onSaveToMemory = onSaveToMemory,
+                        onAcceptSuggestion = onAcceptSuggestion,
+                        onDismissSuggestion = onDismissSuggestion,
                         onApprove = onApproveAction,
                         onEditStep = { editingPlan = it },
                         onCancel = onCancelAction
@@ -236,12 +268,16 @@ fun ChatScreen(
             // Strictly isolated bottom input bar with unified navBars.union(ime) inset handling
             BottomPillInputBar(
                 agentMode = agentMode,
+                isUsingBuiltInGemini = isUsingBuiltInGemini,
+                googleSearchEnabled = builtInGeminiSettings.googleSearchEnabled,
                 isSending = isSending || isAgentLoopRunning,
                 isListening = isListening,
                 voiceLanguage = voiceLanguage,
                 voicePartialText = voicePartialText,
                 voiceFinalEvent = voiceFinalEvent,
                 onToggleMic = onToggleMic,
+                onOpenLiveVoice = onOpenLiveVoice,
+                onToggleGoogleSearch = onToggleGoogleSearch,
                 onToggleVoiceLanguage = onToggleVoiceLanguage,
                 onConsumeVoiceFinal = onConsumeVoiceFinal,
                 onToggleMode = onToggleMode,
@@ -260,7 +296,13 @@ fun ChatScreen(
         ) {
             ProviderPickerSheetContent(
                 providers = providers,
-                activeProviderId = activeProvider?.id,
+                activeProviderId = if (isUsingBuiltInGemini) null else activeProvider?.id,
+                isUsingBuiltInGemini = isUsingBuiltInGemini,
+                selectedBuiltInModel = builtInGeminiSettings.selectedModel,
+                onSelectBuiltIn = { model ->
+                    showProviderSheet = false
+                    onSelectBuiltInGemini(model)
+                },
                 onSelect = { id ->
                     showProviderSheet = false
                     onSelectProvider(id)
@@ -287,7 +329,8 @@ fun ChatScreen(
 
 @Composable
 private fun MinimalChatTopBar(
-    activeProvider: AiProvider?,
+    activeHeaderLabel: String,
+    isUsingBuiltInGemini: Boolean,
     isSpeakingTts: Boolean,
     onStopSpeaking: () -> Unit,
     onOpenDrawer: () -> Unit,
@@ -334,11 +377,18 @@ private fun MinimalChatTopBar(
             Row(
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
+                if (isUsingBuiltInGemini) {
+                    Icon(
+                        imageVector = Icons.Rounded.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 Text(
-                    text = activeProvider?.displayName
-                        ?: stringResource(R.string.no_provider_selected),
+                    text = activeHeaderLabel,
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
@@ -446,11 +496,16 @@ private fun MinimalEmptyGreeting(
 @Composable
 private fun ChatMessageFeed(
     messages: List<ChatMessage>,
+    memorySuggestions: Map<String, MemorySuggestion>,
     showStepPlan: Boolean,
     isSending: Boolean,
+    streamingAssistantText: String,
     livePhaseText: String,
     livePhaseStartMillis: Long,
     onCopyMessage: (String) -> Unit,
+    onSaveToMemory: (ChatMessage) -> Unit,
+    onAcceptSuggestion: (MemorySuggestion) -> Unit,
+    onDismissSuggestion: (String) -> Unit,
     onApprove: (String) -> Unit,
     onEditStep: (ActionPlan) -> Unit,
     onCancel: (String) -> Unit
@@ -462,7 +517,7 @@ private fun ChatMessageFeed(
     val sessionMountMillis = remember { System.currentTimeMillis() }
     val animatedMessageIds = remember { hashSetOf<String>() }
 
-    LaunchedEffect(messages.size, isSending) {
+    LaunchedEffect(messages.size, isSending, streamingAssistantText.length / 40) {
         val target = messages.size + if (isSending) 1 else 0
         if (target > 0) {
             listState.scrollToItem((target - 1).coerceAtLeast(0))
@@ -493,6 +548,7 @@ private fun ChatMessageFeed(
 
             ChatMessageRow(
                 message = message,
+                suggestion = memorySuggestions[message.id],
                 showStepPlan = showStepPlan,
                 livePhaseText = livePhaseText,
                 livePhaseStartMillis = livePhaseStartMillis,
@@ -502,6 +558,9 @@ private fun ChatMessageFeed(
                     clipboard.setText(AnnotatedString(message.text))
                     onCopyMessage("Copied to clipboard")
                 },
+                onSaveToMemory = { onSaveToMemory(message) },
+                onAcceptSuggestion = onAcceptSuggestion,
+                onDismissSuggestion = onDismissSuggestion,
                 onApprove = { actionId -> onApprove(actionId) },
                 onEditStep = { plan -> onEditStep(plan) },
                 onCancel = { actionId -> onCancel(actionId) }
@@ -510,10 +569,28 @@ private fun ChatMessageFeed(
 
         if (isSending) {
             item(key = "gemini_thinking_row", contentType = "thinking") {
-                GeminiThinkingRow(
-                    livePhaseText = livePhaseText,
-                    livePhaseStartMillis = livePhaseStartMillis
-                )
+                if (streamingAssistantText.isNotBlank()) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = streamingAssistantText,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            text = "Streaming…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                } else {
+                    GeminiThinkingRow(
+                        livePhaseText = livePhaseText,
+                        livePhaseStartMillis = livePhaseStartMillis
+                    )
+                }
             }
         }
     }
@@ -703,12 +780,16 @@ private fun LivePhaseTimerText(
 @Composable
 private fun ChatMessageRow(
     message: ChatMessage,
+    suggestion: MemorySuggestion?,
     showStepPlan: Boolean,
     livePhaseText: String,
     livePhaseStartMillis: Long,
     shouldAnimateEntrance: Boolean,
     onEntranceAnimated: () -> Unit,
     onCopy: () -> Unit,
+    onSaveToMemory: () -> Unit,
+    onAcceptSuggestion: (MemorySuggestion) -> Unit,
+    onDismissSuggestion: (String) -> Unit,
     onApprove: (String) -> Unit,
     onEditStep: (ActionPlan) -> Unit,
     onCancel: (String) -> Unit
@@ -718,9 +799,10 @@ private fun ChatMessageRow(
     }
 
     if (message.sender == MessageSender.USER) {
-        Row(
+        Column(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Box(
                 modifier = Modifier
@@ -734,6 +816,55 @@ private fun ChatMessageRow(
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
+            }
+
+            if (suggestion != null) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f))
+                        .border(
+                            1.dp,
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+                            RoundedCornerShape(16.dp)
+                        )
+                        .clickable { onAcceptSuggestion(suggestion) }
+                        .padding(start = 10.dp, end = 6.dp, top = 5.dp, bottom = 5.dp)
+                        .testTag("memory_suggestion_pill_${message.id}"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.BookmarkAdd,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    val prefix = if (suggestion.kind == SuggestionKind.TASK) "+ Add Task:" else "+ Save Memory:"
+                    Text(
+                        text = "$prefix ${suggestion.title.take(30)}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 220.dp)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .clickable { onDismissSuggestion(message.id) }
+                            .testTag("dismiss_suggestion_${message.id}"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Dismiss suggestion",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f),
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
             }
         }
     } else {
@@ -845,6 +976,55 @@ private fun ChatMessageRow(
                     )
                 }
 
+                if (message.groundingSources.isNotEmpty()) {
+                    val context = LocalContext.current
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(top = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        message.groundingSources.take(5).forEach { src ->
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f))
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                                        RoundedCornerShape(12.dp)
+                                    )
+                                    .clickable {
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW, Uri.parse(src.uri))
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            )
+                                        }
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Public,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    text = src.title.take(28),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -873,6 +1053,44 @@ private fun ChatMessageRow(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                    }
+
+                    if (!message.isError && message.text.isNotBlank()) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onSaveToMemory)
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                                .testTag("save_memory_${message.id}"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.BookmarkAdd,
+                                    contentDescription = stringResource(R.string.action_save_to_memory),
+                                    modifier = Modifier.size(14.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = "Save",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    if (!message.modelBadge.isNullOrBlank()) {
+                        Text(
+                            text = message.modelBadge,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
 
                     Text(
@@ -1196,12 +1414,16 @@ private fun StopAgentFloatingBar(
 @Composable
 private fun BottomPillInputBar(
     agentMode: AgentMode,
+    isUsingBuiltInGemini: Boolean,
+    googleSearchEnabled: Boolean,
     isSending: Boolean,
     isListening: Boolean,
     voiceLanguage: VoiceLanguage,
     voicePartialText: String,
     voiceFinalEvent: Pair<Long, String>?,
     onToggleMic: () -> Unit,
+    onOpenLiveVoice: () -> Unit,
+    onToggleGoogleSearch: () -> Unit,
     onToggleVoiceLanguage: () -> Unit,
     onConsumeVoiceFinal: () -> Unit,
     onToggleMode: (AgentMode) -> Unit,
@@ -1295,11 +1517,12 @@ private fun BottomPillInputBar(
                     if (draft.isEmpty()) {
                         Text(
                             text = when {
-                                isListening -> if (voiceLanguage == VoiceLanguage.TE_IN) {
-                                    "వింటున్నాను (తెలుగు)…"
-                                } else {
-                                    stringResource(R.string.voice_listening_hint)
+                                isListening -> when (voiceLanguage) {
+                                    VoiceLanguage.TE_IN -> "వింటున్నాను (తెలుగు)…"
+                                    VoiceLanguage.AUTO -> "Listening (EN + తెలుగు)…"
+                                    VoiceLanguage.EN_IN -> stringResource(R.string.voice_listening_hint)
                                 }
+                                agentMode == AgentMode.SMART_AUTO -> stringResource(R.string.input_placeholder_smart)
                                 agentMode == AgentMode.CHAT_ONLY -> "Ask anything…"
                                 else -> "Tell your agent what to do…"
                             },
@@ -1338,8 +1561,38 @@ private fun BottomPillInputBar(
 
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                        // Google Search Grounding toggle button (visible in Built-in Gemini Smart & Chat modes)
+                        if (isUsingBuiltInGemini && agentMode != AgentMode.AGENT_CONTROL) {
+                            Box(
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (googleSearchEnabled) MaterialTheme.colorScheme.primaryContainer
+                                        else MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (googleSearchEnabled) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+                                        CircleShape
+                                    )
+                                    .clickable(onClick = onToggleGoogleSearch)
+                                    .testTag("google_search_toggle"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Public,
+                                    contentDescription = stringResource(R.string.action_toggle_google_search),
+                                    tint = if (googleSearchEnabled) MaterialTheme.colorScheme.onPrimaryContainer
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                            }
+                        }
+
                         // Compact EN / తెలుగు voice language pill
                         Box(
                             modifier = Modifier
@@ -1352,7 +1605,7 @@ private fun BottomPillInputBar(
                                     RoundedCornerShape(18.dp)
                                 )
                                 .clickable(onClick = onToggleVoiceLanguage)
-                                .padding(horizontal = 10.dp)
+                                .padding(horizontal = 9.dp)
                                 .testTag("voice_language_toggle"),
                             contentAlignment = Alignment.Center
                         ) {
@@ -1360,6 +1613,29 @@ private fun BottomPillInputBar(
                                 text = voiceLanguage.shortChipLabel,
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        // 1-tap Live Voice + 3D Agent conversation launcher
+                        Box(
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.secondaryContainer)
+                                .border(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                                    CircleShape
+                                )
+                                .clickable(onClick = onOpenLiveVoice)
+                                .testTag("open_live_voice_button"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.GraphicEq,
+                                contentDescription = stringResource(R.string.action_open_live_voice),
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(19.dp)
                             )
                         }
 
@@ -1480,9 +1756,13 @@ private fun SlidingModeTogglePill(
     agentMode: AgentMode,
     onToggleMode: (AgentMode) -> Unit
 ) {
-    val isAgent = agentMode == AgentMode.AGENT_CONTROL
-    val slideFraction = animateFloatAsState(
-        targetValue = if (isAgent) 1f else 0f,
+    val activeIndex = when (agentMode) {
+        AgentMode.SMART_AUTO -> 0f
+        AgentMode.CHAT_ONLY -> 1f
+        AgentMode.AGENT_CONTROL -> 2f
+    }
+    val slideIndex = animateFloatAsState(
+        targetValue = activeIndex,
         animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
         label = "mode_pill_slide"
     )
@@ -1500,9 +1780,9 @@ private fun SlidingModeTogglePill(
                 drawRoundRect(color = trackBg, cornerRadius = radius)
 
                 val pad = 3.dp.toPx()
-                val thumbWidth = (size.width - pad * 2f) / 2f
+                val thumbWidth = (size.width - pad * 2f) / 3f
                 val thumbHeight = size.height - pad * 2f
-                val left = pad + slideFraction.value * thumbWidth
+                val left = pad + slideIndex.value * thumbWidth
                 drawRoundRect(
                     color = activeThumbColor,
                     topLeft = Offset(left, pad),
@@ -1515,16 +1795,20 @@ private fun SlidingModeTogglePill(
         verticalAlignment = Alignment.CenterVertically
     ) {
         ModeSegmentChip(
+            label = "Smart",
+            selected = agentMode == AgentMode.SMART_AUTO,
+            onClick = { onToggleMode(AgentMode.SMART_AUTO) },
+            modifier = Modifier.testTag("mode_smart_option")
+        )
+        ModeSegmentChip(
             label = "Chat",
-            icon = Icons.Rounded.SmartToy,
-            selected = !isAgent,
+            selected = agentMode == AgentMode.CHAT_ONLY,
             onClick = { onToggleMode(AgentMode.CHAT_ONLY) },
             modifier = Modifier.testTag("mode_chat_option")
         )
         ModeSegmentChip(
             label = "Agent",
-            icon = Icons.Rounded.PhoneAndroid,
-            selected = isAgent,
+            selected = agentMode == AgentMode.AGENT_CONTROL,
             onClick = { onToggleMode(AgentMode.AGENT_CONTROL) },
             modifier = Modifier.testTag("mode_agent_option")
         )
@@ -1534,7 +1818,6 @@ private fun SlidingModeTogglePill(
 @Composable
 private fun ModeSegmentChip(
     label: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -1545,25 +1828,19 @@ private fun ModeSegmentChip(
         MaterialTheme.colorScheme.onSurfaceVariant
     }
 
-    Row(
+    Box(
         modifier = modifier
-            .width(74.dp)
+            .width(46.dp)
             .clip(RoundedCornerShape(15.dp))
             .clickable(onClick = onClick)
             .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center
+        contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            modifier = Modifier.size(14.dp),
-            tint = contentColor
-        )
-        Spacer(modifier = Modifier.width(4.dp))
         Text(
             text = label,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+            ),
             color = contentColor,
             maxLines = 1
         )
@@ -1574,31 +1851,78 @@ private fun ModeSegmentChip(
 private fun ProviderPickerSheetContent(
     providers: List<AiProvider>,
     activeProviderId: String?,
+    isUsingBuiltInGemini: Boolean,
+    selectedBuiltInModel: GeminiBuiltInModel,
+    onSelectBuiltIn: (GeminiBuiltInModel) -> Unit,
     onSelect: (String) -> Unit,
     onManageProviders: () -> Unit
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .navigationBarsPadding()
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
-            text = "Switch Model / Provider",
+            text = "Built-in Gemini AI (No API Key)",
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface
         )
 
-        if (providers.isEmpty()) {
+        GeminiBuiltInModel.entries.forEach { model ->
+            val isSelected = isUsingBuiltInGemini && selectedBuiltInModel == model
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                    )
+                    .clickable { onSelectBuiltIn(model) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .testTag("pick_builtin_${model.name.lowercase()}"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = model.displayName,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = model.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (isSelected) {
+                    Icon(
+                        imageVector = Icons.Rounded.Check,
+                        contentDescription = "Active",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+
+        if (providers.isNotEmpty()) {
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 4.dp),
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+            )
             Text(
-                text = "No custom endpoints saved yet. Add your own Base URL, optional API key, and model in Settings.",
-                style = MaterialTheme.typography.bodyMedium,
+                text = "Your Custom Providers",
+                style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-        } else {
             providers.forEach { provider ->
-                val isSelected = provider.id == activeProviderId
+                val isSelected = !isUsingBuiltInGemini && provider.id == activeProviderId
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()

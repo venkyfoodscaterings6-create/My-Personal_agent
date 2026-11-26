@@ -10,16 +10,68 @@ import kotlin.math.min
 
 enum class AppDestination(val route: String, val label: String) {
     CHAT("chat", "Chat"),
+    LIVE_VOICE("live_voice", "Live Voice & 3D"),
+    MEMORY_DB("memory_db", "Memory & SQL"),
     APPROVALS("approvals", "Approvals"),
     SETUP("setup", "Setup & Test"),
     SETTINGS("settings", "Settings / API Keys")
 }
+
+enum class LiveVoicePhase {
+    IDLE,
+    LISTENING,
+    THINKING,
+    SPEAKING
+}
+
+enum class GeminiBuiltInModel(
+    val modelId: String,
+    val displayName: String,
+    val subtitle: String
+) {
+    FLASH(
+        modelId = "gemini-3.8-flash",
+        displayName = "Gemini 3.8 Flash",
+        subtitle = "General + Google Search Grounding (Default)"
+    ),
+    HYDROGEN(
+        modelId = "gemini-4-hydrogen",
+        displayName = "Gemini 4 Hydrogen",
+        subtitle = "Fast Gemini 4 workhorse & agentic workflows"
+    ),
+    FLASH_LITE(
+        modelId = "gemini-3.5-flash-lite",
+        displayName = "Gemini 3.5 Flash-Lite",
+        subtitle = "Ultra-fast responses & instant routing"
+    ),
+    ARGON(
+        modelId = "gemini-4-argon",
+        displayName = "Gemini 4 Argon",
+        subtitle = "Deep reasoning & complex planning"
+    )
+}
+
+@Immutable
+data class BuiltInGeminiSettings(
+    val useBuiltInGemini: Boolean = true,
+    val selectedModel: GeminiBuiltInModel = GeminiBuiltInModel.FLASH,
+    val googleSearchEnabled: Boolean = false,
+    val injectSqlMemory: Boolean = true
+)
+
+@Immutable
+@JsonClass(generateAdapter = true)
+data class GroundingSource(
+    val title: String,
+    val uri: String
+)
 
 enum class SettingsFocusSection {
     PROVIDERS
 }
 
 enum class AgentMode {
+    SMART_AUTO,
     CHAT_ONLY,
     AGENT_CONTROL
 }
@@ -35,8 +87,36 @@ enum class VoiceLanguage(
     val shortChipLabel: String,
     val displayName: String
 ) {
+    AUTO("en-IN", "Auto", "Auto (EN + తెలుగు)"),
     EN_IN("en-IN", "EN", "English"),
-    TE_IN("te-IN", "తెలుగు", "Telugu (తెలుగు)")
+    TE_IN("te-IN", "తెలుగు", "Telugu (తెలుగు)");
+
+    fun next(): VoiceLanguage = when (this) {
+        AUTO -> EN_IN
+        EN_IN -> TE_IN
+        TE_IN -> AUTO
+    }
+}
+
+enum class GeminiVoicePersona(
+    val apiVoiceName: String,
+    val displayName: String,
+    val styleHint: String
+) {
+    KORE("Kore", "Kore", "Warm & clear"),
+    PUCK("Puck", "Puck", "Upbeat & lively"),
+    AOEDE("Aoede", "Aoede", "Calm & smooth"),
+    FENRIR("Fenrir", "Fenrir", "Deep & steady")
+}
+
+enum class WakeSensitivity(
+    val displayName: String,
+    val noiseMultiplier: Double,
+    val minRmsFloor: Double
+) {
+    QUIET("Quiet", 2.1, 650.0),
+    BALANCED("Balanced", 2.8, 1050.0),
+    NOISY("Noisy", 3.6, 1650.0)
 }
 
 enum class ApiFormat(
@@ -125,26 +205,46 @@ data class AiProvider(
 @Immutable
 @JsonClass(generateAdapter = true)
 data class SafetyRules(
-    val alwaysAskApproval: Boolean = true,
+    val alwaysAskApproval: Boolean = false,
     val blockSensitiveFinancial: Boolean = true,
     val showStepPlan: Boolean = true,
-    val instantRunLowRiskAppLaunch: Boolean = false
+    val instantRunLowRiskAppLaunch: Boolean = true,
+    val autoRunLowAndMediumRisk: Boolean = true
 )
 
 @Immutable
 data class VoiceSettings(
     val autoSendVoiceCommands: Boolean = true,
     val speakRepliesAloud: Boolean = true,
-    val voiceLanguage: VoiceLanguage = VoiceLanguage.EN_IN,
+    val voiceLanguage: VoiceLanguage = VoiceLanguage.AUTO,
     val persistentAskNotificationEnabled: Boolean = true,
     val wakeWordEnabled: Boolean = false,
-    val wakePhrase: String = DEFAULT_WAKE_PHRASE
+    val wakePhrase: String = DEFAULT_WAKE_PHRASE,
+    val useGeminiNeuralVoice: Boolean = true,
+    val voicePersona: GeminiVoicePersona = GeminiVoicePersona.KORE,
+    val speechRate: Float = 1.0f,
+    val wakeSensitivity: WakeSensitivity = WakeSensitivity.BALANCED
 ) {
     companion object {
         const val DEFAULT_WAKE_PHRASE = "Hey Agent"
         val PRESET_WAKE_PHRASES = listOf("Hey Agent", "OK Agent", "Hey Buddy")
     }
 }
+
+enum class SuggestionKind {
+    MEMORY,
+    TASK
+}
+
+@Immutable
+data class MemorySuggestion(
+    val id: String = UUID.randomUUID().toString(),
+    val anchorMessageId: String,
+    val kind: SuggestionKind,
+    val category: String,
+    val title: String,
+    val content: String
+)
 
 @Immutable
 data class PermissionsStatus(
@@ -299,11 +399,14 @@ data class RoutedToolCall(
         )
 
     val alwaysRequiresApproval: Boolean
-        get() = tool in setOf(
-            ToolName.CALL_CONTACT,
-            ToolName.SEND_MESSAGE,
-            ToolName.UI_AUTOMATE
-        )
+        get() = riskLevel == RiskLevel.HIGH
+
+    fun shouldAutoRun(safetyRules: SafetyRules): Boolean {
+        return when (riskLevel) {
+            RiskLevel.HIGH -> false
+            RiskLevel.LOW, RiskLevel.MEDIUM -> safetyRules.autoRunLowAndMediumRisk
+        }
+    }
 
     fun toJsonString(): String {
         val map = LinkedHashMap<String, Any>()
@@ -361,7 +464,9 @@ data class ChatMessage(
     val isBlockedBySafety: Boolean = false,
     val blockedReason: String? = null,
     val excludeFromContext: Boolean = false,
-    val durationLabel: String? = null
+    val durationLabel: String? = null,
+    val groundingSources: List<GroundingSource> = emptyList(),
+    val modelBadge: String? = null
 )
 
 @Immutable
@@ -552,10 +657,106 @@ object SafetyGuardrail {
         )
     )
 
+    private val sensitivePackageMarkers: List<String> = listOf(
+        "phonepe",
+        "nbu.paisa",
+        "net.one97.paytm",
+        "paytm",
+        "npci.upi",
+        "bhim",
+        "paypal",
+        "venmo",
+        "squareup.cash",
+        "mobikwik",
+        "freecharge",
+        "cred.club",
+        "bharatpe",
+        "yono",
+        "imobile",
+        "netbanking",
+        "sbi.lotusintouch",
+        "snapwork.hdfc",
+        "hdfcbank",
+        "icicibank",
+        "axis.mobile",
+        "kotak",
+        "canarabank",
+        "pnbone",
+        "indusind",
+        "yesbank",
+        "idfcfirstbank",
+        "rblbank",
+        "federalbank",
+        "chase.sig",
+        "bankofamerica",
+        "wf.wellsfargomobile",
+        "citi.citimobile",
+        "hsbc"
+    )
+
+    private val launcherOrSystemPackageMarkers: List<String> = listOf(
+        "launcher",
+        "trebuchet",
+        "miui.home",
+        "systemui",
+        "android.settings"
+    )
+
+    private val sensitiveEditableFieldRegex = Regex(
+        """\b(password|passcode|passphrase|upi\s*pin|enter\s*pin|mpin|tpin|atm\s*pin|cvv|card\s*number|enter\s*otp|verification\s*code)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val sensitiveCheckoutButtonRegex = Regex(
+        """\b(enter\s*upi\s*pin|confirm\s*payment|authorize\s*payment|transfer\s*money|send\s*money|pay\s*now\s*via\s*upi)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
     fun detectSensitiveViolation(vararg texts: String?): String? {
         val combined = texts.filterNotNull().joinToString("\n")
         if (combined.isBlank()) return null
         return sensitivePatterns.firstOrNull { it.regex.containsMatchIn(combined) }?.category
+    }
+
+    /**
+     * Live-screen guardrail specifically designed to avoid false positives on Zomato, Swiggy,
+     * Amazon, YouTube, WhatsApp, or the Android Home Screen (which often display "Bank offers",
+     * "Zomato UPI" promo banners, or GPay/PhonePe home-screen icons).
+     *
+     * Blocks ONLY:
+     * 1) Dedicated Banking / UPI / Payment apps (by packageName)
+     * 2) Active password / PIN / OTP / card-number editable input fields
+     * 3) Explicit payment-authorization buttons (e.g., "Enter UPI PIN", "Confirm Payment")
+     */
+    fun detectSensitiveScreen(
+        packageName: String,
+        ownPackageName: String,
+        nodes: List<ScreenNode>
+    ): String? {
+        val pkg = packageName.trim().lowercase()
+        if (pkg.isBlank() || pkg == ownPackageName.lowercase()) return null
+        if (launcherOrSystemPackageMarkers.any { pkg.contains(it) }) return null
+
+        if (sensitivePackageMarkers.any { pkg.contains(it) }) {
+            return "UPI / Banking App ($packageName)"
+        }
+
+        for (node in nodes) {
+            val label = buildString {
+                if (node.text.isNotBlank()) append(node.text).append(' ')
+                if (node.contentDescription.isNotBlank()) append(node.contentDescription).append(' ')
+                if (node.viewIdResourceName.isNotBlank()) append(node.viewIdResourceName.substringAfterLast('/')).append(' ')
+            }
+            if (label.isBlank()) continue
+
+            if (node.isEditable && sensitiveEditableFieldRegex.containsMatchIn(label)) {
+                return "Password / PIN / OTP Input Field"
+            }
+            if (node.isClickable && sensitiveCheckoutButtonRegex.containsMatchIn(label)) {
+                return "Payment Confirmation Action"
+            }
+        }
+        return null
     }
 }
 
@@ -576,9 +777,23 @@ object AppNameFuzzyMatcher {
             "instagram", "ig", "insta" -> listOf("com.instagram.android")
             "spotify" -> listOf("com.spotify.music")
             "telegram", "tg" -> listOf("org.telegram.messenger")
+            "zomato", "zomoto", "zomatto" -> listOf("com.application.zomato")
+            "swiggy", "swigy" -> listOf("in.swiggy.android")
+            "blinkit" -> listOf("com.grofers.customerapp")
+            "zepto" -> listOf("com.zeptoconsumerapp")
+            "uber" -> listOf("com.ubercab")
+            "ola" -> listOf("com.olacabs.customer")
+            "rapido" -> listOf("com.rapido.passenger")
+            "amazon" -> listOf("in.amazon.mShop.android.shopping", "com.amazon.mShop.android.shopping")
+            "flipkart" -> listOf("com.flipkart.android")
+            "netflix" -> listOf("com.netflix.mediaclient")
+            "hotstar", "jiohotstar" -> listOf("in.startv.hotstar")
+            "primevideo", "amazonprime" -> listOf("com.amazon.avod.thirdpartyclient")
             "settings" -> listOf("com.android.settings")
             "clock", "alarm" -> listOf("com.google.android.deskclock", "com.android.deskclock")
-            "camera" -> listOf("com.android.camera", "com.google.android.GoogleCamera")
+            "calendar" -> listOf("com.google.android.calendar", "com.android.calendar")
+            "calculator" -> listOf("com.google.android.calculator", "com.android.calculator2")
+            "camera" -> listOf("com.android.camera", "com.google.android.GoogleCamera", "com.android.camera2")
             "contacts" -> listOf("com.google.android.contacts", "com.android.contacts")
             "phone", "dialer" -> listOf("com.google.android.dialer", "com.android.dialer")
             "messages", "sms" -> listOf("com.google.android.apps.messaging", "com.android.mms")
@@ -1269,7 +1484,7 @@ object HybridToolRouting {
                 ToolName.OPEN_SETTING -> listOf("Open Android ${settingName ?: "device"} settings")
                 ToolName.CALL_CONTACT -> listOf(
                     "Look up phone number for ${contactOrNumber ?: "contact"}",
-                    "Place phone call after your approval"
+                    "Place phone call"
                 )
                 ToolName.SEND_MESSAGE -> listOf(
                     "Resolve contact ${contactOrNumber ?: "recipient"}",
@@ -1482,6 +1697,8 @@ object WakeWordMatcher {
 
     private val defaultAgentAliases = listOf(
         "hey agent",
+        "hay agent",
+        "a agent",
         "hi agent",
         "ok agent",
         "okay agent",
@@ -1563,6 +1780,220 @@ object WakeWordMatcher {
         val rawRegex = Regex(regexStr, RegexOption.IGNORE_CASE)
         val match = rawRegex.find(raw) ?: return null
         return raw.substring(match.range.last + 1).trimStart(' ', ',', '.', '!', '?', ':', ';', '-').trim()
+    }
+}
+
+object SpeechTextCleaner {
+    private val codeBlockRegex = Regex("""```[\s\S]*?```""")
+    private val inlineCodeRegex = Regex("""`([^`]+)`""")
+    private val markdownLinkRegex = Regex("""\[([^\]]+)]\(([^)]+)\)""")
+    private val urlRegex = Regex("""https?://\S+""")
+    private val headingRegex = Regex("""(?m)^\s{0,3}#{1,6}\s+""")
+    private val bulletRegex = Regex("""(?m)^\s*[-*•]\s+""")
+    private val numberedRegex = Regex("""(?m)^\s*\d+[.)]\s+""")
+    private val formattingCharsRegex = Regex("""[*_~>|]+""")
+    private val timingSuffixRegex = Regex("""\s*\(\d+(?:\.\d+)?s\)\s*$""")
+    private val whitespaceRegex = Regex("""\s+""")
+
+    fun containsTeluguScript(text: String): Boolean {
+        return text.any { ch -> ch in '\u0C00'..'\u0C7F' }
+    }
+
+    fun resolveEffectiveLanguage(text: String, preferred: VoiceLanguage): VoiceLanguage {
+        if (containsTeluguScript(text)) return VoiceLanguage.TE_IN
+        return when (preferred) {
+            VoiceLanguage.TE_IN -> VoiceLanguage.TE_IN
+            VoiceLanguage.EN_IN, VoiceLanguage.AUTO -> VoiceLanguage.EN_IN
+        }
+    }
+
+    /**
+     * Strips markdown, code fences, URLs, and timing badges so neural/on-device TTS sounds natural.
+     */
+    fun cleanForSpeech(raw: String): String {
+        if (raw.isBlank()) return ""
+        var text = raw.trim()
+        text = timingSuffixRegex.replace(text, "")
+        text = codeBlockRegex.replace(text, " ")
+        text = markdownLinkRegex.replace(text, "$1")
+        text = urlRegex.replace(text, "")
+        text = inlineCodeRegex.replace(text, "$1")
+        text = headingRegex.replace(text, "")
+        text = bulletRegex.replace(text, "")
+        text = numberedRegex.replace(text, "")
+        text = formattingCharsRegex.replace(text, "")
+        text = text.replace("\n", ". ")
+        text = whitespaceRegex.replace(text, " ")
+        text = text.replace(Regex("""\.\s*\."""), ".")
+        return text.trim()
+    }
+
+    /**
+     * Extracts complete natural sentences from a streaming buffer, returning (readySentences, remainingBuffer).
+     */
+    fun extractReadySentences(buffer: String): Pair<List<String>, String> {
+        if (buffer.isBlank()) return emptyList<String>() to ""
+        val ready = mutableListOf<String>()
+        var start = 0
+        var i = 0
+        while (i < buffer.length) {
+            val ch = buffer[i]
+            val isSentenceEnd = ch == '.' || ch == '!' || ch == '?' || ch == '।' || ch == '\n'
+            val nextIsBoundary = i + 1 >= buffer.length || buffer[i + 1].isWhitespace()
+            if (isSentenceEnd && nextIsBoundary) {
+                val slice = buffer.substring(start, i + 1).trim()
+                // Avoid splitting abbreviations like "Mr." or "Dr." or tiny fragments
+                val looksLikeAbbrev = slice.endsWith("Mr.", true) ||
+                    slice.endsWith("Mrs.", true) ||
+                    slice.endsWith("Dr.", true) ||
+                    slice.endsWith("Ms.", true) ||
+                    slice.endsWith("e.g.", true) ||
+                    slice.endsWith("i.e.", true)
+                if (!looksLikeAbbrev && slice.length >= 16) {
+                    val cleaned = cleanForSpeech(slice)
+                    if (cleaned.isNotBlank()) ready.add(cleaned)
+                    start = i + 1
+                }
+            }
+            i++
+        }
+        val remainder = if (start < buffer.length) buffer.substring(start) else ""
+        return ready to remainder
+    }
+
+    /**
+     * Splits a complete response into comfortably sized sentences for fast first-sentence neural synthesis.
+     */
+    fun splitIntoSpeakableChunks(raw: String, maxChunkChars: Int = 220): List<String> {
+        val cleaned = cleanForSpeech(raw)
+        if (cleaned.isBlank()) return emptyList()
+        if (cleaned.length <= maxChunkChars) return listOf(cleaned)
+
+        val chunks = mutableListOf<String>()
+        val (sentences, tail) = extractReadySentences(cleaned)
+        val allParts = buildList {
+            addAll(sentences)
+            if (tail.isNotBlank()) add(tail.trim())
+        }
+        var current = StringBuilder()
+        for (part in allParts) {
+            if (current.isEmpty()) {
+                if (part.length <= maxChunkChars) {
+                    current.append(part)
+                } else {
+                    chunks.addAll(hardSplitLongSentence(part, maxChunkChars))
+                }
+            } else if (current.length + 1 + part.length <= maxChunkChars) {
+                current.append(' ').append(part)
+            } else {
+                chunks.add(current.toString().trim())
+                current = StringBuilder()
+                if (part.length <= maxChunkChars) {
+                    current.append(part)
+                } else {
+                    chunks.addAll(hardSplitLongSentence(part, maxChunkChars))
+                }
+            }
+        }
+        if (current.isNotBlank()) chunks.add(current.toString().trim())
+        return chunks.filter { it.isNotBlank() }
+    }
+
+    private fun hardSplitLongSentence(sentence: String, maxChars: Int): List<String> {
+        val result = mutableListOf<String>()
+        var remaining = sentence.trim()
+        while (remaining.length > maxChars) {
+            val cut = remaining.lastIndexOf(' ', maxChars).takeIf { it > maxChars / 2 } ?: maxChars
+            result.add(remaining.substring(0, cut).trim())
+            remaining = remaining.substring(cut).trim()
+        }
+        if (remaining.isNotBlank()) result.add(remaining)
+        return result
+    }
+}
+
+object SmartIntentClassifier {
+    private val phoneActionPattern = Regex(
+        """\b(open|launch|start|play|call|dial|ring|send|text|message|whatsapp|sms|alarm|timer|navigate|directions?|maps?|route\s+to|turn\s+on|turn\s+off|toggle|enable|disable|scroll|swipe|tap|click|press|volume|mute|unmute|brightness|wifi|wi-fi|bluetooth|settings?|notifications?|recents?|youtube|zomato|swiggy|uber|ola|rapido|spotify|instagram|chrome|gmail|search\s+on|find\s+on|order\s+on|book\s+a\s+cab|book\s+uber)\b""",
+        RegexOption.IGNORE_CASE
+    )
+    private val conversationalQuestionPattern = Regex(
+        """^(?:what|why|how|who|when|where|which|explain|tell\s+me\s+about|write|draft|summarize|translate|compare|give\s+me\s+ideas|help\s+me\s+understand|define|difference\s+between|can\s+you\s+explain)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    /**
+     * Determines whether a prompt in Unified Smart Mode or Live Voice should pass through the
+     * Hybrid Tool Router vs. go straight to low-latency streaming Gemini chat.
+     */
+    fun looksLikePhoneAction(rawInput: String): Boolean {
+        val text = rawInput.trim()
+        if (text.isBlank()) return false
+        if (HybridToolRouting.matchDirectLocalTool(text) != null) return true
+        if (conversationalQuestionPattern.containsMatchIn(text)) {
+            // Still allow explicit phone imperatives even if phrased politely ("Can you open Zomato and search biryani?")
+            val explicitImperative = Regex(
+                """\b(open|launch|call|whatsapp|send\s+(?:a\s+)?(?:message|sms|text)|set\s+(?:an?\s+)?(?:alarm|timer)|play\s+.+\s+on\s+youtube|navigate\s+to|turn\s+(?:on|off))\b""",
+                RegexOption.IGNORE_CASE
+            )
+            return explicitImperative.containsMatchIn(text)
+        }
+        return phoneActionPattern.containsMatchIn(text)
+    }
+}
+
+object SmartMemorySuggestionDetector {
+    private val memoryCueRegex = Regex(
+        """\b(my\s+name\s+is|i\s+am\s+allergic\s+to|i'?m\s+allergic\s+to|my\s+favorite|my\s+favourite|i\s+prefer|i\s+live\s+in|i\s+work\s+(?:at|as)|my\s+birthday\s+is|my\s+dog'?s\s+name|my\s+cat'?s\s+name|i\s+don'?t\s+eat|i'?m\s+vegetarian|i'?m\s+vegan)\b""",
+        RegexOption.IGNORE_CASE
+    )
+    private val taskCueRegex = Regex(
+        """\b(i\s+need\s+to|i\s+have\s+to|i\s+must|don'?t\s+let\s+me\s+forget\s+to|gotta\s+|i\s+should\s+(?:buy|pay|call|submit|finish|book|email|send|pick\s+up))\s+(.{4,90})""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun detect(userText: String, anchorMessageId: String): MemorySuggestion? {
+        val cleaned = userText.trim().replace(Regex("\\s+"), " ")
+        if (cleaned.length < 8 || cleaned.length > 260) return null
+        if (SafetyGuardrail.detectSensitiveViolation(cleaned) != null) return null
+        // Skip if user already issued an explicit SQL command ("Remember that..." / "Add task...")
+        if (SqlMemoryCommandParser.parse(cleaned) != null) return null
+
+        val taskMatch = taskCueRegex.find(cleaned)
+        if (taskMatch != null) {
+            val extracted = taskMatch.groupValues[2].trim().trimEnd('.', '!', '?')
+            if (extracted.length >= 4) {
+                val title = extracted.replaceFirstChar { it.uppercase() }.take(80)
+                return MemorySuggestion(
+                    anchorMessageId = anchorMessageId,
+                    kind = SuggestionKind.TASK,
+                    category = "Task",
+                    title = title,
+                    content = title
+                )
+            }
+        }
+
+        if (memoryCueRegex.containsMatchIn(cleaned)) {
+            val category = when {
+                cleaned.contains("prefer", ignoreCase = true) ||
+                    cleaned.contains("favorite", ignoreCase = true) ||
+                    cleaned.contains("favourite", ignoreCase = true) -> "Preference"
+                cleaned.contains("allergic", ignoreCase = true) ||
+                    cleaned.contains("vegetarian", ignoreCase = true) ||
+                    cleaned.contains("vegan", ignoreCase = true) -> "Health"
+                else -> "Fact"
+            }
+            val title = cleaned.split(" ").take(5).joinToString(" ").replaceFirstChar { it.uppercase() }
+            return MemorySuggestion(
+                anchorMessageId = anchorMessageId,
+                kind = SuggestionKind.MEMORY,
+                category = category,
+                title = title,
+                content = cleaned
+            )
+        }
+        return null
     }
 }
 

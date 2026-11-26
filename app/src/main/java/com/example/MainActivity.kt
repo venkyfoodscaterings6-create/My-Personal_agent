@@ -15,28 +15,45 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddComment
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Checklist
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.NavigationDrawerItemDefaults
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -52,8 +69,11 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -63,14 +83,19 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.ApprovalsScreen
 import com.example.ui.ChatScreen
+import com.example.ui.LiveVoiceScreen
+import com.example.ui.MemoryDatabaseScreen
 import com.example.ui.SettingsScreen
 import com.example.ui.SetupGuideScreen
 import com.example.ui.theme.PersonalAgentTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // STEP 1: Configure Firebase App Check with launch intent BEFORE UI, ViewModels, or Firebase calls.
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
         setContent {
             val viewModel: AgentViewModel = viewModel()
@@ -90,11 +115,16 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
 
     var askedNotificationPermission by remember { mutableStateOf(false) }
     var startMicAfterPermission by remember { mutableStateOf(false) }
+    var startLiveVoiceAfterPermission by remember { mutableStateOf(false) }
     var enableWakeWordAfterPermission by remember { mutableStateOf(false) }
     var voicePartialText by remember { mutableStateOf("") }
     var voiceFinalEvent by remember { mutableStateOf<Pair<Long, String>?>(null) }
 
     val latestVoiceSettings by rememberUpdatedState(uiState.voiceSettings)
+    val latestDestination by rememberUpdatedState(uiState.destination)
+    val latestLiveContinuous by rememberUpdatedState(uiState.liveContinuousMode)
+
+    val startLiveListeningRef = remember { arrayOf<(() -> Unit)?>(null) }
 
     val speechFallbackLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -107,7 +137,9 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                 .orEmpty()
             if (spoken.isNotBlank()) {
                 voicePartialText = ""
-                if (latestVoiceSettings.autoSendVoiceCommands) {
+                if (latestDestination == AppDestination.LIVE_VOICE) {
+                    viewModel.handleLiveVoiceUtterance(spoken) { startLiveListeningRef[0]?.invoke() }
+                } else if (latestVoiceSettings.autoSendVoiceCommands) {
                     viewModel.sendUserMessage(spoken)
                 } else {
                     voiceFinalEvent = System.currentTimeMillis() to spoken
@@ -120,11 +152,17 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         VoiceController(
             context = context,
             onPartialText = { partial ->
-                voicePartialText = partial
+                if (latestDestination == AppDestination.LIVE_VOICE) {
+                    viewModel.setLiveUserTranscript(partial)
+                } else {
+                    voicePartialText = partial
+                }
             },
             onFinalText = { finalText ->
                 voicePartialText = ""
-                if (latestVoiceSettings.autoSendVoiceCommands) {
+                if (latestDestination == AppDestination.LIVE_VOICE) {
+                    viewModel.handleLiveVoiceUtterance(finalText) { startLiveListeningRef[0]?.invoke() }
+                } else if (latestVoiceSettings.autoSendVoiceCommands) {
                     viewModel.sendUserMessage(finalText)
                 } else {
                     voiceFinalEvent = System.currentTimeMillis() to finalText
@@ -138,15 +176,50 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             },
             onVoiceError = { errMsg ->
                 voicePartialText = ""
+                if (latestDestination == AppDestination.LIVE_VOICE) {
+                    viewModel.setLiveVoicePhase(LiveVoicePhase.IDLE)
+                }
                 viewModel.showMessage(errMsg)
+            },
+            onSilenceTimeout = {
+                voicePartialText = ""
+                if (latestDestination == AppDestination.LIVE_VOICE && latestLiveContinuous) {
+                    scope.launch {
+                        delay(350L)
+                        if (latestDestination == AppDestination.LIVE_VOICE && latestLiveContinuous) {
+                            startLiveListeningRef[0]?.invoke()
+                        }
+                    }
+                } else if (latestDestination == AppDestination.LIVE_VOICE) {
+                    viewModel.setLiveVoicePhase(LiveVoicePhase.IDLE)
+                }
             }
         )
     }
 
+    val startLiveListeningNow: () -> Unit = {
+        AgentSpeechFeedback.stopSpeaking()
+        voiceController.stopSpeaking()
+        viewModel.setLiveUserTranscript("")
+        viewModel.setLiveVoicePhase(LiveVoicePhase.LISTENING)
+        voiceController.startListening(
+            language = latestVoiceSettings.voiceLanguage,
+            continuousSoftRetry = latestLiveContinuous
+        )
+    }
+    startLiveListeningRef[0] = startLiveListeningNow
+
     val isListening by voiceController.isListening.collectAsStateWithLifecycle()
-    val isSpeakingLocal by voiceController.isSpeaking.collectAsStateWithLifecycle()
+    val micRmsEnergy by voiceController.micRmsEnergy.collectAsStateWithLifecycle()
     val isSpeakingGlobal by AgentSpeechFeedback.isSpeaking.collectAsStateWithLifecycle()
-    val isSpeakingTts = isSpeakingLocal || isSpeakingGlobal
+    val playbackEnergy by AgentSpeechFeedback.playbackEnergy.collectAsStateWithLifecycle()
+    val usingNeuralVoiceNow by AgentSpeechFeedback.usingNeuralVoiceNow.collectAsStateWithLifecycle()
+    val isSpeakingTts = isSpeakingGlobal
+    val liveAudioEnergy = when {
+        isListening -> micRmsEnergy
+        uiState.liveVoicePhase == LiveVoicePhase.SPEAKING || isSpeakingGlobal -> playbackEnergy
+        else -> 0.08f
+    }
 
     val stopAllSpeaking: () -> Unit = {
         voiceController.stopSpeaking()
@@ -157,9 +230,11 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         onDispose { voiceController.destroy() }
     }
 
-    // Yield WakeWordListeningService mic whenever the main chat mic is listening
-    LaunchedEffect(isListening) {
-        WakeWordListeningService.setExternalMicBusy(isListening)
+    // Yield WakeWordListeningService mic whenever the main chat mic or Live Voice screen is active
+    LaunchedEffect(isListening, uiState.destination) {
+        WakeWordListeningService.setExternalMicBusy(
+            isListening || uiState.destination == AppDestination.LIVE_VOICE
+        )
     }
 
     // Native Compose ActivityResultContracts permission launchers (no Accompanist)
@@ -170,12 +245,18 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         if (granted && enableWakeWordAfterPermission) {
             enableWakeWordAfterPermission = false
             viewModel.setWakeWordEnabled(true)
+        } else if (granted && startLiveVoiceAfterPermission) {
+            startLiveVoiceAfterPermission = false
+            viewModel.resetLiveVoiceSession()
+            viewModel.navigateTo(AppDestination.LIVE_VOICE)
+            startLiveListeningNow()
         } else if (granted && startMicAfterPermission) {
             startMicAfterPermission = false
             voicePartialText = ""
             voiceController.startListening(latestVoiceSettings.voiceLanguage)
         } else {
             startMicAfterPermission = false
+            startLiveVoiceAfterPermission = false
             enableWakeWordAfterPermission = false
             if (!granted) {
                 viewModel.showMessage("Microphone permission denied. Allow it in Setup & Test -> Permissions Center.")
@@ -211,10 +292,11 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
     val sessionMountMillis = remember { System.currentTimeMillis() }
     var lastSpokenMessageId by remember { mutableStateOf<String?>(null) }
     val latestMsg = uiState.chatMessages.lastOrNull()
-    LaunchedEffect(latestMsg?.id, uiState.voiceSettings.speakRepliesAloud) {
+    LaunchedEffect(latestMsg?.id, uiState.voiceSettings.speakRepliesAloud, uiState.destination) {
         if (
             uiState.voiceSettings.speakRepliesAloud &&
-            uiState.agentMode == AgentMode.CHAT_ONLY &&
+            uiState.agentMode != AgentMode.AGENT_CONTROL &&
+            uiState.destination != AppDestination.LIVE_VOICE &&
             latestMsg != null &&
             latestMsg.sender == MessageSender.AGENT &&
             latestMsg.actionPlan == null &&
@@ -224,7 +306,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             latestMsg.text.isNotBlank()
         ) {
             lastSpokenMessageId = latestMsg.id
-            AgentSpeechFeedback.speak(context, latestMsg.text, uiState.voiceSettings.voiceLanguage)
+            AgentSpeechFeedback.speak(context, latestMsg.text, uiState.voiceSettings)
         }
     }
 
@@ -242,6 +324,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             when (event) {
                 Lifecycle.Event.ON_RESUME -> {
                     AgentSpeechFeedback.isMainAppInForeground = true
+                    WakeWordListeningService.setAppInForeground(true)
                     viewModel.refreshPermissionsStatus()
                     val (running, statusText) = latestRunningState
                     AgentNotificationHelper.syncPersistentNotification(
@@ -253,6 +336,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                 }
                 Lifecycle.Event.ON_PAUSE -> {
                     AgentSpeechFeedback.isMainAppInForeground = false
+                    WakeWordListeningService.setAppInForeground(false)
                 }
                 else -> Unit
             }
@@ -260,6 +344,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             AgentSpeechFeedback.isMainAppInForeground = false
+            WakeWordListeningService.setAppInForeground(false)
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
@@ -292,6 +377,29 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             putExtra(VoiceOverlayActivity.EXTRA_WAKE_TRIGGERED, true)
         }
         runCatching { context.startActivity(overlayIntent) }
+    }
+
+    val openLiveVoiceMode: () -> Unit = {
+        stopAllSpeaking()
+        val hasMic = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasMic) {
+            viewModel.resetLiveVoiceSession()
+            viewModel.navigateTo(AppDestination.LIVE_VOICE)
+            startLiveListeningNow()
+        } else {
+            startLiveVoiceAfterPermission = true
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    val exitLiveVoiceMode: () -> Unit = {
+        voiceController.stopListening()
+        stopAllSpeaking()
+        viewModel.resetLiveVoiceSession()
+        viewModel.navigateTo(AppDestination.CHAT)
     }
 
     val onToggleMic: () -> Unit = {
@@ -364,6 +472,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
     BackHandler(enabled = drawerState.isOpen || uiState.destination != AppDestination.CHAT) {
         if (drawerState.isOpen) {
             scope.launch { drawerState.close() }
+        } else if (uiState.destination == AppDestination.LIVE_VOICE) {
+            exitLiveVoiceMode()
         } else {
             viewModel.navigateTo(AppDestination.CHAT)
         }
@@ -375,119 +485,273 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             gesturesEnabled = uiState.destination == AppDestination.CHAT,
             drawerContent = {
                 ModalDrawerSheet(
-                    modifier = Modifier.widthIn(max = 300.dp),
+                    modifier = Modifier.widthIn(max = 312.dp),
                     drawerContainerColor = MaterialTheme.colorScheme.surface
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 20.dp)
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
                     ) {
-                        Text(
-                            text = "My Personal Agent",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = MaterialTheme.colorScheme.onSurface
+                        Column(
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 20.dp)
+                        ) {
+                            Text(
+                                text = "My Personal Agent",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = uiState.activeHeaderLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        NavigationDrawerItem(
+                            label = { Text("New Chat") },
+                            icon = { Icon(Icons.Outlined.AddComment, contentDescription = null) },
+                            selected = false,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                stopAllSpeaking()
+                                viewModel.startNewChat()
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_new_chat")
                         )
-                        Text(
-                            text = uiState.activeProvider?.displayName ?: "On-device AI & phone control",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+
+                        // Saved Multi-Thread Chats Section
+                        if (uiState.chatThreads.isNotEmpty() || uiState.threadSearchQuery.isNotBlank()) {
+                            HorizontalDivider(
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                            )
+                            Text(
+                                text = stringResource(R.string.drawer_saved_chats),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                            )
+                            if (uiState.chatThreads.size >= 2 || uiState.threadSearchQuery.isNotBlank()) {
+                                OutlinedTextField(
+                                    value = uiState.threadSearchQuery,
+                                    onValueChange = viewModel::updateThreadSearchQuery,
+                                    placeholder = {
+                                        Text(
+                                            text = stringResource(R.string.drawer_search_chats_hint),
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Search,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    },
+                                    trailingIcon = if (uiState.threadSearchQuery.isNotBlank()) {
+                                        {
+                                            IconButton(onClick = { viewModel.updateThreadSearchQuery("") }) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Close,
+                                                    contentDescription = "Clear search",
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        null
+                                    },
+                                    singleLine = true,
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                                        .testTag("drawer_thread_search")
+                                )
+                            }
+
+                            uiState.chatThreads.take(12).forEach { thread ->
+                                val isSelected = thread.id == uiState.sessionId && uiState.destination == AppDestination.CHAT
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 2.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(
+                                            if (isSelected) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                                            else MaterialTheme.colorScheme.surface
+                                        )
+                                        .clickable {
+                                            scope.launch { drawerState.close() }
+                                            stopAllSpeaking()
+                                            viewModel.selectChatThread(thread.id)
+                                        }
+                                        .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp)
+                                        .testTag("drawer_thread_${thread.id}"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.ChatBubbleOutline,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = thread.title,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                            else MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "${thread.messageCount} msgs",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = { viewModel.deleteChatThread(thread.id) },
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .testTag("delete_thread_${thread.id}")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Outlined.DeleteOutline,
+                                            contentDescription = "Delete chat",
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
                         )
+
+                        NavigationDrawerItem(
+                            label = { Text(stringResource(R.string.drawer_live_voice_label)) },
+                            icon = { Icon(Icons.Outlined.AutoAwesome, contentDescription = null) },
+                            badge = { Text("3D") },
+                            selected = uiState.destination == AppDestination.LIVE_VOICE,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                openLiveVoiceMode()
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_live_voice")
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text(stringResource(R.string.drawer_memory_db_label)) },
+                            icon = { Icon(Icons.Outlined.Storage, contentDescription = null) },
+                            badge = {
+                                val total = uiState.memories.size + uiState.openTasksCount
+                                if (total > 0) Text("$total")
+                            },
+                            selected = uiState.destination == AppDestination.MEMORY_DB,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                viewModel.navigateTo(AppDestination.MEMORY_DB)
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_memory_db")
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text("Hands-Free \"${uiState.voiceSettings.wakePhrase}\"") },
+                            icon = { Icon(Icons.Outlined.GraphicEq, contentDescription = null) },
+                            badge = {
+                                Text(if (uiState.voiceSettings.wakeWordEnabled) "ON" else "OFF")
+                            },
+                            selected = uiState.voiceSettings.wakeWordEnabled,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                onToggleWakeWord(!uiState.voiceSettings.wakeWordEnabled)
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_wake_word")
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text("Test Approval Demo") },
+                            icon = { Icon(Icons.Outlined.PlayCircle, contentDescription = null) },
+                            selected = false,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                viewModel.triggerApprovalDemo()
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_test_demo")
+                        )
+
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text("Approvals") },
+                            icon = { Icon(Icons.Outlined.Checklist, contentDescription = null) },
+                            badge = if (uiState.pendingApprovalsCount > 0) {
+                                { Text("${uiState.pendingApprovalsCount}") }
+                            } else {
+                                null
+                            },
+                            selected = uiState.destination == AppDestination.APPROVALS,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                viewModel.navigateTo(AppDestination.APPROVALS)
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_approvals")
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text("Setup & Test") },
+                            icon = { Icon(Icons.Outlined.Build, contentDescription = null) },
+                            badge = { Text("${uiState.permissionsStatus.grantedCount}/6") },
+                            selected = uiState.destination == AppDestination.SETUP,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                viewModel.refreshPermissionsStatus()
+                                viewModel.navigateTo(AppDestination.SETUP)
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_setup")
+                        )
+
+                        NavigationDrawerItem(
+                            label = { Text("Settings / API Keys") },
+                            icon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
+                            selected = uiState.destination == AppDestination.SETTINGS,
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                viewModel.navigateTo(AppDestination.SETTINGS)
+                            },
+                            modifier = Modifier
+                                .padding(NavigationDrawerItemDefaults.ItemPadding)
+                                .testTag("drawer_settings")
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
                     }
-
-                    NavigationDrawerItem(
-                        label = { Text("New Chat") },
-                        icon = { Icon(Icons.Outlined.AddComment, contentDescription = null) },
-                        selected = false,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            stopAllSpeaking()
-                            viewModel.startNewChat()
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_new_chat")
-                    )
-
-                    NavigationDrawerItem(
-                        label = { Text("Hands-Free \"${uiState.voiceSettings.wakePhrase}\"") },
-                        icon = { Icon(Icons.Outlined.GraphicEq, contentDescription = null) },
-                        badge = {
-                            Text(if (uiState.voiceSettings.wakeWordEnabled) "ON" else "OFF")
-                        },
-                        selected = uiState.voiceSettings.wakeWordEnabled,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            onToggleWakeWord(!uiState.voiceSettings.wakeWordEnabled)
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_wake_word")
-                    )
-
-                    NavigationDrawerItem(
-                        label = { Text("Test Approval Demo") },
-                        icon = { Icon(Icons.Outlined.PlayCircle, contentDescription = null) },
-                        selected = false,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            viewModel.triggerApprovalDemo()
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_test_demo")
-                    )
-
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
-                    )
-
-                    NavigationDrawerItem(
-                        label = { Text("Approvals") },
-                        icon = { Icon(Icons.Outlined.Checklist, contentDescription = null) },
-                        badge = if (uiState.pendingApprovalsCount > 0) {
-                            { Text("${uiState.pendingApprovalsCount}") }
-                        } else {
-                            null
-                        },
-                        selected = uiState.destination == AppDestination.APPROVALS,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            viewModel.navigateTo(AppDestination.APPROVALS)
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_approvals")
-                    )
-
-                    NavigationDrawerItem(
-                        label = { Text("Setup & Test") },
-                        icon = { Icon(Icons.Outlined.Build, contentDescription = null) },
-                        badge = { Text("${uiState.permissionsStatus.grantedCount}/6") },
-                        selected = uiState.destination == AppDestination.SETUP,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            viewModel.refreshPermissionsStatus()
-                            viewModel.navigateTo(AppDestination.SETUP)
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_setup")
-                    )
-
-                    NavigationDrawerItem(
-                        label = { Text("Settings / API Keys") },
-                        icon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
-                        selected = uiState.destination == AppDestination.SETTINGS,
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            viewModel.navigateTo(AppDestination.SETTINGS)
-                        },
-                        modifier = Modifier
-                            .padding(NavigationDrawerItemDefaults.ItemPadding)
-                            .testTag("drawer_settings")
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
                 }
             }
         ) {
@@ -497,6 +761,10 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         messages = uiState.chatMessages,
                         providers = uiState.providers,
                         activeProvider = uiState.activeProvider,
+                        activeHeaderLabel = uiState.activeHeaderLabel,
+                        isUsingBuiltInGemini = uiState.isUsingBuiltInGemini,
+                        builtInGeminiSettings = uiState.builtInGeminiSettings,
+                        streamingAssistantText = uiState.streamingAssistantText,
                         agentMode = uiState.agentMode,
                         quickActionChips = uiState.quickActionChips,
                         showStepPlan = uiState.safetyRules.showStepPlan,
@@ -510,6 +778,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         voicePartialText = voicePartialText,
                         voiceFinalEvent = voiceFinalEvent,
                         onToggleMic = onToggleMic,
+                        onOpenLiveVoice = openLiveVoiceMode,
+                        onToggleGoogleSearch = viewModel::toggleGoogleSearchGrounding,
                         onToggleVoiceLanguage = viewModel::toggleVoiceLanguage,
                         onStopSpeaking = stopAllSpeaking,
                         onConsumeVoiceFinal = { voiceFinalEvent = null },
@@ -519,6 +789,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             stopAllSpeaking()
                             viewModel.startNewChat()
                         },
+                        onSelectBuiltInGemini = viewModel::selectBuiltInGeminiModel,
                         onSelectProvider = viewModel::selectDefaultProvider,
                         onToggleMode = viewModel::setAgentMode,
                         onSendMessage = viewModel::sendUserMessage,
@@ -528,7 +799,57 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         onOpenSettingsProviders = {
                             viewModel.jumpToSettingsSection(SettingsFocusSection.PROVIDERS)
                         },
-                        onCopyMessage = viewModel::showMessage
+                        onCopyMessage = viewModel::showMessage,
+                        memorySuggestions = uiState.memorySuggestions,
+                        onSaveToMemory = viewModel::saveMessageToMemory,
+                        onAcceptSuggestion = viewModel::acceptMemorySuggestion,
+                        onDismissSuggestion = viewModel::dismissMemorySuggestion
+                    )
+
+                    AppDestination.LIVE_VOICE -> LiveVoiceScreen(
+                        phase = if (isListening) LiveVoicePhase.LISTENING else uiState.liveVoicePhase,
+                        liveAudioEnergy = liveAudioEnergy,
+                        liveUserTranscript = uiState.liveUserTranscript,
+                        liveAgentCaption = uiState.liveAgentCaption,
+                        groundingSources = uiState.liveGroundingSources,
+                        voiceLanguage = uiState.voiceSettings.voiceLanguage,
+                        voicePersonaLabel = uiState.voiceSettings.voicePersona.displayName,
+                        usingNeuralVoice = uiState.voiceSettings.useGeminiNeuralVoice && usingNeuralVoiceNow,
+                        googleSearchEnabled = uiState.builtInGeminiSettings.googleSearchEnabled,
+                        continuousHandsFree = uiState.liveContinuousMode,
+                        memoryCount = uiState.memories.size,
+                        pendingApprovalPlan = uiState.livePendingApprovalPlan,
+                        onToggleMicOrBargeIn = {
+                            if (isListening) {
+                                voiceController.stopListening()
+                                viewModel.setLiveVoicePhase(LiveVoicePhase.IDLE)
+                            } else {
+                                startLiveListeningNow()
+                            }
+                        },
+                        onToggleGoogleSearch = viewModel::toggleGoogleSearchGrounding,
+                        onToggleLanguage = viewModel::toggleVoiceLanguage,
+                        onToggleContinuous = viewModel::toggleLiveContinuousMode,
+                        onApprovePendingPlan = approveWithNotificationCheck,
+                        onCancelPendingPlan = viewModel::cancelAction,
+                        onEndSession = exitLiveVoiceMode
+                    )
+
+                    AppDestination.MEMORY_DB -> MemoryDatabaseScreen(
+                        memories = uiState.memories,
+                        tasks = uiState.tasks,
+                        logs = uiState.sqlLogs,
+                        searchQuery = uiState.sqlSearchQuery,
+                        onSearchQueryChange = viewModel::updateSqlSearchQuery,
+                        onAddMemory = viewModel::addMemory,
+                        onToggleMemoryPin = viewModel::toggleMemoryPin,
+                        onDeleteMemory = viewModel::deleteMemory,
+                        onAddTask = viewModel::addTask,
+                        onToggleTaskCompleted = viewModel::toggleTaskCompleted,
+                        onDeleteTask = viewModel::deleteTask,
+                        onClearCompletedTasks = viewModel::clearCompletedTasks,
+                        onClearLogs = viewModel::clearSqlLogs,
+                        onBack = { viewModel.navigateTo(AppDestination.CHAT) }
                     )
 
                     AppDestination.APPROVALS -> ApprovalsScreen(
@@ -563,6 +884,9 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                     AppDestination.SETTINGS -> SettingsScreen(
                         uiState = uiState,
                         onBack = { viewModel.navigateTo(AppDestination.CHAT) },
+                        onSelectBuiltInGemini = viewModel::selectBuiltInGeminiModel,
+                        onUpdateBuiltInGeminiSettings = viewModel::updateBuiltInGeminiSettings,
+                        onOpenMemoryDatabase = { viewModel.navigateTo(AppDestination.MEMORY_DB) },
                         onSaveProvider = viewModel::saveProvider,
                         onDeleteProvider = viewModel::deleteProvider,
                         onSelectDefaultProvider = viewModel::selectDefaultProvider,
@@ -574,6 +898,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         onToggleWakeWord = onToggleWakeWord,
                         onUpdateWakePhrase = viewModel::updateWakePhrase,
                         onTestVoiceWakeUp = onTestVoiceWakeUp,
+                        onTestVoice = viewModel::testCurrentVoice,
                         onShowMessage = viewModel::showMessage,
                         onOpenPermissionsCenter = {
                             viewModel.refreshPermissionsStatus()

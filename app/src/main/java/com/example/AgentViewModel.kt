@@ -5,10 +5,12 @@ import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -31,7 +33,7 @@ data class AgentUiState(
     val installedAppsCount: Int = 0,
     val quickActionChips: List<String> = DefaultQuickChips.items,
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
-    val agentMode: AgentMode = AgentMode.CHAT_ONLY,
+    val agentMode: AgentMode = AgentMode.SMART_AUTO,
     val connectionTestPassed: Boolean = false,
     val isSending: Boolean = false,
     val isAgentLoopRunning: Boolean = false,
@@ -45,10 +47,35 @@ data class AgentUiState(
     val fetchedModels: List<String> = emptyList(),
     val fetchModelsNote: String? = null,
     val isWakeWordServiceRunning: Boolean = false,
+    val builtInGeminiSettings: BuiltInGeminiSettings = BuiltInGeminiSettings(),
+    val streamingAssistantText: String = "",
+    val memories: List<MemoryEntity> = emptyList(),
+    val tasks: List<TaskEntity> = emptyList(),
+    val sqlLogs: List<AgentSqlLogEntity> = emptyList(),
+    val sqlSearchQuery: String = "",
+    val chatThreads: List<ChatThreadEntity> = emptyList(),
+    val threadSearchQuery: String = "",
+    val memorySuggestions: Map<String, MemorySuggestion> = emptyMap(),
+    val liveVoicePhase: LiveVoicePhase = LiveVoicePhase.IDLE,
+    val liveUserTranscript: String = "",
+    val liveAgentCaption: String = "",
+    val liveGroundingSources: List<GroundingSource> = emptyList(),
+    val liveContinuousMode: Boolean = true,
+    val livePendingApprovalPlan: ActionPlan? = null,
     val snackbarMessage: String? = null
 ) {
     val activeProvider: AiProvider?
         get() = providers.firstOrNull { it.isDefault } ?: providers.firstOrNull()
+
+    val isUsingBuiltInGemini: Boolean
+        get() = builtInGeminiSettings.useBuiltInGemini || providers.isEmpty()
+
+    val activeHeaderLabel: String
+        get() = if (isUsingBuiltInGemini) {
+            builtInGeminiSettings.selectedModel.displayName
+        } else {
+            activeProvider?.displayName ?: "No AI Provider"
+        }
 
     val activeProviderResolvedUrl: String
         get() = activeProvider?.let { providerResolvedUrls[it.id] }.orEmpty()
@@ -56,12 +83,15 @@ data class AgentUiState(
     val pendingApprovalsCount: Int
         get() = approvalHistory.count { it.status == ApprovalStatus.PENDING }
 
+    val openTasksCount: Int
+        get() = tasks.count { !it.isCompleted }
+
     val isAccessibilityEnabled: Boolean
         get() = permissionsStatus.accessibilityEnabled
 
     // 3-step Setup Progress
     val step1Complete: Boolean
-        get() = providers.isNotEmpty()
+        get() = isUsingBuiltInGemini || providers.isNotEmpty()
 
     val step2Complete: Boolean
         get() = permissionsStatus.accessibilityEnabled
@@ -73,11 +103,17 @@ data class AgentUiState(
         get() = listOf(step1Complete, step2Complete, step3Complete).count { it }
 }
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appContext = application.applicationContext
     private val storage = LocalStorage(appContext)
     private val networkClient = NetworkClient()
+    private val firebaseAiService = FirebaseAiService()
+    private val sqlRepository = AgentSqlRepository(PersonalAgentDatabase.getInstance(appContext))
+    private val sqlSearchFlow = MutableStateFlow("")
+    private val threadSearchFlow = MutableStateFlow("")
+    private var seededInitialThread = false
 
     private val _uiState = MutableStateFlow(AgentUiState())
     val uiState: StateFlow<AgentUiState> = _uiState.asStateFlow()
@@ -170,8 +206,20 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         quickActionChips = persisted.quickActionChips,
                         themePreference = persisted.themePreference,
                         agentMode = persisted.agentMode,
-                        connectionTestPassed = persisted.connectionTestPassed
+                        connectionTestPassed = persisted.connectionTestPassed,
+                        builtInGeminiSettings = persisted.builtInGeminiSettings
                     )
+                }
+                AgentSpeechFeedback.updateCachedSettings(persisted.voiceSettings)
+                if (!seededInitialThread && persisted.chatMessages.isNotEmpty() && persisted.sessionId.isNotBlank()) {
+                    seededInitialThread = true
+                    if (sqlRepository.countThreads() == 0) {
+                        sqlRepository.upsertThread(
+                            id = persisted.sessionId,
+                            messages = persisted.chatMessages,
+                            messagesJson = storage.encodeChatMessages(persisted.chatMessages)
+                        )
+                    }
                 }
                 AgentNotificationHelper.syncPersistentNotification(
                     context = appContext,
@@ -186,6 +234,24 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     WakeWordListeningService.start(appContext, persisted.voiceSettings.wakePhrase)
                 }
             }
+        }
+
+        // Reactive Room SQLite database observers (supports live SQL LIKE search)
+        viewModelScope.launch {
+            sqlSearchFlow.flatMapLatest { q -> sqlRepository.searchMemories(q) }
+                .collect { list -> _uiState.update { it.copy(memories = list) } }
+        }
+        viewModelScope.launch {
+            sqlSearchFlow.flatMapLatest { q -> sqlRepository.searchTasks(q) }
+                .collect { list -> _uiState.update { it.copy(tasks = list) } }
+        }
+        viewModelScope.launch {
+            sqlSearchFlow.flatMapLatest { q -> sqlRepository.searchLogs(q) }
+                .collect { list -> _uiState.update { it.copy(sqlLogs = list) } }
+        }
+        viewModelScope.launch {
+            threadSearchFlow.flatMapLatest { q -> sqlRepository.searchThreads(q) }
+                .collect { list -> _uiState.update { it.copy(chatThreads = list) } }
         }
     }
 
@@ -230,6 +296,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     fun updateVoiceSettings(transform: (VoiceSettings) -> VoiceSettings) {
         val updated = transform(_uiState.value.voiceSettings)
         _uiState.update { it.copy(voiceSettings = updated) }
+        AgentSpeechFeedback.updateCachedSettings(updated)
         if (!updated.speakRepliesAloud) {
             AgentSpeechFeedback.stopSpeaking()
         }
@@ -280,29 +347,665 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleVoiceLanguage() {
-        val next = if (_uiState.value.voiceSettings.voiceLanguage == VoiceLanguage.EN_IN) {
-            VoiceLanguage.TE_IN
-        } else {
-            VoiceLanguage.EN_IN
-        }
+        val next = _uiState.value.voiceSettings.voiceLanguage.next()
         updateVoiceSettings { it.copy(voiceLanguage = next) }
         showMessage("Voice language: ${next.displayName}")
     }
 
+    fun testCurrentVoice() {
+        val vs = _uiState.value.voiceSettings
+        val sample = when (vs.voiceLanguage) {
+            VoiceLanguage.TE_IN -> "నమస్కారం! నేను మీ పర్సనల్ ఏజెంట్. నేను మీకు ఎలా సహాయం చేయగలను?"
+            VoiceLanguage.AUTO -> "Hi! I am ${vs.voicePersona.displayName}, your personal agent. Ready in English and Telugu."
+            VoiceLanguage.EN_IN -> "Hi! I am ${vs.voicePersona.displayName}, your personal agent. How can I help you today?"
+        }
+        AgentSpeechFeedback.speak(
+            context = appContext,
+            text = sample,
+            voiceSettings = vs
+        )
+    }
+
+    fun selectBuiltInGeminiModel(model: GeminiBuiltInModel) {
+        val updated = _uiState.value.builtInGeminiSettings.copy(
+            useBuiltInGemini = true,
+            selectedModel = model
+        )
+        _uiState.update {
+            it.copy(
+                builtInGeminiSettings = updated,
+                snackbarMessage = "Switched to Built-in ${model.displayName}"
+            )
+        }
+        viewModelScope.launch {
+            storage.saveBuiltInGeminiSettings(updated)
+        }
+    }
+
+    fun updateBuiltInGeminiSettings(transform: (BuiltInGeminiSettings) -> BuiltInGeminiSettings) {
+        val updated = transform(_uiState.value.builtInGeminiSettings)
+        _uiState.update { it.copy(builtInGeminiSettings = updated) }
+        viewModelScope.launch {
+            storage.saveBuiltInGeminiSettings(updated)
+        }
+    }
+
+    fun toggleGoogleSearchGrounding() {
+        val next = !_uiState.value.builtInGeminiSettings.googleSearchEnabled
+        updateBuiltInGeminiSettings { it.copy(googleSearchEnabled = next) }
+        showMessage(if (next) "Google Search Grounding ON" else "Google Search Grounding OFF")
+    }
+
     fun selectDefaultProvider(providerId: String) {
         val current = _uiState.value.providers
-        if (current.firstOrNull { it.isDefault }?.id == providerId) return
         val updated = current.map { it.copy(isDefault = it.id == providerId) }
         val chosen = updated.firstOrNull { it.id == providerId }
+        val updatedGemini = _uiState.value.builtInGeminiSettings.copy(useBuiltInGemini = false)
         _uiState.update {
             it.copy(
                 providers = updated,
+                builtInGeminiSettings = updatedGemini,
                 snackbarMessage = chosen?.let { p -> "Switched to ${p.displayName}" }
             )
         }
         viewModelScope.launch {
             storage.saveProviders(updated)
+            storage.saveBuiltInGeminiSettings(updatedGemini)
         }
+    }
+
+    // Room SQL Database (Memories, Tasks, Logs) actions
+    fun updateSqlSearchQuery(query: String) {
+        _uiState.update { it.copy(sqlSearchQuery = query) }
+        sqlSearchFlow.value = query
+    }
+
+    fun addMemory(category: String, title: String, content: String, isPinned: Boolean) {
+        if (content.isBlank()) return
+        if (_uiState.value.safetyRules.blockSensitiveFinancial) {
+            val violation = SafetyGuardrail.detectSensitiveViolation(title, content)
+            if (violation != null) {
+                showMessage("Blocked by Safety Guardrail ($violation): secrets cannot be saved in SQL Memory.")
+                return
+            }
+        }
+        viewModelScope.launch {
+            sqlRepository.addMemory(category, title, content, isPinned)
+            showMessage("Memory saved to SQL database")
+        }
+    }
+
+    fun toggleMemoryPin(id: Long, pinned: Boolean) {
+        viewModelScope.launch { sqlRepository.toggleMemoryPin(id, pinned) }
+    }
+
+    fun deleteMemory(id: Long) {
+        viewModelScope.launch {
+            sqlRepository.deleteMemory(id)
+            showMessage("Memory removed")
+        }
+    }
+
+    fun addTask(title: String, notes: String, priority: String, dueLabel: String) {
+        if (title.isBlank()) return
+        viewModelScope.launch {
+            sqlRepository.addTask(title, notes, priority, dueLabel)
+            showMessage("Task added to SQL database")
+        }
+    }
+
+    fun toggleTaskCompleted(id: Long, completed: Boolean) {
+        viewModelScope.launch { sqlRepository.setTaskCompleted(id, completed) }
+    }
+
+    fun deleteTask(id: Long) {
+        viewModelScope.launch {
+            sqlRepository.deleteTask(id)
+            showMessage("Task deleted")
+        }
+    }
+
+    fun clearCompletedTasks() {
+        viewModelScope.launch {
+            sqlRepository.clearCompletedTasks()
+            showMessage("Completed tasks cleared")
+        }
+    }
+
+    fun clearSqlLogs() {
+        viewModelScope.launch {
+            sqlRepository.clearAllLogs()
+            showMessage("SQL logs cleared")
+        }
+    }
+
+    // Multi-Thread Saved Chat Drawer actions
+    fun updateThreadSearchQuery(query: String) {
+        _uiState.update { it.copy(threadSearchQuery = query) }
+        threadSearchFlow.value = query
+    }
+
+    fun selectChatThread(threadId: String) {
+        if (_uiState.value.isAgentLoopRunning) {
+            stopRunningAgent()
+        }
+        viewModelScope.launch {
+            val entity = sqlRepository.getThreadById(threadId) ?: return@launch
+            val decoded = storage.decodeChatMessages(entity.messagesJson)
+            storage.switchActiveChatSession(entity.id, decoded)
+            _uiState.update {
+                it.copy(
+                    destination = AppDestination.CHAT,
+                    sessionId = entity.id,
+                    chatMessages = decoded,
+                    memorySuggestions = emptyMap(),
+                    livePendingApprovalPlan = null,
+                    isSending = false
+                )
+            }
+        }
+    }
+
+    fun deleteChatThread(threadId: String) {
+        viewModelScope.launch {
+            val deletingActive = _uiState.value.sessionId == threadId
+            sqlRepository.deleteThread(threadId)
+            if (deletingActive) {
+                val remaining = _uiState.value.chatThreads.firstOrNull { it.id != threadId }
+                if (remaining != null) {
+                    selectChatThread(remaining.id)
+                } else {
+                    startNewChat()
+                }
+            }
+            showMessage("Chat removed")
+        }
+    }
+
+    // One-Tap Save to Memory & Auto-Extracted Suggestions
+    fun saveMessageToMemory(message: ChatMessage) {
+        val cleaned = SpeechTextCleaner.cleanForSpeech(message.text).trim()
+        if (cleaned.isBlank()) return
+        if (_uiState.value.safetyRules.blockSensitiveFinancial) {
+            val violation = SafetyGuardrail.detectSensitiveViolation(cleaned)
+            if (violation != null) {
+                showMessage("Blocked by Safety Guardrail ($violation): secrets cannot be saved in Memory.")
+                return
+            }
+        }
+        val title = cleaned.take(48).let { if (cleaned.length > 48) "$it…" else it }
+        viewModelScope.launch {
+            sqlRepository.addMemory(
+                category = "Saved Note",
+                title = title,
+                content = cleaned.take(400),
+                isPinned = false
+            )
+            showMessage("Saved to Memory DB")
+        }
+    }
+
+    fun acceptMemorySuggestion(suggestion: MemorySuggestion) {
+        _uiState.update { it.copy(memorySuggestions = it.memorySuggestions - suggestion.anchorMessageId) }
+        viewModelScope.launch {
+            when (suggestion.kind) {
+                SuggestionKind.MEMORY -> {
+                    sqlRepository.addMemory(
+                        category = suggestion.category,
+                        title = suggestion.title,
+                        content = suggestion.content,
+                        isPinned = true
+                    )
+                    showMessage("Saved to Memory: ${suggestion.title.take(32)}")
+                }
+                SuggestionKind.TASK -> {
+                    sqlRepository.addTask(
+                        title = suggestion.title,
+                        notes = suggestion.content,
+                        priority = "NORMAL"
+                    )
+                    showMessage("Task added: ${suggestion.title.take(32)}")
+                }
+            }
+        }
+    }
+
+    fun dismissMemorySuggestion(anchorMessageId: String) {
+        _uiState.update { it.copy(memorySuggestions = it.memorySuggestions - anchorMessageId) }
+    }
+
+    private fun maybeAttachMemorySuggestion(userText: String, anchorMessageId: String) {
+        val suggestion = SmartMemorySuggestionDetector.detect(userText, anchorMessageId) ?: return
+        _uiState.update { current ->
+            current.copy(memorySuggestions = current.memorySuggestions + (anchorMessageId to suggestion))
+        }
+    }
+
+    private suspend fun persistMessagesAndThread(
+        messages: List<ChatMessage>,
+        approvals: List<ApprovalRecord>? = null
+    ) {
+        if (approvals != null) {
+            storage.saveChatAndApprovals(messages, approvals)
+        } else {
+            storage.saveChatMessages(messages)
+        }
+        val activeSession = _uiState.value.sessionId
+        if (activeSession.isNotBlank() && messages.isNotEmpty()) {
+            sqlRepository.upsertThread(
+                id = activeSession,
+                messages = messages,
+                messagesJson = storage.encodeChatMessages(messages)
+            )
+        }
+    }
+
+    // Live Voice + 3D Conversation Engine
+    fun setLiveVoicePhase(phase: LiveVoicePhase) {
+        _uiState.update { it.copy(liveVoicePhase = phase) }
+    }
+
+    fun setLiveUserTranscript(text: String) {
+        _uiState.update { it.copy(liveUserTranscript = text) }
+    }
+
+    fun toggleLiveContinuousMode() {
+        val next = !_uiState.value.liveContinuousMode
+        _uiState.update { it.copy(liveContinuousMode = next) }
+        showMessage(if (next) "Continuous hands-free conversation ON" else "Single-turn push-to-talk ON")
+    }
+
+    fun resetLiveVoiceSession() {
+        _uiState.update {
+            it.copy(
+                liveVoicePhase = LiveVoicePhase.IDLE,
+                liveUserTranscript = "",
+                liveAgentCaption = "",
+                liveGroundingSources = emptyList(),
+                livePendingApprovalPlan = null
+            )
+        }
+    }
+
+    fun handleLiveVoiceUtterance(
+        rawUtterance: String,
+        onFinishedSpeaking: () -> Unit
+    ) {
+        val text = rawUtterance.trim()
+        if (text.isBlank()) {
+            _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.IDLE) }
+            return
+        }
+
+        val state = _uiState.value
+        val userMsg = ChatMessage(sender = MessageSender.USER, text = text)
+        val withUser = state.chatMessages + userMsg
+        _uiState.update {
+            it.copy(
+                chatMessages = withUser,
+                liveUserTranscript = text,
+                liveAgentCaption = "",
+                liveGroundingSources = emptyList(),
+                livePendingApprovalPlan = null,
+                liveVoicePhase = LiveVoicePhase.THINKING
+            )
+        }
+        maybeAttachMemorySuggestion(text, userMsg.id)
+
+        viewModelScope.launch {
+            persistMessagesAndThread(withUser)
+
+            // 1. Safety Guardrail check first
+            if (state.safetyRules.blockSensitiveFinancial) {
+                val violation = withContext(Dispatchers.Default) {
+                    SafetyGuardrail.detectSensitiveViolation(text)
+                }
+                if (violation != null) {
+                    val blockedReply = "I cannot help with $violation while financial safety protection is enabled."
+                    recordHardBlockedRequest(text, violation, withUser)
+                    speakLiveReply(blockedReply, emptyList(), onFinishedSpeaking)
+                    return@launch
+                }
+            }
+
+            // 2. Direct SQL Memory / Task voice commands
+            val sqlReply = tryHandleDirectSqlIntent(text, modeTag = "LIVE_VOICE")
+            if (sqlReply != null) {
+                speakLiveReply(sqlReply, emptyList(), onFinishedSpeaking)
+                return@launch
+            }
+
+            // 3. Direct deterministic phone actions during Live Voice (calls, messages, alarms, apps, YouTube, scroll)
+            val localTool = withContext(Dispatchers.Default) {
+                HybridToolRouting.matchDirectLocalTool(text)
+            }
+            if (localTool != null && localTool.tool != ToolName.REPLY_TO_USER) {
+                val createdPlan = dispatchRoutedToolCall(localTool, text, "Live · Instant")
+                if (localTool.shouldAutoRun(state.safetyRules)) {
+                    val confirm = "On it! ${localTool.title}."
+                    speakLiveReply(confirm, emptyList(), onFinishedSpeaking)
+                } else {
+                    _uiState.update { it.copy(livePendingApprovalPlan = createdPlan) }
+                    val askApprove = "I prepared a plan to ${localTool.title}. Tap Approve on screen to run it."
+                    speakLiveReply(askApprove, emptyList(), onFinishedSpeaking)
+                }
+                return@launch
+            }
+
+            val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
+                sqlRepository.buildPersonalContextBlock()
+            } else {
+                ""
+            }
+
+            // 3b. Full AI Hybrid Tool Router inside Live Voice when the utterance looks like a phone action
+            val looksLikeAction = withContext(Dispatchers.Default) {
+                SmartIntentClassifier.looksLikePhoneAction(text)
+            }
+            if (looksLikeAction) {
+                val installedNames = InstalledAppCache.getCached().map { it.displayName }
+                val routeResult = routeHybridWithFallback(
+                    state = state,
+                    userGoal = text,
+                    installedNames = installedNames,
+                    messagesWithUser = withUser,
+                    sqlContext = sqlContext
+                )
+                if (routeResult is ToolRouteApiResult.Success && routeResult.toolCall.tool != ToolName.REPLY_TO_USER) {
+                    val routed = routeResult.toolCall
+                    val createdPlan = dispatchRoutedToolCall(routed, text, "Live · Smart Action")
+                    if (routed.shouldAutoRun(state.safetyRules)) {
+                        val confirm = "On it! ${routed.title}."
+                        speakLiveReply(confirm, emptyList(), onFinishedSpeaking)
+                    } else {
+                        _uiState.update { it.copy(livePendingApprovalPlan = createdPlan) }
+                        val askApprove = "This action needs your approval: ${routed.title}. Tap Approve to run it."
+                        speakLiveReply(askApprove, emptyList(), onFinishedSpeaking)
+                    }
+                    return@launch
+                }
+            }
+
+            // 4. Streaming Gemini Live conversational turn with Sentence-Pipelined Neural Voice + Google Search + SQL Memory
+            if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+                var streamOpened = false
+                var spokenCursor = 0
+                var pendingSpeechBuf = ""
+                val activeVoiceSettings = _uiState.value.voiceSettings
+                val onLiveTurnFinished: () -> Unit = {
+                    if (_uiState.value.destination == AppDestination.LIVE_VOICE) {
+                        if (_uiState.value.liveContinuousMode) {
+                            onFinishedSpeaking()
+                        } else {
+                            _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.IDLE) }
+                        }
+                    }
+                }
+                val ensureSpeechStreamOpen = {
+                    if (!streamOpened) {
+                        streamOpened = true
+                        _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.SPEAKING) }
+                        AgentSpeechFeedback.beginSpeechStream(
+                            context = appContext,
+                            voiceSettings = activeVoiceSettings,
+                            onAllDone = onLiveTurnFinished
+                        )
+                    }
+                }
+
+                val result = firebaseAiService.streamChat(
+                    modelChoice = state.builtInGeminiSettings.selectedModel,
+                    conversationHistory = withUser,
+                    latestUserPrompt = text,
+                    enableGoogleSearch = state.builtInGeminiSettings.googleSearchEnabled,
+                    personalSqlContext = sqlContext,
+                    voiceLanguage = state.voiceSettings.voiceLanguage,
+                    isLiveVoice = true,
+                    onPartialText = { partial ->
+                        _uiState.update { it.copy(liveAgentCaption = partial) }
+                        if (partial.length > spokenCursor) {
+                            pendingSpeechBuf += partial.substring(spokenCursor)
+                            spokenCursor = partial.length
+                            val (readySentences, remainder) = SpeechTextCleaner.extractReadySentences(pendingSpeechBuf)
+                            pendingSpeechBuf = remainder
+                            readySentences.forEach { sentence ->
+                                ensureSpeechStreamOpen()
+                                AgentSpeechFeedback.enqueueSentence(sentence)
+                            }
+                        }
+                    }
+                )
+                when (result) {
+                    is GeminiStreamResult.Success -> {
+                        val badge = buildString {
+                            append("Live · ${FirebaseAiService.displayNameForModelId(result.modelUsed)}")
+                            if (result.groundingSources.isNotEmpty()) append(" · Google Search")
+                        }
+                        val replyMsg = ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = result.text,
+                            groundingSources = result.groundingSources,
+                            modelBadge = badge
+                        )
+                        val updated = _uiState.value.chatMessages + replyMsg
+                        _uiState.update {
+                            it.copy(
+                                chatMessages = updated,
+                                liveAgentCaption = result.text,
+                                liveGroundingSources = result.groundingSources
+                            )
+                        }
+                        persistMessagesAndThread(updated)
+                        sqlRepository.recordInteractionLog(
+                            sessionId = state.sessionId,
+                            mode = "LIVE_VOICE",
+                            userPrompt = text,
+                            agentResponse = result.text,
+                            toolUsed = result.modelUsed,
+                            usedGoogleSearch = result.groundingSources.isNotEmpty()
+                        )
+
+                        // Flush remaining tail or full text into the streaming speech pipeline
+                        val tailText = if (streamOpened) {
+                            if (result.text.length > spokenCursor) {
+                                pendingSpeechBuf + result.text.substring(spokenCursor)
+                            } else {
+                                pendingSpeechBuf
+                            }
+                        } else {
+                            result.text
+                        }
+                        val cleanedTail = SpeechTextCleaner.cleanForSpeech(tailText)
+                        if (cleanedTail.isNotBlank()) {
+                            ensureSpeechStreamOpen()
+                            AgentSpeechFeedback.enqueueSentence(cleanedTail)
+                        }
+                        if (streamOpened) {
+                            AgentSpeechFeedback.finishSpeechStream()
+                        } else {
+                            onLiveTurnFinished()
+                        }
+                    }
+                    is GeminiStreamResult.Error -> {
+                        if (streamOpened) AgentSpeechFeedback.stopSpeaking()
+                        val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
+                        if (result.isRateLimit && fallbackCustom != null) {
+                            val liveSysPrompt = buildString {
+                                appendLine("You are My Personal Agent in a real-time spoken voice conversation. Reply warmly in 2 to 3 concise sentences without markdown formatting.")
+                                if (sqlContext.isNotBlank()) appendLine(sqlContext)
+                            }
+                            when (val customRes = networkClient.sendChatMessage(fallbackCustom, withUser, systemPrompt = liveSysPrompt)) {
+                                is ChatApiResult.Success -> {
+                                    val replyMsg = ChatMessage(
+                                        sender = MessageSender.AGENT,
+                                        text = customRes.reply,
+                                        modelBadge = "Live · ${fallbackCustom.displayName} (Fallback)"
+                                    )
+                                    val updated = _uiState.value.chatMessages + replyMsg
+                                    _uiState.update { it.copy(chatMessages = updated) }
+                                    persistMessagesAndThread(updated)
+                                    speakLiveReply(customRes.reply, emptyList(), onFinishedSpeaking)
+                                    return@launch
+                                }
+                                is ChatApiResult.Error -> Unit
+                            }
+                        }
+                        val errMsg = ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = result.message,
+                            isError = true,
+                            excludeFromContext = true
+                        )
+                        val updated = _uiState.value.chatMessages + errMsg
+                        _uiState.update {
+                            it.copy(
+                                chatMessages = updated,
+                                liveAgentCaption = result.message,
+                                liveVoicePhase = LiveVoicePhase.IDLE
+                            )
+                        }
+                        persistMessagesAndThread(updated)
+                    }
+                }
+            } else {
+                val customProvider = state.activeProvider!!
+                val liveSysPrompt = buildString {
+                    appendLine("You are My Personal Agent in a real-time spoken voice conversation. Reply warmly in 2 to 3 concise sentences without markdown formatting.")
+                    if (sqlContext.isNotBlank()) appendLine(sqlContext)
+                }
+                when (val res = networkClient.sendChatMessage(customProvider, withUser, systemPrompt = liveSysPrompt)) {
+                    is ChatApiResult.Success -> {
+                        val replyMsg = ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = res.reply,
+                            modelBadge = "Live · ${customProvider.displayName}"
+                        )
+                        val updated = _uiState.value.chatMessages + replyMsg
+                        _uiState.update { it.copy(chatMessages = updated) }
+                        persistMessagesAndThread(updated)
+                        sqlRepository.recordInteractionLog(
+                            sessionId = state.sessionId,
+                            mode = "LIVE_VOICE",
+                            userPrompt = text,
+                            agentResponse = res.reply,
+                            toolUsed = customProvider.modelName
+                        )
+                        speakLiveReply(res.reply, emptyList(), onFinishedSpeaking)
+                    }
+                    is ChatApiResult.Error -> {
+                        if (FirebaseAiService.isQuotaOrRateLimitMessage(res.message)) {
+                            val geminiFallback = firebaseAiService.streamChat(
+                                modelChoice = GeminiBuiltInModel.FLASH_LITE,
+                                conversationHistory = withUser,
+                                latestUserPrompt = text,
+                                enableGoogleSearch = false,
+                                personalSqlContext = sqlContext,
+                                voiceLanguage = state.voiceSettings.voiceLanguage,
+                                isLiveVoice = true,
+                                onPartialText = { partial ->
+                                    _uiState.update { it.copy(liveAgentCaption = partial) }
+                                }
+                            )
+                            if (geminiFallback is GeminiStreamResult.Success) {
+                                val replyMsg = ChatMessage(
+                                    sender = MessageSender.AGENT,
+                                    text = geminiFallback.text,
+                                    modelBadge = "Live · ${FirebaseAiService.displayNameForModelId(geminiFallback.modelUsed)}"
+                                )
+                                val updated = _uiState.value.chatMessages + replyMsg
+                                _uiState.update { it.copy(chatMessages = updated) }
+                                persistMessagesAndThread(updated)
+                                speakLiveReply(geminiFallback.text, emptyList(), onFinishedSpeaking)
+                                return@launch
+                            }
+                        }
+                        _uiState.update {
+                            it.copy(
+                                liveAgentCaption = res.message,
+                                liveVoicePhase = LiveVoicePhase.IDLE
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun speakLiveReply(
+        spokenText: String,
+        sources: List<GroundingSource>,
+        onFinishedSpeaking: () -> Unit
+    ) {
+        _uiState.update {
+            it.copy(
+                liveAgentCaption = spokenText,
+                liveGroundingSources = sources,
+                liveVoicePhase = LiveVoicePhase.SPEAKING
+            )
+        }
+        AgentSpeechFeedback.speak(
+            context = appContext,
+            text = spokenText,
+            voiceSettings = _uiState.value.voiceSettings,
+            onDone = {
+                if (_uiState.value.destination == AppDestination.LIVE_VOICE) {
+                    if (_uiState.value.liveContinuousMode) {
+                        onFinishedSpeaking()
+                    } else {
+                        _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.IDLE) }
+                    }
+                }
+            }
+        )
+    }
+
+    private suspend fun tryHandleDirectSqlIntent(rawText: String, modeTag: String): String? {
+        val intent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(rawText) }
+            ?: return null
+
+        val reply = when (intent) {
+            is SqlDirectIntent.SaveMemory -> {
+                sqlRepository.addMemory(intent.category, intent.title, intent.content, isPinned = true)
+                "Saved to your SQL Memory (${intent.category}): \"${intent.content}\""
+            }
+            is SqlDirectIntent.AddTask -> {
+                sqlRepository.addTask(intent.title, priority = intent.priority)
+                "Added task to your SQL database: \"${intent.title}\""
+            }
+            SqlDirectIntent.ListTasks -> {
+                val pending = PersonalAgentDatabase.getInstance(appContext).taskDao().getPendingTasks(10)
+                if (pending.isEmpty()) {
+                    "You have no open tasks in your SQL database right now."
+                } else {
+                    "Your open tasks:\n" + pending.mapIndexed { i, t -> "${i + 1}. ${t.title}" }.joinToString("\n")
+                }
+            }
+            SqlDirectIntent.ListMemories -> {
+                val mems = PersonalAgentDatabase.getInstance(appContext).memoryDao().getTopMemories(10)
+                if (mems.isEmpty()) {
+                    "No personal memories are saved yet. Tell me 'Remember that...' anytime!"
+                } else {
+                    "Saved SQL memories:\n" + mems.mapIndexed { i, m -> "${i + 1}. [${m.category}] ${m.content}" }.joinToString("\n")
+                }
+            }
+        }
+
+        val replyMsg = ChatMessage(
+            sender = MessageSender.AGENT,
+            text = reply,
+            modelBadge = "SQL Memory"
+        )
+        val updated = _uiState.value.chatMessages + replyMsg
+        _uiState.update { it.copy(chatMessages = updated) }
+        persistMessagesAndThread(updated)
+        sqlRepository.recordInteractionLog(
+            sessionId = _uiState.value.sessionId,
+            mode = modeTag,
+            userPrompt = rawText,
+            agentResponse = reply,
+            toolUsed = "sql_memory"
+        )
+        return reply
     }
 
     fun saveProvider(
@@ -433,15 +1136,14 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun runConnectionTest() {
-        val activeProvider = _uiState.value.activeProvider
-        if (activeProvider == null) {
-            showMessage("Add a custom AI provider in Settings first.")
-            return
-        }
-
+        val state = _uiState.value
         viewModelScope.launch {
             _uiState.update { it.copy(isTestingConnection = true) }
-            val providerResult = networkClient.testProviderConnection(activeProvider)
+            val providerResult = if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+                firebaseAiService.testBuiltInGeminiConnection(state.builtInGeminiSettings.selectedModel)
+            } else {
+                networkClient.testProviderConnection(state.activeProvider!!)
+            }
             val summary = ConnectionTestSummary(
                 testedAtMillis = System.currentTimeMillis(),
                 providerResult = providerResult
@@ -463,17 +1165,18 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isRunningSelfTest = true) }
 
-            // 1. Active AI Provider speed & JSON accuracy
-            val provider = _uiState.value.activeProvider
-            val aiItem = if (provider != null) {
-                networkClient.runSelfTestJsonProbe(provider)
-            } else {
+            // 1. Active AI Provider (Built-in Gemini or Custom) speed & accuracy
+            val state = _uiState.value
+            val aiItem = if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+                val detail = firebaseAiService.testBuiltInGeminiConnection(state.builtInGeminiSettings.selectedModel)
                 SelfTestItem(
                     id = "ai_provider",
-                    title = "AI Provider Speed & JSON Accuracy",
-                    passed = false,
-                    detail = "No active AI provider configured yet. Add one in Settings / API Keys."
+                    title = "Built-in Gemini AI (Firebase AI Logic)",
+                    passed = detail.success,
+                    detail = detail.message
                 )
+            } else {
+                networkClient.runSelfTestJsonProbe(state.activeProvider!!)
             }
             if (aiItem.passed) {
                 storage.saveConnectionTestPassed(true)
@@ -562,49 +1265,399 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         )
         val withUser = state.chatMessages + userMsg
         _uiState.update { it.copy(chatMessages = withUser) }
+        maybeAttachMemorySuggestion(text, userMsg.id)
 
         viewModelScope.launch {
-            storage.saveChatMessages(withUser)
+            persistMessagesAndThread(withUser)
 
             when (state.agentMode) {
+                AgentMode.SMART_AUTO -> handleSmartAutoDispatch(text, withUser)
                 AgentMode.CHAT_ONLY -> handleChatOnlyDispatch(withUser)
                 AgentMode.AGENT_CONTROL -> handleOnDeviceAgentPlan(text, withUser)
             }
         }
     }
 
-    private suspend fun handleChatOnlyDispatch(messagesWithUser: List<ChatMessage>) {
-        val provider = _uiState.value.activeProvider
-        if (provider == null) {
-            val helper = ChatMessage(
-                sender = MessageSender.AGENT,
-                text = "No AI provider configured yet. Open Settings / API Keys from the menu to add any custom Base URL, optional API key, and model name.",
-                isError = true,
-                excludeFromContext = true
+    private suspend fun handleSmartAutoDispatch(
+        userGoal: String,
+        messagesWithUser: List<ChatMessage>
+    ) {
+        val state = _uiState.value
+
+        // 1. Safety Guardrail check first
+        if (state.safetyRules.blockSensitiveFinancial) {
+            val violation = withContext(Dispatchers.Default) {
+                SafetyGuardrail.detectSensitiveViolation(userGoal)
+            }
+            if (violation != null) {
+                recordHardBlockedRequest(userGoal, violation, messagesWithUser)
+                return
+            }
+        }
+
+        // 2. Direct SQL memory / task commands
+        val sqlReply = tryHandleDirectSqlIntent(userGoal, modeTag = "SMART")
+        if (sqlReply != null) {
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = sqlReply,
+                isSuccess = true,
+                voiceSettings = state.voiceSettings,
+                showToastWhenOutsideApp = false
             )
-            val updated = messagesWithUser + helper
-            _uiState.update { it.copy(chatMessages = updated) }
-            storage.saveChatMessages(updated)
             return
         }
 
-        _uiState.update { it.copy(isSending = true) }
-        val result = networkClient.sendChatMessage(provider, messagesWithUser)
-        val replyMsg = when (result) {
-            is ChatApiResult.Success -> ChatMessage(
-                sender = MessageSender.AGENT,
-                text = result.reply
+        // 3. Deterministic local phone commands (instant <20ms)
+        val localTool = withContext(Dispatchers.Default) {
+            HybridToolRouting.matchDirectLocalTool(userGoal)
+        }
+        if (localTool != null && localTool.tool != ToolName.REPLY_TO_USER) {
+            dispatchRoutedToolCall(
+                toolCall = localTool,
+                userGoal = userGoal,
+                planDurationLabel = "Instant · 0.0s"
             )
-            is ChatApiResult.Error -> ChatMessage(
-                sender = MessageSender.AGENT,
-                text = result.message,
-                isError = true,
-                excludeFromContext = true
+            return
+        }
+
+        // 4. Smart Intent Classifier: conversational questions go straight to streaming Gemini + Google Search!
+        val looksLikeAction = withContext(Dispatchers.Default) {
+            SmartIntentClassifier.looksLikePhoneAction(userGoal)
+        }
+        if (!looksLikeAction) {
+            handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
+            return
+        }
+
+        // 5. Route action-like prompts via AI Hybrid Tool Router; if it decides REPLY_TO_USER, hand off to streaming chat
+        val routeStartMillis = System.currentTimeMillis()
+        _uiState.update {
+            it.copy(
+                isSending = true,
+                liveAgentStatusText = "Smart routing…",
+                livePhaseStartMillis = routeStartMillis
             )
         }
+        val installedNames = InstalledAppCache.getCached().map { it.displayName }
+        val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
+            sqlRepository.buildPersonalContextBlock()
+        } else {
+            ""
+        }
+        val routeResult = routeHybridWithFallback(
+            state = state,
+            userGoal = userGoal,
+            installedNames = installedNames,
+            messagesWithUser = messagesWithUser,
+            sqlContext = sqlContext
+        )
+        val routeElapsed = formatElapsed(System.currentTimeMillis() - routeStartMillis)
+        _uiState.update {
+            it.copy(
+                isSending = false,
+                liveAgentStatusText = "",
+                livePhaseStartMillis = 0L
+            )
+        }
+
+        when (routeResult) {
+            is ToolRouteApiResult.Error -> {
+                handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
+            }
+            is ToolRouteApiResult.Success -> {
+                if (routeResult.toolCall.tool == ToolName.REPLY_TO_USER) {
+                    handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
+                } else {
+                    dispatchRoutedToolCall(
+                        toolCall = routeResult.toolCall,
+                        userGoal = userGoal,
+                        planDurationLabel = "Smart · $routeElapsed"
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun routeHybridWithFallback(
+        state: AgentUiState,
+        userGoal: String,
+        installedNames: List<String>,
+        messagesWithUser: List<ChatMessage>,
+        sqlContext: String
+    ): ToolRouteApiResult {
+        val primaryRouteResult = if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+            firebaseAiService.routeHybridToolWithGemini(
+                userGoal = userGoal,
+                installedAppSample = installedNames,
+                safetyRules = state.safetyRules,
+                conversationHistory = messagesWithUser,
+                personalSqlContext = sqlContext
+            )
+        } else {
+            networkClient.routeHybridTool(
+                provider = state.activeProvider!!,
+                userGoal = userGoal,
+                installedAppSample = installedNames,
+                safetyRules = state.safetyRules,
+                conversationHistory = messagesWithUser
+            )
+        }
+        return if (primaryRouteResult is ToolRouteApiResult.Error &&
+            FirebaseAiService.isQuotaOrRateLimitMessage(primaryRouteResult.message)
+        ) {
+            if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+                val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
+                if (fallbackCustom != null) {
+                    networkClient.routeHybridTool(
+                        provider = fallbackCustom,
+                        userGoal = userGoal,
+                        installedAppSample = installedNames,
+                        safetyRules = state.safetyRules,
+                        conversationHistory = messagesWithUser
+                    )
+                } else {
+                    primaryRouteResult
+                }
+            } else {
+                firebaseAiService.routeHybridToolWithGemini(
+                    userGoal = userGoal,
+                    installedAppSample = installedNames,
+                    safetyRules = state.safetyRules,
+                    conversationHistory = messagesWithUser,
+                    personalSqlContext = sqlContext
+                )
+            }
+        } else {
+            primaryRouteResult
+        }
+    }
+
+    private suspend fun handleChatOnlyDispatch(
+        messagesWithUser: List<ChatMessage>,
+        skipPreflight: Boolean = false
+    ) {
+        val state = _uiState.value
+        val latestUserText = messagesWithUser.lastOrNull()?.text.orEmpty()
+
+        if (!skipPreflight) {
+            // 1. Keep Safety Guardrail active even for SQL memory saves
+            if (state.safetyRules.blockSensitiveFinancial) {
+                val violation = withContext(Dispatchers.Default) {
+                    SafetyGuardrail.detectSensitiveViolation(latestUserText)
+                }
+                if (violation != null) {
+                    recordHardBlockedRequest(latestUserText, violation, messagesWithUser)
+                    return
+                }
+            }
+
+            // 2. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
+            if (tryHandleDirectSqlIntent(latestUserText, modeTag = "CHAT") != null) {
+                return
+            }
+
+            // 2b. Unmistakable direct phone commands ("open zomato", "open youtube and play...", "set volume...")
+            // execute immediately even if the user didn't toggle the Agent Mode chip first.
+            val directPhoneTool = withContext(Dispatchers.Default) {
+                HybridToolRouting.matchDirectLocalTool(latestUserText)
+            }
+            if (directPhoneTool != null && directPhoneTool.tool != ToolName.REPLY_TO_USER) {
+                dispatchRoutedToolCall(
+                    toolCall = directPhoneTool,
+                    userGoal = latestUserText,
+                    planDurationLabel = "Instant · 0.0s"
+                )
+                return
+            }
+        }
+
+        val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
+            sqlRepository.buildPersonalContextBlock()
+        } else {
+            ""
+        }
+
+        if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+            val startMillis = System.currentTimeMillis()
+            val searchEnabled = state.builtInGeminiSettings.googleSearchEnabled
+            _uiState.update {
+                it.copy(
+                    isSending = true,
+                    streamingAssistantText = "",
+                    liveAgentStatusText = if (searchEnabled) "Searching Google & thinking…" else "Thinking with Gemini…",
+                    livePhaseStartMillis = startMillis
+                )
+            }
+
+            val result = firebaseAiService.streamChat(
+                modelChoice = state.builtInGeminiSettings.selectedModel,
+                conversationHistory = messagesWithUser,
+                latestUserPrompt = latestUserText,
+                enableGoogleSearch = searchEnabled,
+                personalSqlContext = sqlContext,
+                voiceLanguage = state.voiceSettings.voiceLanguage,
+                isLiveVoice = false,
+                onPartialText = { partial ->
+                    _uiState.update { it.copy(streamingAssistantText = partial) }
+                }
+            )
+
+            val replyMsg = when (result) {
+                is GeminiStreamResult.Success -> {
+                    val modelLabel = FirebaseAiService.displayNameForModelId(result.modelUsed)
+                    val badge = buildString {
+                        append(modelLabel)
+                        if (result.groundingSources.isNotEmpty()) append(" · Google Search")
+                    }
+                    sqlRepository.recordInteractionLog(
+                        sessionId = state.sessionId,
+                        mode = "CHAT",
+                        userPrompt = latestUserText,
+                        agentResponse = result.text,
+                        toolUsed = result.modelUsed,
+                        usedGoogleSearch = result.groundingSources.isNotEmpty()
+                    )
+                    ChatMessage(
+                        sender = MessageSender.AGENT,
+                        text = result.text,
+                        groundingSources = result.groundingSources,
+                        modelBadge = badge
+                    )
+                }
+                is GeminiStreamResult.Error -> {
+                    val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
+                    if (result.isRateLimit && fallbackCustom != null) {
+                        val customSysPrompt = if (sqlContext.isNotBlank()) {
+                            "${NetworkClient.DEFAULT_CHAT_SYSTEM_PROMPT}\n\n$sqlContext"
+                        } else {
+                            null
+                        }
+                        when (val fallbackRes = networkClient.sendChatMessage(fallbackCustom, messagesWithUser, systemPrompt = customSysPrompt)) {
+                            is ChatApiResult.Success -> {
+                                sqlRepository.recordInteractionLog(
+                                    sessionId = state.sessionId,
+                                    mode = "CHAT",
+                                    userPrompt = latestUserText,
+                                    agentResponse = fallbackRes.reply,
+                                    toolUsed = fallbackCustom.modelName
+                                )
+                                ChatMessage(
+                                    sender = MessageSender.AGENT,
+                                    text = fallbackRes.reply,
+                                    modelBadge = "${fallbackCustom.displayName} (Auto-Fallback)"
+                                )
+                            }
+                            is ChatApiResult.Error -> ChatMessage(
+                                sender = MessageSender.AGENT,
+                                text = result.message,
+                                isError = true,
+                                excludeFromContext = true
+                            )
+                        }
+                    } else {
+                        ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = result.message,
+                            isError = true,
+                            excludeFromContext = true
+                        )
+                    }
+                }
+            }
+            val updated = _uiState.value.chatMessages + replyMsg
+            _uiState.update {
+                it.copy(
+                    isSending = false,
+                    streamingAssistantText = "",
+                    liveAgentStatusText = "",
+                    livePhaseStartMillis = 0L,
+                    chatMessages = updated
+                )
+            }
+            persistMessagesAndThread(updated)
+            return
+        }
+
+        // Custom Base URL + API Key provider path (preserved 100%, with automatic Built-in Gemini fallback on 429 rate limits)
+        val provider = state.activeProvider!!
+        _uiState.update { it.copy(isSending = true, streamingAssistantText = "") }
+        val customSysPrompt = if (sqlContext.isNotBlank()) {
+            "${NetworkClient.DEFAULT_CHAT_SYSTEM_PROMPT}\n\n$sqlContext"
+        } else {
+            null
+        }
+        val result = networkClient.sendChatMessage(provider, messagesWithUser, systemPrompt = customSysPrompt)
+        val replyMsg = when (result) {
+            is ChatApiResult.Success -> {
+                sqlRepository.recordInteractionLog(
+                    sessionId = state.sessionId,
+                    mode = "CHAT",
+                    userPrompt = latestUserText,
+                    agentResponse = result.reply,
+                    toolUsed = provider.modelName
+                )
+                ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = result.reply,
+                    modelBadge = provider.displayName
+                )
+            }
+            is ChatApiResult.Error -> {
+                if (FirebaseAiService.isQuotaOrRateLimitMessage(result.message)) {
+                    val geminiFallback = firebaseAiService.streamChat(
+                        modelChoice = GeminiBuiltInModel.FLASH_LITE,
+                        conversationHistory = messagesWithUser,
+                        latestUserPrompt = latestUserText,
+                        enableGoogleSearch = false,
+                        personalSqlContext = sqlContext,
+                        voiceLanguage = state.voiceSettings.voiceLanguage,
+                        isLiveVoice = false,
+                        onPartialText = { partial ->
+                            _uiState.update { it.copy(streamingAssistantText = partial) }
+                        }
+                    )
+                    when (geminiFallback) {
+                        is GeminiStreamResult.Success -> {
+                            sqlRepository.recordInteractionLog(
+                                sessionId = state.sessionId,
+                                mode = "CHAT",
+                                userPrompt = latestUserText,
+                                agentResponse = geminiFallback.text,
+                                toolUsed = geminiFallback.modelUsed
+                            )
+                            ChatMessage(
+                                sender = MessageSender.AGENT,
+                                text = geminiFallback.text,
+                                modelBadge = "${FirebaseAiService.displayNameForModelId(geminiFallback.modelUsed)} (Auto-Fallback)"
+                            )
+                        }
+                        is GeminiStreamResult.Error -> ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = result.message,
+                            isError = true,
+                            excludeFromContext = true
+                        )
+                    }
+                } else {
+                    ChatMessage(
+                        sender = MessageSender.AGENT,
+                        text = result.message,
+                        isError = true,
+                        excludeFromContext = true
+                    )
+                }
+            }
+        }
         val updated = _uiState.value.chatMessages + replyMsg
-        _uiState.update { it.copy(isSending = false, chatMessages = updated) }
-        storage.saveChatMessages(updated)
+        _uiState.update {
+            it.copy(
+                isSending = false,
+                streamingAssistantText = "",
+                chatMessages = updated
+            )
+        }
+        persistMessagesAndThread(updated)
     }
 
     private suspend fun handleOnDeviceAgentPlan(
@@ -624,6 +1677,19 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // 1b. Direct on-device SQL memory / task commands work in Agent Mode too!
+        val sqlReply = tryHandleDirectSqlIntent(userGoal, modeTag = "AGENT")
+        if (sqlReply != null) {
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = sqlReply,
+                isSuccess = true,
+                voiceSettings = state.voiceSettings,
+                showToastWhenOutsideApp = false
+            )
+            return
+        }
+
         // 2. Ultra-fast local deterministic tool router (never swallows compound commands into open_app)
         val localTool = withContext(Dispatchers.Default) {
             HybridToolRouting.matchDirectLocalTool(userGoal)
@@ -637,21 +1703,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 3. Hybrid AI Tool Router (temperature = 0.0, max_tokens = 200, strict JSON + 1 auto-retry)
-        val provider = state.activeProvider
-        if (provider == null) {
-            val helper = ChatMessage(
-                sender = MessageSender.AGENT,
-                text = "Add a Custom AI Provider in Settings / API Keys first so your agent can route and execute complex commands.",
-                isError = true,
-                excludeFromContext = true
-            )
-            val updated = messagesWithUser + helper
-            _uiState.update { it.copy(chatMessages = updated) }
-            storage.saveChatMessages(updated)
-            return
-        }
-
+        // 3. Hybrid AI Tool Router (Built-in Gemini or Custom AI Provider)
         val routeStartMillis = System.currentTimeMillis()
         _uiState.update {
             it.copy(
@@ -661,12 +1713,17 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         val installedNames = InstalledAppCache.getCached().map { it.displayName }
-        val routeResult = networkClient.routeHybridTool(
-            provider = provider,
+        val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
+            sqlRepository.buildPersonalContextBlock()
+        } else {
+            ""
+        }
+        val routeResult = routeHybridWithFallback(
+            state = state,
             userGoal = userGoal,
-            installedAppSample = installedNames,
-            safetyRules = state.safetyRules,
-            conversationHistory = messagesWithUser
+            installedNames = installedNames,
+            messagesWithUser = messagesWithUser,
+            sqlContext = sqlContext
         )
         val routeElapsed = formatElapsed(System.currentTimeMillis() - routeStartMillis)
         _uiState.update {
@@ -687,7 +1744,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 val updated = _uiState.value.chatMessages + errMsg
                 _uiState.update { it.copy(chatMessages = updated) }
-                storage.saveChatMessages(updated)
+                persistMessagesAndThread(updated)
             }
 
             is ToolRouteApiResult.Success -> {
@@ -729,14 +1786,14 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
         }
-        storage.saveChatAndApprovals(nextMessages, nextApprovals)
+        persistMessagesAndThread(nextMessages, nextApprovals)
     }
 
     private suspend fun dispatchRoutedToolCall(
         toolCall: RoutedToolCall,
         userGoal: String,
         planDurationLabel: String
-    ) {
+    ): ActionPlan? {
         val state = _uiState.value
 
         // 0. Natural greetings & conversational replies — reply warmly, NEVER create an ActionPlan or open an app!
@@ -750,7 +1807,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             )
             val nextMessages = _uiState.value.chatMessages + replyMsg
             _uiState.update { it.copy(chatMessages = nextMessages) }
-            storage.saveChatMessages(nextMessages)
+            persistMessagesAndThread(nextMessages)
             AgentSpeechFeedback.announceOutcome(
                 context = appContext,
                 message = warmReply,
@@ -758,7 +1815,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 voiceSettings = state.voiceSettings,
                 showToastWhenOutsideApp = false
             )
-            return
+            return null
         }
 
         // Re-verify financial/UPI/OTP/password hard-block on routed tool arguments
@@ -783,7 +1840,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     routedToolJson = toolCall.toJsonString()
                 )
                 recordHardBlockedRequest(userGoal, violation, _uiState.value.chatMessages, blockedPlan)
-                return
+                return null
             }
         }
 
@@ -796,17 +1853,11 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             routedToolJson = toolCall.toJsonString()
         )
 
-        // Confirmed Approval Policy:
-        // - Calls, Messages, and general UI Automation ALWAYS require Approval Card.
-        // - Low-risk media & alarm tools auto-run immediately!
-        // - Simple open_app respects alwaysAskApproval / instantRunLowRiskAppLaunch.
-        val shouldAutoRun = when {
-            toolCall.alwaysRequiresApproval -> false
-            toolCall.isLowRiskAutoRunnableMediaOrAlarm -> true
-            toolCall.tool == ToolName.OPEN_APP ->
-                !state.safetyRules.alwaysAskApproval || state.safetyRules.instantRunLowRiskAppLaunch
-            else -> !state.safetyRules.alwaysAskApproval
-        }
+        // Approval Policy:
+        // - LOW and MEDIUM risk actions auto-run without approval (when autoRunLowAndMediumRisk is enabled).
+        // - HIGH risk actions ALWAYS require an Approval Card.
+        // - Financial/UPI/OTP/password actions remain hard-blocked above.
+        val shouldAutoRun = toolCall.shouldAutoRun(state.safetyRules)
 
         val initialStatus = if (shouldAutoRun) ApprovalStatus.RUNNING else ApprovalStatus.PENDING
         val cardMsg = ChatMessage(
@@ -833,11 +1884,12 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
         }
-        storage.saveChatAndApprovals(nextMessages, nextApprovals)
+        persistMessagesAndThread(nextMessages, nextApprovals)
 
         if (shouldAutoRun) {
             executeRoutedToolPlan(plan, toolCall)
         }
+        return plan
     }
 
     fun triggerApprovalDemo() {
@@ -945,6 +1997,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         if (_uiState.value.isAgentLoopRunning) {
             showMessage("An agent task is already running. Tap Stop Agent first.")
             return
+        }
+        if (_uiState.value.livePendingApprovalPlan?.actionId == actionId) {
+            _uiState.update { it.copy(livePendingApprovalPlan = null) }
         }
 
         viewModelScope.launch {
@@ -1238,11 +2293,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             ToolName.UI_AUTOMATE -> {
-                val provider = _uiState.value.activeProvider
-                if (provider == null) {
-                    showMessage("No active Custom AI Provider selected.")
-                    return
-                }
+                val effectiveProvider = if (_uiState.value.isUsingBuiltInGemini) null else _uiState.value.activeProvider
                 val service = AgentAccessibilityService.getInstance()
                 if (service == null) {
                     refreshPermissionsStatus()
@@ -1280,7 +2331,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 service.startAiUiAutomation(
                     plan = plan,
                     goal = goal,
-                    provider = provider,
+                    provider = effectiveProvider,
                     blockSensitive = blockSensitive,
                     maxSteps = 15,
                     conversationHistory = _uiState.value.chatMessages
@@ -1424,6 +2475,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cancelAction(actionId: String) {
+        if (_uiState.value.livePendingApprovalPlan?.actionId == actionId) {
+            _uiState.update { it.copy(livePendingApprovalPlan = null) }
+        }
         viewModelScope.launch {
             updateActionStatus(
                 actionId = actionId,
@@ -1445,6 +2499,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 destination = AppDestination.CHAT,
                 chatMessages = emptyList(),
+                memorySuggestions = emptyMap(),
+                livePendingApprovalPlan = null,
                 isSending = false
             )
         }
@@ -1504,7 +2560,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(chatMessages = updatedMessages, approvalHistory = updatedHistory)
         }
         if (persistNow) {
-            storage.saveChatAndApprovals(updatedMessages, updatedHistory)
+            persistMessagesAndThread(updatedMessages, updatedHistory)
         }
     }
 }

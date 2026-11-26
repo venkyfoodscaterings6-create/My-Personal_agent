@@ -154,8 +154,9 @@ class ExampleUnitTest {
         assertNotNull(parsedCall)
         assertEquals(ToolName.CALL_CONTACT, parsedCall?.tool)
         assertEquals("Mom", parsedCall?.contactOrNumber)
-        assertTrue(parsedCall?.alwaysRequiresApproval == true)
-        assertFalse(parsedCall?.isLowRiskAutoRunnableMediaOrAlarm == true)
+        assertEquals(RiskLevel.MEDIUM, parsedCall?.riskLevel)
+        assertTrue(parsedCall?.shouldAutoRun(SafetyRules()) == true)
+        assertFalse(parsedCall?.alwaysRequiresApproval == true)
 
         val msgJson = """{"tool":"draft_message","args":{"contact":"Alex","messagingApp":"whatsapp","messageText":"On my way"}}"""
         val parsedMsg = HybridToolRouting.parseRoutedToolJson(msgJson, fallbackGoal = "whatsapp Alex")
@@ -164,7 +165,15 @@ class ExampleUnitTest {
         assertEquals("Alex", parsedMsg?.contactOrNumber)
         assertEquals("whatsapp", parsedMsg?.messagingApp)
         assertEquals("On my way", parsedMsg?.messageText)
-        assertTrue(parsedMsg?.alwaysRequiresApproval == true)
+        assertEquals(RiskLevel.MEDIUM, parsedMsg?.riskLevel)
+        assertTrue(parsedMsg?.shouldAutoRun(SafetyRules()) == true)
+
+        val highRiskJson = """{"tool":"ui_automate","goal":"Delete old files","riskLevel":"HIGH"}"""
+        val parsedHigh = HybridToolRouting.parseRoutedToolJson(highRiskJson, fallbackGoal = "Delete old files")
+        assertNotNull(parsedHigh)
+        assertEquals(RiskLevel.HIGH, parsedHigh?.riskLevel)
+        assertTrue(parsedHigh?.alwaysRequiresApproval == true)
+        assertFalse(parsedHigh?.shouldAutoRun(SafetyRules()) == true)
     }
 
     @Test
@@ -239,7 +248,8 @@ class ExampleUnitTest {
         assertEquals("Ravi", waDirect?.contactOrNumber)
         assertEquals("whatsapp", waDirect?.messagingApp)
         assertEquals("hi", waDirect?.messageText)
-        assertTrue(waDirect?.alwaysRequiresApproval == true)
+        assertEquals(RiskLevel.MEDIUM, waDirect?.riskLevel)
+        assertTrue(waDirect?.shouldAutoRun(SafetyRules()) == true)
 
         val waSuffix = HybridToolRouting.matchDirectLocalTool("send hi to Ravi on whatsapp")
         assertNotNull(waSuffix)
@@ -253,7 +263,8 @@ class ExampleUnitTest {
         assertEquals("Mom", smsDirect?.contactOrNumber)
         assertEquals("sms", smsDirect?.messagingApp)
         assertEquals("On my way", smsDirect?.messageText)
-        assertTrue(smsDirect?.alwaysRequiresApproval == true)
+        assertEquals(RiskLevel.MEDIUM, smsDirect?.riskLevel)
+        assertTrue(smsDirect?.shouldAutoRun(SafetyRules()) == true)
 
         // Pronoun follow-ups ("send him ...") must pass through to AI router with conversation history
         assertNull(HybridToolRouting.matchDirectLocalTool("send 'I am on the way' to him on whatsapp"))
@@ -356,5 +367,130 @@ class ExampleUnitTest {
         assertNull(teluguWake?.inlineCommand)
 
         assertNull(WakeWordMatcher.extractWakeMatch("Hello everyone let us watch a movie", "Hey Agent"))
+    }
+
+    @Test
+    fun `sql memory command parser detects save memory, add task, list queries, and ignores normal chat`() {
+        val saveMem = SqlMemoryCommandParser.parse("Remember that my favorite coffee is South Indian filter coffee")
+        assertTrue(saveMem is SqlDirectIntent.SaveMemory)
+        val mem = saveMem as SqlDirectIntent.SaveMemory
+        assertTrue(mem.content.contains("filter coffee", ignoreCase = true))
+
+        val addTask = SqlMemoryCommandParser.parse("Add task buy groceries tomorrow")
+        assertTrue(addTask is SqlDirectIntent.AddTask)
+        val task = addTask as SqlDirectIntent.AddTask
+        assertEquals("Buy groceries tomorrow", task.title)
+
+        val listTasks = SqlMemoryCommandParser.parse("What are my tasks?")
+        assertTrue(listTasks is SqlDirectIntent.ListTasks)
+
+        val listMemories = SqlMemoryCommandParser.parse("Show my memories")
+        assertTrue(listMemories is SqlDirectIntent.ListMemories)
+
+        assertNull(SqlMemoryCommandParser.parse("Explain quantum computing in simple words"))
+    }
+
+    @Test
+    fun `built-in gemini models include gemini 4 hydrogen`() {
+        assertEquals("gemini-4-hydrogen", GeminiBuiltInModel.HYDROGEN.modelId)
+        assertTrue(GeminiBuiltInModel.entries.any { it.modelId == "gemini-4-hydrogen" })
+    }
+
+    @Test
+    fun `live screen guardrail allows zomato banners and home screen while blocking banking apps and password fields`() {
+        val ownPkg = "com.aistudio.personalagent.k7m4px"
+
+        // Own app screen displaying guardrail notice must NEVER block
+        val ownNodes = listOf(
+            ScreenNode(0, "Banking, UPI, OTP, and password actions are hard-blocked", "", "", "TextView", false, false, 100, 100, 100, 40)
+        )
+        assertNull(SafetyGuardrail.detectSensitiveScreen(ownPkg, ownPkg, ownNodes))
+
+        // Android Home screen with GPay / PhonePe app icons must NEVER block
+        val homeNodes = listOf(
+            ScreenNode(0, "PhonePe", "PhonePe", "PhonePe", "TextView", true, false, 100, 200, 200, 40),
+            ScreenNode(1, "Zomato", "Zomato", "Zomato", "TextView", true, false, 200, 200, 200, 40)
+        )
+        assertNull(SafetyGuardrail.detectSensitiveScreen("com.google.android.apps.nexuslauncher", ownPkg, homeNodes))
+
+        // Zomato home screen with promo banners mentioning UPI / Bank offer must NEVER block
+        val zomatoNodes = listOf(
+            ScreenNode(0, "Flat 100 off with HDFC Bank Credit Card", "", "", "TextView", false, false, 200, 300, 300, 40),
+            ScreenNode(1, "Try Zomato UPI", "", "", "TextView", true, false, 200, 400, 400, 40)
+        )
+        assertNull(SafetyGuardrail.detectSensitiveScreen("com.application.zomato", ownPkg, zomatoNodes))
+
+        // Actual PhonePe / Banking app package MUST still be blocked
+        assertNotNull(SafetyGuardrail.detectSensitiveScreen("com.phonepe.app", ownPkg, emptyList()))
+        assertNotNull(SafetyGuardrail.detectSensitiveScreen("com.google.android.apps.nbu.paisa.user", ownPkg, emptyList()))
+
+        // Active password / UPI PIN editable input field MUST still be blocked
+        val pinNodes = listOf(
+            ScreenNode(0, "Enter UPI PIN", "Enter UPI PIN", "Enter UPI PIN", "EditText", true, true, 200, 500, 500, 60)
+        )
+        assertNotNull(SafetyGuardrail.detectSensitiveScreen("com.application.zomato", ownPkg, pinNodes))
+
+        // Fuzzy match opens Zomato even when spelled "zomoto"
+        val apps = listOf(InstalledAppInfo("Zomato", "com.application.zomato", "zomato"))
+        assertEquals("com.application.zomato", AppNameFuzzyMatcher.findBestMatch("zomoto", apps)?.packageName)
+    }
+
+    @Test
+    fun `speech text cleaner strips markdown urls and extracts streaming sentences`() {
+        val raw = "**Hello!** Check [Google](https://google.com) and `val x = 1` #heading"
+        val cleaned = SpeechTextCleaner.cleanForSpeech(raw)
+        assertFalse(cleaned.contains("**"))
+        assertFalse(cleaned.contains("https://"))
+        assertFalse(cleaned.contains("`"))
+        assertTrue(cleaned.contains("Hello!"))
+        assertTrue(cleaned.contains("Google"))
+
+        assertTrue(SpeechTextCleaner.containsTeluguScript("నమస్కారం, ఎలా ఉన్నారు?"))
+        assertFalse(SpeechTextCleaner.containsTeluguScript("Hello, how are you?"))
+
+        val (ready, remainder) = SpeechTextCleaner.extractReadySentences(
+            "Good morning, welcome back! Today is sunny and warm. Tomorrow might"
+        )
+        assertEquals(2, ready.size)
+        assertEquals("Good morning, welcome back!", ready[0])
+        assertEquals("Today is sunny and warm.", ready[1])
+        assertEquals("Tomorrow might", remainder.trim())
+    }
+
+    @Test
+    fun `smart intent classifier distinguishes conversational questions from phone actions`() {
+        assertFalse(SmartIntentClassifier.looksLikePhoneAction("What is the capital of Japan?"))
+        assertFalse(SmartIntentClassifier.looksLikePhoneAction("Explain quantum computing in simple words"))
+        assertFalse(SmartIntentClassifier.looksLikePhoneAction("How to make South Indian filter coffee?"))
+
+        assertTrue(SmartIntentClassifier.looksLikePhoneAction("Open Zomato and search biryani"))
+        assertTrue(SmartIntentClassifier.looksLikePhoneAction("Call Mom"))
+        assertTrue(SmartIntentClassifier.looksLikePhoneAction("Set an alarm for 6:30 AM"))
+        assertTrue(SmartIntentClassifier.looksLikePhoneAction("Send a WhatsApp message to Ravi"))
+        assertTrue(SmartIntentClassifier.looksLikePhoneAction("Turn on WiFi"))
+    }
+
+    @Test
+    fun `smart memory suggestion detector extracts preferences and tasks while ignoring secrets`() {
+        val pref = SmartMemorySuggestionDetector.detect("I prefer dark roast coffee without sugar", "m1")
+        assertNotNull(pref)
+        assertEquals(SuggestionKind.MEMORY, pref?.kind)
+
+        val task = SmartMemorySuggestionDetector.detect("I need to submit the project report tomorrow", "m2")
+        assertNotNull(task)
+        assertEquals(SuggestionKind.TASK, task?.kind)
+
+        // Secrets must never trigger a memory suggestion
+        assertNull(SmartMemorySuggestionDetector.detect("My bank password is secret123", "m3"))
+        // Explicit SQL commands already auto-save so no duplicate pill needed
+        assertNull(SmartMemorySuggestionDetector.detect("Remember that my birthday is June 5", "m4"))
+    }
+
+    @Test
+    fun `voice language cycles cleanly through Auto, English, and Telugu`() {
+        assertEquals(VoiceLanguage.EN_IN, VoiceLanguage.AUTO.next())
+        assertEquals(VoiceLanguage.TE_IN, VoiceLanguage.EN_IN.next())
+        assertEquals(VoiceLanguage.AUTO, VoiceLanguage.TE_IN.next())
+        assertEquals(AgentMode.SMART_AUTO, AgentUiState().agentMode)
     }
 }

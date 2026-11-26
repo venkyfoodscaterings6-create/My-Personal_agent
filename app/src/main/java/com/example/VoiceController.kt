@@ -8,81 +8,48 @@ import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.Locale
 
+/**
+ * Upgraded SpeechRecognizer controller with:
+ * - Real-time normalized microphone amplitude (`micRmsEnergy: 0f..1f`) for 3D audio reactivity
+ * - Generous end-of-speech silence thresholds (2.2s complete silence) to prevent mid-sentence cutoffs
+ * - Soft-retry callback for continuous Live Voice mode on brief silence timeouts
+ * - Unified speech output delegated to `AgentSpeechFeedback` (zero duplicate TextToSpeech engines)
+ */
 class VoiceController(
     private val context: Context,
     private val onPartialText: (String) -> Unit,
     private val onFinalText: (String) -> Unit,
     private val onRequestFallbackIntent: (Intent) -> Unit,
-    private val onVoiceError: (String) -> Unit
+    private val onVoiceError: (String) -> Unit,
+    private val onSilenceTimeout: (() -> Unit)? = null
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private var currentLanguage: VoiceLanguage = VoiceLanguage.EN_IN
+    private var currentLanguage: VoiceLanguage = VoiceLanguage.AUTO
 
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
 
-    private val _isSpeaking = MutableStateFlow(false)
-    val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
+    private val _micRmsEnergy = MutableStateFlow(0f)
+    val micRmsEnergy: StateFlow<Float> = _micRmsEnergy.asStateFlow()
 
-    init {
-        initTextToSpeech()
-    }
+    val isSpeaking: StateFlow<Boolean> = AgentSpeechFeedback.isSpeaking
 
-    private fun initTextToSpeech() {
-        runCatching {
-            tts = TextToSpeech(context.applicationContext) { status ->
-                ttsReady = status == TextToSpeech.SUCCESS
-                if (ttsReady) {
-                    tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                        override fun onStart(utteranceId: String?) {
-                            _isSpeaking.value = true
-                        }
-
-                        override fun onDone(utteranceId: String?) {
-                            _isSpeaking.value = false
-                        }
-
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(utteranceId: String?) {
-                            _isSpeaking.value = false
-                        }
-
-                        override fun onError(utteranceId: String?, errorCode: Int) {
-                            _isSpeaking.value = false
-                        }
-                    })
-                    applyTtsLanguage(currentLanguage)
-                }
-            }
-        }
-    }
-
-    private fun applyTtsLanguage(language: VoiceLanguage) {
-        if (!ttsReady) return
-        val locale = Locale.forLanguageTag(language.bcp47Tag)
-        val result = tts?.setLanguage(locale)
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            tts?.setLanguage(Locale.US)
-        }
-    }
-
-    fun startListening(language: VoiceLanguage) {
+    fun startListening(
+        language: VoiceLanguage,
+        continuousSoftRetry: Boolean = false
+    ) {
         currentLanguage = language
-        stopSpeaking()
+        AgentSpeechFeedback.stopSpeaking()
 
         mainHandler.post {
             if (!SpeechRecognizer.isRecognitionAvailable(context)) {
                 _isListening.value = false
+                _micRmsEnergy.value = 0f
                 onRequestFallbackIntent(buildFallbackSpeechIntent(language))
                 return@post
             }
@@ -95,32 +62,44 @@ class VoiceController(
                 recognizer.setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         _isListening.value = true
+                        _micRmsEnergy.value = 0.14f
                     }
 
                     override fun onBeginningOfSpeech() {
                         _isListening.value = true
                     }
 
-                    override fun onRmsChanged(rmsdB: Float) = Unit
+                    override fun onRmsChanged(rmsdB: Float) {
+                        // Android SpeechRecognizer rmsdB typically spans -2 dB (quiet) to +10 dB (loud speech)
+                        val normalized = ((rmsdB + 2f) / 12f).coerceIn(0.05f, 1.0f)
+                        _micRmsEnergy.value = normalized
+                    }
+
                     override fun onBufferReceived(buffer: ByteArray?) = Unit
 
                     override fun onEndOfSpeech() {
                         _isListening.value = false
+                        _micRmsEnergy.value = 0f
                     }
 
                     override fun onError(error: Int) {
                         _isListening.value = false
+                        _micRmsEnergy.value = 0f
                         destroySpeechRecognizerOnly()
                         when (error) {
                             SpeechRecognizer.ERROR_NO_MATCH,
                             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                                onVoiceError("Didn't catch that — tap the mic and try again.")
+                                if (continuousSoftRetry && onSilenceTimeout != null) {
+                                    onSilenceTimeout.invoke()
+                                } else {
+                                    onVoiceError("Didn't catch that — tap the mic and try again.")
+                                }
                             }
                             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                                 onVoiceError("Microphone permission is required for voice commands.")
                             }
+                            SpeechRecognizer.ERROR_CLIENT -> Unit
                             else -> {
-                                // Automatic fallback to system RecognizerIntent activity on OEM/service errors
                                 onRequestFallbackIntent(buildFallbackSpeechIntent(language))
                             }
                         }
@@ -128,6 +107,7 @@ class VoiceController(
 
                     override fun onResults(results: Bundle?) {
                         _isListening.value = false
+                        _micRmsEnergy.value = 0f
                         val best = results
                             ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             ?.firstOrNull()
@@ -136,6 +116,8 @@ class VoiceController(
                         destroySpeechRecognizerOnly()
                         if (best.isNotBlank()) {
                             onFinalText(best)
+                        } else if (continuousSoftRetry && onSilenceTimeout != null) {
+                            onSilenceTimeout.invoke()
                         }
                     }
 
@@ -158,13 +140,18 @@ class VoiceController(
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, language.bcp47Tag)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language.bcp47Tag)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
+                    // Generous silence windows so natural pauses mid-sentence never cut off speech
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2500L)
                 }
 
                 _isListening.value = true
                 recognizer.startListening(intent)
             }.onFailure {
                 _isListening.value = false
+                _micRmsEnergy.value = 0f
                 destroySpeechRecognizerOnly()
                 onRequestFallbackIntent(buildFallbackSpeechIntent(language))
             }
@@ -174,35 +161,19 @@ class VoiceController(
     fun stopListening() {
         mainHandler.post {
             _isListening.value = false
+            _micRmsEnergy.value = 0f
             runCatching { speechRecognizer?.stopListening() }
             destroySpeechRecognizerOnly()
         }
     }
 
     fun speak(text: String, language: VoiceLanguage) {
-        val cleaned = text.trim()
-        if (cleaned.isBlank() || !ttsReady) return
         currentLanguage = language
-        // Auto-detect Telugu Unicode block (0C00–0C7F) so Telugu replies speak in Telugu even if EN mode is selected
-        val hasTeluguScript = cleaned.any { ch -> ch in '\u0C00'..'\u0C7F' }
-        val targetLang = if (hasTeluguScript) VoiceLanguage.TE_IN else language
-        applyTtsLanguage(targetLang)
-        _isSpeaking.value = true
-        runCatching {
-            tts?.speak(
-                cleaned.take(600),
-                TextToSpeech.QUEUE_FLUSH,
-                null,
-                "agent_reply_${System.currentTimeMillis()}"
-            )
-        }.onFailure {
-            _isSpeaking.value = false
-        }
+        AgentSpeechFeedback.speak(context, text, language)
     }
 
     fun stopSpeaking() {
-        runCatching { tts?.stop() }
-        _isSpeaking.value = false
+        AgentSpeechFeedback.stopSpeaking()
     }
 
     private fun destroySpeechRecognizerOnly() {
@@ -216,23 +187,17 @@ class VoiceController(
     fun destroy() {
         mainHandler.post {
             _isListening.value = false
+            _micRmsEnergy.value = 0f
             destroySpeechRecognizerOnly()
         }
-        runCatching {
-            tts?.stop()
-            tts?.shutdown()
-        }
-        tts = null
-        ttsReady = false
-        _isSpeaking.value = false
     }
 
     companion object {
         fun buildFallbackSpeechIntent(language: VoiceLanguage): Intent {
-            val prompt = if (language == VoiceLanguage.TE_IN) {
-                "తెలుగు లేదా English లో మాట్లాడండి…"
-            } else {
-                "Speak your command (English / తెలుగు)…"
+            val prompt = when (language) {
+                VoiceLanguage.TE_IN -> "తెలుగు లేదా English లో మాట్లాడండి…"
+                VoiceLanguage.AUTO -> "Speak in English or తెలుగు…"
+                VoiceLanguage.EN_IN -> "Speak your command (English / తెలుగు)…"
             }
             return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)

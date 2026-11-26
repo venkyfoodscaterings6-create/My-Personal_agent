@@ -107,6 +107,7 @@ class VoiceOverlayActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configureAppCheck(this, intent)
         readLaunchExtras(intent)
         window.setBackgroundDrawableResource(android.R.color.transparent)
         enableEdgeToEdge(
@@ -292,7 +293,7 @@ private fun VoiceOverlaySheetContent(
             }
 
             ToolName.UI_AUTOMATE -> {
-                if (service != null && activeProvider != null) {
+                if (service != null) {
                     val goal = toolCall.goal?.takeIf { it.isNotBlank() } ?: plan.title
                     service.startAiUiAutomation(
                         plan = plan,
@@ -344,8 +345,13 @@ private fun VoiceOverlaySheetContent(
 
         scope.launch {
             val latestState = storage.readLatestState()
-            val activeProvider = latestState.providers.firstOrNull { it.isDefault }
-                ?: latestState.providers.firstOrNull()
+            val useBuiltIn = latestState.builtInGeminiSettings.useBuiltInGemini || latestState.providers.isEmpty()
+            val activeProvider = if (useBuiltIn) {
+                null
+            } else {
+                latestState.providers.firstOrNull { it.isDefault }
+                    ?: latestState.providers.firstOrNull()
+            }
             val userMsg = ChatMessage(sender = MessageSender.USER, text = command)
             val historyWithUser = latestState.chatMessages + userMsg
             storage.appendChatAndApproval(listOf(userMsg))
@@ -381,6 +387,46 @@ private fun VoiceOverlaySheetContent(
                 }
             }
 
+            // 1b. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
+            val sqlIntent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(command) }
+            if (sqlIntent != null) {
+                val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
+                val reply = when (sqlIntent) {
+                    is SqlDirectIntent.SaveMemory -> {
+                        sqlRepo.addMemory(sqlIntent.category, sqlIntent.title, sqlIntent.content, isPinned = true)
+                        "Saved to your personal SQL memory: ${sqlIntent.content}"
+                    }
+                    is SqlDirectIntent.AddTask -> {
+                        sqlRepo.addTask(sqlIntent.title, priority = sqlIntent.priority)
+                        "Added to your tasks: ${sqlIntent.title}"
+                    }
+                    SqlDirectIntent.ListTasks -> {
+                        val pending = PersonalAgentDatabase.getInstance(context.applicationContext).taskDao().getPendingTasks(6)
+                        if (pending.isEmpty()) "You have no open tasks right now."
+                        else "Your open tasks are: " + pending.joinToString("; ") { it.title }
+                    }
+                    SqlDirectIntent.ListMemories -> {
+                        val mems = PersonalAgentDatabase.getInstance(context.applicationContext).memoryDao().getTopMemories(5)
+                        if (mems.isEmpty()) "No memories saved yet. Say 'Remember that...' to save one."
+                        else "Here is what I remember: " + mems.joinToString("; ") { it.content }
+                    }
+                }
+                val replyMsg = ChatMessage(sender = MessageSender.AGENT, text = reply, modelBadge = "SQL Memory")
+                storage.appendChatAndApproval(listOf(replyMsg))
+                sqlRepo.recordInteractionLog(latestState.sessionId, "VOICE_OVERLAY", command, reply, toolUsed = "sql_memory")
+                isRouting = false
+                statusNote = null
+                replyText = reply
+                AgentSpeechFeedback.announceOutcome(
+                    context = context.applicationContext,
+                    message = reply,
+                    isSuccess = true,
+                    voiceSettings = latestState.voiceSettings,
+                    showToastWhenOutsideApp = false
+                )
+                return@launch
+            }
+
             // 2. Local deterministic fast router first
             val localTool = withContext(Dispatchers.Default) {
                 HybridToolRouting.matchDirectLocalTool(command)
@@ -389,25 +435,35 @@ private fun VoiceOverlaySheetContent(
             val resolvedTool: RoutedToolCall? = if (localTool != null) {
                 localTool
             } else {
-                if (activeProvider == null) {
-                    isRouting = false
-                    statusNote = null
-                    errorNote = "Add an AI provider in My Personal Agent -> Settings to handle complex voice commands."
-                    return@launch
-                }
                 val installed = InstalledAppCache.getCached().ifEmpty {
                     InstalledAppCache.refresh(context.applicationContext)
                 }.map { it.displayName }
 
-                when (
-                    val routed = networkClient.routeHybridTool(
+                val routed = if (activeProvider != null) {
+                    networkClient.routeHybridTool(
                         provider = activeProvider,
                         userGoal = command,
                         installedAppSample = installed,
                         safetyRules = latestState.safetyRules,
                         conversationHistory = historyWithUser
                     )
-                ) {
+                } else {
+                    val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
+                    val sqlCtx = if (latestState.builtInGeminiSettings.injectSqlMemory) {
+                        sqlRepo.buildPersonalContextBlock()
+                    } else {
+                        ""
+                    }
+                    FirebaseAiService().routeHybridToolWithGemini(
+                        userGoal = command,
+                        installedAppSample = installed,
+                        safetyRules = latestState.safetyRules,
+                        conversationHistory = historyWithUser,
+                        personalSqlContext = sqlCtx
+                    )
+                }
+
+                when (routed) {
                     is ToolRouteApiResult.Error -> {
                         val errMsg = ChatMessage(
                             sender = MessageSender.AGENT,
@@ -449,7 +505,7 @@ private fun VoiceOverlaySheetContent(
                     AgentSpeechFeedback.speak(
                         context = context.applicationContext,
                         text = warmReply,
-                        language = latestState.voiceSettings.voiceLanguage
+                        voiceSettings = latestState.voiceSettings
                     )
                 }
                 return@launch
@@ -539,17 +595,9 @@ private fun VoiceOverlaySheetContent(
                 return@launch
             }
 
-            // Calls, Messages, and Medium/High UI automation ALWAYS show the compact Approval Card inside this overlay.
-            // Safe quick overlay commands (tap_on_screen, scroll_screen, volume, system nav, play_youtube_video, set_alarm, open_maps)
-            // auto-run immediately!
-            val shouldAutoRun = when {
-                resolvedTool.tool == ToolName.CALL_CONTACT || resolvedTool.tool == ToolName.SEND_MESSAGE -> false
-                resolvedTool.isLowRiskAutoRunnableMediaOrAlarm -> true
-                resolvedTool.tool == ToolName.UI_AUTOMATE -> resolvedTool.riskLevel == RiskLevel.LOW
-                resolvedTool.tool == ToolName.OPEN_APP ->
-                    !latestState.safetyRules.alwaysAskApproval || latestState.safetyRules.instantRunLowRiskAppLaunch
-                else -> !latestState.safetyRules.alwaysAskApproval
-            }
+            // LOW and MEDIUM risk actions auto-run immediately without approval;
+            // HIGH risk actions ALWAYS show the compact Approval Card inside this overlay.
+            val shouldAutoRun = resolvedTool.shouldAutoRun(latestState.safetyRules)
 
             val initialStatus = if (shouldAutoRun) ApprovalStatus.RUNNING else ApprovalStatus.PENDING
             val cardMsg = ChatMessage(
@@ -675,16 +723,15 @@ private fun VoiceOverlaySheetContent(
         }
 
         if (wakeTriggered && latest.speakRepliesAloud) {
-            val greeting = if (latest.voiceLanguage == VoiceLanguage.TE_IN) {
-                "చెప్పండి, వింటున్నాను"
-            } else {
-                "Yes, I'm listening"
+            val greeting = when (latest.voiceLanguage) {
+                VoiceLanguage.TE_IN -> "చెప్పండి, వింటున్నాను"
+                else -> "Yes, I'm listening"
             }
             replyText = greeting
             AgentSpeechFeedback.speak(
                 context = context.applicationContext,
                 text = greeting,
-                language = latest.voiceLanguage,
+                voiceSettings = latest,
                 onDone = { startMicNow() }
             )
         } else {
@@ -771,11 +818,7 @@ private fun VoiceOverlaySheetContent(
                                 .clip(CircleShape)
                                 .background(MaterialTheme.colorScheme.secondaryContainer)
                                 .clickable {
-                                    val next = if (voiceLanguage == VoiceLanguage.EN_IN) {
-                                        VoiceLanguage.TE_IN
-                                    } else {
-                                        VoiceLanguage.EN_IN
-                                    }
+                                    val next = voiceLanguage.next()
                                     scope.launch {
                                         storage.saveVoiceSettings(latestVoiceSettings.copy(voiceLanguage = next))
                                     }

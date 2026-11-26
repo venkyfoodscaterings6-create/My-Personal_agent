@@ -130,6 +130,8 @@ object AgentNotificationHelper {
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Shows the Ask Agent trigger and live Stop Agent controls."
+                setSound(null, null)
+                enableVibration(false)
             }
             manager.createNotificationChannel(channel)
         }
@@ -163,6 +165,7 @@ object AgentNotificationHelper {
             .setContentText("Tap Ask Agent to control your phone from any app.")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setContentIntent(askPendingIntent)
             .addAction(
                 R.drawable.ic_robot_tile,
@@ -195,6 +198,7 @@ object AgentNotificationHelper {
             .setContentText(statusText)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setContentIntent(askPendingIntent)
             .addAction(
                 R.drawable.ic_robot_tile,
@@ -374,7 +378,11 @@ class AgentAccessibilityService : AccessibilityService() {
 
                     val snap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
                     if (blockSensitive) {
-                        val violation = SafetyGuardrail.detectSensitiveViolation(snap.packageName, snap.compactSummary)
+                        val violation = SafetyGuardrail.detectSensitiveScreen(
+                            packageName = snap.packageName,
+                            ownPackageName = ownPkg,
+                            nodes = snap.nodes
+                        )
                         if (violation != null) {
                             emitBlocked(plan.actionId, violation)
                             return@launch
@@ -618,11 +626,12 @@ class AgentAccessibilityService : AccessibilityService() {
 
                 val snap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
                 if (blockSensitive) {
-                    val violation = SafetyGuardrail.detectSensitiveViolation(
-                        snap.packageName,
-                        snap.compactSummary,
-                        targetText
-                    )
+                    val violation = SafetyGuardrail.detectSensitiveViolation(targetText)
+                        ?: SafetyGuardrail.detectSensitiveScreen(
+                            packageName = snap.packageName,
+                            ownPackageName = packageName,
+                            nodes = snap.nodes
+                        )
                     if (violation != null) {
                         emitBlocked(plan.actionId, violation)
                         return@launch
@@ -889,7 +898,11 @@ class AgentAccessibilityService : AccessibilityService() {
                     latestSnapshot = snap
 
                     if (blockSensitive) {
-                        val violation = SafetyGuardrail.detectSensitiveViolation(snap.packageName, snap.compactSummary)
+                        val violation = SafetyGuardrail.detectSensitiveScreen(
+                            packageName = snap.packageName,
+                            ownPackageName = packageName,
+                            nodes = snap.nodes
+                        )
                         if (violation != null) {
                             emitBlocked(plan.actionId, violation)
                             return@launch
@@ -1005,10 +1018,12 @@ class AgentAccessibilityService : AccessibilityService() {
      * Background-safe multi-step AI Accessibility loop running in serviceScope so it never
      * pauses when another app comes to the foreground.
      */
+    private val firebaseAiService by lazy { FirebaseAiService() }
+
     fun startAiUiAutomation(
         plan: ActionPlan,
         goal: String,
-        provider: AiProvider,
+        provider: AiProvider?,
         blockSensitive: Boolean,
         maxSteps: Int = 15,
         conversationHistory: List<ChatMessage> = emptyList(),
@@ -1044,7 +1059,7 @@ class AgentAccessibilityService : AccessibilityService() {
     private suspend fun runAiAutomationLoop(
         plan: ActionPlan,
         goal: String,
-        provider: AiProvider,
+        provider: AiProvider?,
         blockSensitive: Boolean,
         maxSteps: Int,
         loopStartMillis: Long,
@@ -1057,6 +1072,8 @@ class AgentAccessibilityService : AccessibilityService() {
         var finishedSummary: String? = null
         var failedMessage: String? = null
         var blockedReason: String? = null
+        var consecutiveStagnantSteps = 0
+        var lastAutoScrollDir = "down"
 
         val firstBanner = "Step 1/$maxSteps · Reading screen…"
         publishRunningState(plan.actionId, firstBanner, loopStartMillis, completedSteps = 0, activeStep = 0)
@@ -1094,9 +1111,10 @@ class AgentAccessibilityService : AccessibilityService() {
             if (isStopRequested()) break
 
             if (blockSensitive) {
-                val screenViolation = SafetyGuardrail.detectSensitiveViolation(
-                    snapshot.packageName,
-                    snapshot.compactSummary
+                val screenViolation = SafetyGuardrail.detectSensitiveScreen(
+                    packageName = snapshot.packageName,
+                    ownPackageName = packageName,
+                    nodes = snapshot.nodes
                 )
                 if (screenViolation != null) {
                     blockedReason = screenViolation
@@ -1114,17 +1132,29 @@ class AgentAccessibilityService : AccessibilityService() {
             )
             updateOverlayAndNotification(thinkBanner)
 
-            val nextResult = networkClient.requestNextOnDeviceAction(
-                provider = provider,
-                goal = goal,
-                plannedSteps = plan.steps,
-                screenSnapshot = snapshot,
-                stepHistory = stepLog,
-                stepNumber = step,
-                maxSteps = maxSteps,
-                lastActionFeedback = lastActionFeedback,
-                conversationHistory = conversationHistory
-            )
+            val nextResult = if (provider != null) {
+                networkClient.requestNextOnDeviceAction(
+                    provider = provider,
+                    goal = goal,
+                    plannedSteps = plan.steps,
+                    screenSnapshot = snapshot,
+                    stepHistory = stepLog,
+                    stepNumber = step,
+                    maxSteps = maxSteps,
+                    lastActionFeedback = lastActionFeedback,
+                    conversationHistory = conversationHistory
+                )
+            } else {
+                firebaseAiService.requestNextOnDeviceActionWithGemini(
+                    goal = goal,
+                    screenSnapshot = snapshot,
+                    stepHistory = stepLog,
+                    stepNumber = step,
+                    maxSteps = maxSteps,
+                    lastActionFeedback = lastActionFeedback,
+                    conversationHistory = conversationHistory
+                )
+            }
 
             if (isStopRequested()) break
 
@@ -1173,14 +1203,41 @@ class AgentAccessibilityService : AccessibilityService() {
                     }
                     if (isStopRequested()) break
 
-                    // Anti-stuck UI-tree hash comparison
+                    // Anti-stuck UI-tree hash comparison + automatic scroll-retry recovery
                     val afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
-                    lastActionFeedback = if (!execResult.success) {
-                        "Last action failed (${execResult.summary}) — try a different element or scroll."
-                    } else if (afterSnap.treeHash == beforeHash && nextAction.action != "open_app") {
-                        "Last action had no visual effect — pick a different element or scroll."
+                    val screenUnchanged = afterSnap.treeHash == beforeHash && nextAction.action != "open_app"
+                    if (!execResult.success || screenUnchanged) {
+                        consecutiveStagnantSteps++
+                        if (consecutiveStagnantSteps >= 2 && !isStopRequested()) {
+                            val recoveryDir = if (nextAction.action == "scroll" && nextAction.direction == "down") {
+                                "up"
+                            } else {
+                                lastAutoScrollDir.also { lastAutoScrollDir = if (it == "down") "up" else "down" }
+                            }
+                            val retryBanner = "Step $step/$maxSteps · Retrying (scrolling $recoveryDir)…"
+                            publishRunningState(plan.actionId, retryBanner, loopStartMillis, mappedDone, mappedDone)
+                            updateOverlayAndNotification(retryBanner)
+                            performScroll(recoveryDir)
+                            for (tick in 0 until 4) {
+                                if (isStopRequested()) break
+                                delay(100L)
+                            }
+                            stepLog.add("Step $step (auto-retry scroll $recoveryDir): nudged screen after $consecutiveStagnantSteps stagnant steps")
+                            lastActionFeedback = "Screen was unchanged for $consecutiveStagnantSteps steps, so I auto-scrolled $recoveryDir to reveal fresh controls. Pick a different visible element now."
+                            consecutiveStagnantSteps = 0
+                        } else {
+                            val retryBanner = "Step $step/$maxSteps · Retrying alternative…"
+                            publishRunningState(plan.actionId, retryBanner, loopStartMillis, mappedDone, mappedDone)
+                            updateOverlayAndNotification(retryBanner)
+                            lastActionFeedback = if (!execResult.success) {
+                                "Last action failed (${execResult.summary}) — try a different element or scroll."
+                            } else {
+                                "Last action had no visual effect — pick a different element or scroll."
+                            }
+                        }
                     } else {
-                        null
+                        consecutiveStagnantSteps = 0
+                        lastActionFeedback = null
                     }
                 }
             }

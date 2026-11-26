@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.squareup.moshi.JsonAdapter
@@ -34,7 +35,8 @@ data class PersistedAppState(
     val quickActionChips: List<String>,
     val themePreference: ThemePreference,
     val agentMode: AgentMode,
-    val connectionTestPassed: Boolean
+    val connectionTestPassed: Boolean,
+    val builtInGeminiSettings: BuiltInGeminiSettings = BuiltInGeminiSettings()
 )
 
 class LocalStorage(private val context: Context) {
@@ -77,6 +79,14 @@ class LocalStorage(private val context: Context) {
         val PERSISTENT_ASK_NOTIFICATION = booleanPreferencesKey("persistent_ask_notification_enabled")
         val WAKE_WORD_ENABLED = booleanPreferencesKey("wake_word_enabled")
         val WAKE_PHRASE = stringPreferencesKey("wake_phrase")
+        val USE_GEMINI_NEURAL_VOICE = booleanPreferencesKey("use_gemini_neural_voice")
+        val VOICE_PERSONA = stringPreferencesKey("voice_persona")
+        val SPEECH_RATE = floatPreferencesKey("speech_rate")
+        val WAKE_SENSITIVITY = stringPreferencesKey("wake_sensitivity")
+        val USE_BUILT_IN_GEMINI = booleanPreferencesKey("use_built_in_gemini")
+        val BUILT_IN_GEMINI_MODEL = stringPreferencesKey("built_in_gemini_model")
+        val GOOGLE_SEARCH_ENABLED = booleanPreferencesKey("google_search_enabled")
+        val INJECT_SQL_MEMORY = booleanPreferencesKey("inject_sql_memory")
     }
 
     // All DataStore reads, Moshi decoding, and URL normalization run strictly on Dispatchers.IO.
@@ -102,11 +112,21 @@ class LocalStorage(private val context: Context) {
 
             val mode = prefs[Keys.AGENT_MODE]?.let { raw ->
                 runCatching { AgentMode.valueOf(raw) }.getOrNull()
-            } ?: AgentMode.CHAT_ONLY
+            } ?: AgentMode.SMART_AUTO
 
             val voiceLanguage = prefs[Keys.VOICE_LANGUAGE]?.let { raw ->
                 runCatching { VoiceLanguage.valueOf(raw) }.getOrNull()
-            } ?: VoiceLanguage.EN_IN
+            } ?: VoiceLanguage.AUTO
+
+            val voicePersona = prefs[Keys.VOICE_PERSONA]?.let { raw ->
+                runCatching { GeminiVoicePersona.valueOf(raw) }.getOrNull()
+            } ?: GeminiVoicePersona.KORE
+
+            val wakeSensitivity = prefs[Keys.WAKE_SENSITIVITY]?.let { raw ->
+                runCatching { WakeSensitivity.valueOf(raw) }.getOrNull()
+            } ?: WakeSensitivity.BALANCED
+
+            val speechRate = (prefs[Keys.SPEECH_RATE] ?: 1.0f).coerceIn(0.8f, 1.35f)
 
             val voiceSettings = VoiceSettings(
                 autoSendVoiceCommands = prefs[Keys.AUTO_SEND_VOICE] ?: true,
@@ -115,7 +135,22 @@ class LocalStorage(private val context: Context) {
                 persistentAskNotificationEnabled = prefs[Keys.PERSISTENT_ASK_NOTIFICATION] ?: true,
                 wakeWordEnabled = prefs[Keys.WAKE_WORD_ENABLED] ?: false,
                 wakePhrase = prefs[Keys.WAKE_PHRASE]?.takeIf { it.isNotBlank() }
-                    ?: VoiceSettings.DEFAULT_WAKE_PHRASE
+                    ?: VoiceSettings.DEFAULT_WAKE_PHRASE,
+                useGeminiNeuralVoice = prefs[Keys.USE_GEMINI_NEURAL_VOICE] ?: true,
+                voicePersona = voicePersona,
+                speechRate = speechRate,
+                wakeSensitivity = wakeSensitivity
+            )
+
+            val builtInModel = prefs[Keys.BUILT_IN_GEMINI_MODEL]?.let { raw ->
+                runCatching { GeminiBuiltInModel.valueOf(raw) }.getOrNull()
+            } ?: GeminiBuiltInModel.FLASH
+
+            val builtInGeminiSettings = BuiltInGeminiSettings(
+                useBuiltInGemini = prefs[Keys.USE_BUILT_IN_GEMINI] ?: true,
+                selectedModel = builtInModel,
+                googleSearchEnabled = prefs[Keys.GOOGLE_SEARCH_ENABLED] ?: false,
+                injectSqlMemory = prefs[Keys.INJECT_SQL_MEMORY] ?: true
             )
 
             PersistedAppState(
@@ -129,7 +164,8 @@ class LocalStorage(private val context: Context) {
                 quickActionChips = quickChips,
                 themePreference = theme,
                 agentMode = mode,
-                connectionTestPassed = prefs[Keys.CONNECTION_TEST_PASSED] ?: false
+                connectionTestPassed = prefs[Keys.CONNECTION_TEST_PASSED] ?: false,
+                builtInGeminiSettings = builtInGeminiSettings
             )
         }
         .flowOn(Dispatchers.IO)
@@ -190,6 +226,19 @@ class LocalStorage(private val context: Context) {
             prefs[Keys.PERSISTENT_ASK_NOTIFICATION] = settings.persistentAskNotificationEnabled
             prefs[Keys.WAKE_WORD_ENABLED] = settings.wakeWordEnabled
             prefs[Keys.WAKE_PHRASE] = settings.wakePhrase.ifBlank { VoiceSettings.DEFAULT_WAKE_PHRASE }
+            prefs[Keys.USE_GEMINI_NEURAL_VOICE] = settings.useGeminiNeuralVoice
+            prefs[Keys.VOICE_PERSONA] = settings.voicePersona.name
+            prefs[Keys.SPEECH_RATE] = settings.speechRate.coerceIn(0.8f, 1.35f)
+            prefs[Keys.WAKE_SENSITIVITY] = settings.wakeSensitivity.name
+        }
+    }
+
+    suspend fun saveBuiltInGeminiSettings(settings: BuiltInGeminiSettings) = withContext(Dispatchers.IO) {
+        context.personalAgentDataStore.edit { prefs ->
+            prefs[Keys.USE_BUILT_IN_GEMINI] = settings.useBuiltInGemini
+            prefs[Keys.BUILT_IN_GEMINI_MODEL] = settings.selectedModel.name
+            prefs[Keys.GOOGLE_SEARCH_ENABLED] = settings.googleSearchEnabled
+            prefs[Keys.INJECT_SQL_MEMORY] = settings.injectSqlMemory
         }
     }
 
@@ -291,6 +340,25 @@ class LocalStorage(private val context: Context) {
             prefs[Keys.SESSION_ID] = newId
         }
         newId
+    }
+
+    suspend fun switchActiveChatSession(
+        sessionId: String,
+        messages: List<ChatMessage>
+    ) = withContext(Dispatchers.IO) {
+        val json = chatListAdapter.toJson(messages)
+        context.personalAgentDataStore.edit { prefs ->
+            prefs[Keys.SESSION_ID] = sessionId
+            prefs[Keys.CHAT_MESSAGES_JSON] = json
+        }
+    }
+
+    fun encodeChatMessages(messages: List<ChatMessage>): String {
+        return chatListAdapter.toJson(messages)
+    }
+
+    fun decodeChatMessages(json: String?): List<ChatMessage> {
+        return decodeList(json, chatListAdapter)
     }
 
     private fun <T> decodeList(
