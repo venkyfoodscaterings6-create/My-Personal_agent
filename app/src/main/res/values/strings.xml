@@ -1,0 +1,71 @@
+<resources>
+    <string name="app_name">My Personal Agent</string>
+
+    <!-- Accessibility Service -->
+    <string name="accessibility_service_description">Lets My Personal Agent read visible screen buttons and perform taps, typing, scrolling, and app launches directly on your device—strictly after you tap Approve.</string>
+
+    <!-- Agent Screen -->
+    <string name="mode_chat_only">Chat Only</string>
+    <string name="mode_agent_control">Agent Control</string>
+    <string name="action_test_approval_demo">Test Approval Demo</string>
+    <string name="action_clear_chat">Clear Chat</string>
+    <string name="action_copy_reply">Copy reply</string>
+    <string name="action_approve_run">Approve</string>
+    <string name="action_edit_step">Edit Step</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_send">Send message</string>
+    <string name="action_voice_start">Start voice command</string>
+    <string name="action_voice_input">Start voice command</string>
+    <string name="action_voice_stop">Stop listening</string>
+    <string name="voice_listening_hint">Listening…</string>
+    <string name="action_tts_stop">Stop speaking</string>
+    <string name="action_stop_speaking">Stop speaking</string>
+    <string name="action_stop_agent">Stop Agent</string>
+    <string name="input_placeholder_chat">Ask anything…</string>
+    <string name="input_placeholder_agent">Tell your agent what to do…</string>
+    <string name="no_provider_selected">No AI Provider</string>
+
+    <!-- Approvals Screen -->
+    <string name="filter_pending">Pending</string>
+    <string name="filter_history">History</string>
+    <string name="action_clear_history">Clear History</string>
+
+    <!-- Setup & Permissions Screen -->
+    <string name="setup_title">Setup &amp; Test</string>
+    <string name="setup_go_to_api_keys">Go to API Keys</string>
+    <string name="setup_test_connection">Test Connection</string>
+    <string name="setup_run_self_test">Run Full Self-Test</string>
+    <string name="self_test_title">Full On-Device Self-Test</string>
+    <string name="self_test_subtitle">Verifies AI JSON speed, installed app discovery, speech recognition, and all 6 permissions.</string>
+    <string name="self_test_button">Run Full Self-Test</string>
+    <string name="permissions_center_title">Permissions Center</string>
+    <string name="permissions_center_subtitle">Grant permissions in one tap. Status updates automatically.</string>
+    <string name="setup_open_accessibility">Open Accessibility Settings</string>
+    <string name="setup_open_app_info">Open App Info (Restricted Settings)</string>
+    <string name="permission_allow">Allow</string>
+    <string name="permission_grant">Grant</string>
+    <string name="permission_granted">Granted</string>
+    <string name="permission_required">Required</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_add_provider">Add Provider</string>
+    <string name="settings_fetch_models">Fetch Models</string>
+    <string name="settings_open_permissions_center">Open Permissions Center</string>
+    <string name="qs_tile_label">Personal Agent</string>
+    <string name="qs_tile_subtitle">Voice &amp; Agent</string>
+    <string name="settings_qs_tile_title">Quick Settings Tile (Zero-Clutter Trigger)</string>
+    <string name="settings_qs_tile_subtitle">Trigger voice commands over YouTube, WhatsApp, or any app with nothing floating on your screen.</string>
+    <string name="settings_qs_tile_steps">1. Swipe down twice from the top of your phone to open Quick Settings.\n2. Tap the Edit (pencil) icon.\n3. Drag \"Personal Agent\" into your active tiles.\n4. Tap the tile anytime to speak right over your current app.</string>
+    <string name="settings_qs_tile_add_button">Add \"Personal Agent\" Tile</string>
+    <string name="settings_persistent_notif_title">Persistent \"Ask Agent\" notification</string>
+    <string name="settings_persistent_notif_subtitle">Keeps a quiet notification in your shade with a one-tap Ask Agent button to speak from any app.</string>
+    <string name="action_ask_agent">Ask Agent</string>
+    <string name="settings_wake_word_title">Hands-Free Wake Word (\"Hey Agent\")</string>
+    <string name="settings_wake_word_subtitle">Say \"Hey Agent\" anytime — just like \"Hey Google\" — and the app will chime, reply with voice, and run your command.</string>
+    <string name="settings_wake_phrase_label">Wake Phrase</string>
+    <string name="settings_default_assistant_button">Set as Phone Default Assistant</string>
+    <string name="settings_test_wake_button">Test Voice Wake-Up</string>
+    <string name="voice_overlay_title">Personal Agent</string>
+    <string name="voice_overlay_type_hint">Or type a quick command…</string>
+</resources>

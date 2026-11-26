@@ -1,0 +1,6 @@
+{
+  "name": "My Personal Agent",
+  "description": "Local-first native Android AI chat and personal phone-automation controller with custom OpenAI-compatible endpoints, interactive approval cards, and safety guardrails.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
