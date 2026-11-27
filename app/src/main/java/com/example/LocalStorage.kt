@@ -110,13 +110,18 @@ class LocalStorage(private val context: Context) {
                 runCatching { ThemePreference.valueOf(raw) }.getOrNull()
             } ?: ThemePreference.SYSTEM
 
-            val mode = prefs[Keys.AGENT_MODE]?.let { raw ->
-                runCatching { AgentMode.valueOf(raw) }.getOrNull()
-            } ?: AgentMode.SMART_AUTO
+            val mode = when (
+                prefs[Keys.AGENT_MODE]?.let { raw ->
+                    runCatching { AgentMode.valueOf(raw) }.getOrNull()
+                }
+            ) {
+                AgentMode.AGENT_CONTROL -> AgentMode.AGENT_CONTROL
+                else -> AgentMode.CHAT_ONLY
+            }
 
             val voiceLanguage = prefs[Keys.VOICE_LANGUAGE]?.let { raw ->
                 runCatching { VoiceLanguage.valueOf(raw) }.getOrNull()
-            } ?: VoiceLanguage.AUTO
+            } ?: VoiceLanguage.EN_IN
 
             val voicePersona = prefs[Keys.VOICE_PERSONA]?.let { raw ->
                 runCatching { GeminiVoicePersona.valueOf(raw) }.getOrNull()
@@ -149,7 +154,7 @@ class LocalStorage(private val context: Context) {
             val builtInGeminiSettings = BuiltInGeminiSettings(
                 useBuiltInGemini = prefs[Keys.USE_BUILT_IN_GEMINI] ?: true,
                 selectedModel = builtInModel,
-                googleSearchEnabled = prefs[Keys.GOOGLE_SEARCH_ENABLED] ?: false,
+                googleSearchEnabled = prefs[Keys.GOOGLE_SEARCH_ENABLED] ?: true,
                 injectSqlMemory = prefs[Keys.INJECT_SQL_MEMORY] ?: true
             )
 

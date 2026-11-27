@@ -1,14 +1,11 @@
 package com.example.ui.theme
 
 import android.app.Activity
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -16,31 +13,10 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
-import com.example.R
 import com.example.ThemePreference
-
-// Top-level cached singleton FontFamily: bundled locally for instant offline rendering
-// and zero reloads during scrolling or typing.
-val GeminiSansFontFamily: FontFamily = FontFamily(
-    Font(R.font.google_sans_flex, FontWeight.Normal),
-    Font(R.font.google_sans_flex, FontWeight.Medium),
-    Font(R.font.google_sans_flex, FontWeight.SemiBold),
-    Font(R.font.google_sans_flex, FontWeight.Bold)
-)
-
-val FallbackSansFontFamily: FontFamily = FontFamily(
-    Font(R.font.plus_jakarta_sans, FontWeight.Normal),
-    Font(R.font.plus_jakarta_sans, FontWeight.Medium),
-    Font(R.font.plus_jakarta_sans, FontWeight.SemiBold),
-    Font(R.font.plus_jakarta_sans, FontWeight.Bold)
-)
 
 @Immutable
 data class AgentSemanticColors(
@@ -52,67 +28,79 @@ data class AgentSemanticColors(
     val highRiskContent: Color,
     val successContainer: Color,
     val successContent: Color,
-    val geminiGradient: List<Color>
+    val geminiGradient: List<Color>,
+    val pdfBadgeContainer: Color = Color(0xFFFEE2E2),
+    val pdfBadgeContent: Color = Color(0xFFDC2626),
+    val xlsxBadgeContainer: Color = Color(0xFFDCFCE7),
+    val xlsxBadgeContent: Color = Color(0xFF15803D),
+    val docxBadgeContainer: Color = Color(0xFFDBEAFE),
+    val docxBadgeContent: Color = Color(0xFF1D4ED8),
+    val csvBadgeContainer: Color = Color(0xFFCCFBF1),
+    val csvBadgeContent: Color = Color(0xFF0F766E)
 )
 
 val LocalAgentSemanticColors = staticCompositionLocalOf {
     AgentSemanticColors(
-        lowRiskContainer = RiskLowContainerLight,
-        lowRiskContent = RiskLowContentLight,
-        mediumRiskContainer = RiskMediumContainerLight,
-        mediumRiskContent = RiskMediumContentLight,
-        highRiskContainer = RiskHighContainerLight,
-        highRiskContent = RiskHighContentLight,
-        successContainer = RiskLowContainerLight,
-        successContent = RiskLowContentLight,
-        geminiGradient = GeminiGradientLight
+        lowRiskContainer = RiskLowContainerDark,
+        lowRiskContent = RiskLowContentDark,
+        mediumRiskContainer = RiskMediumContainerDark,
+        mediumRiskContent = RiskMediumContentDark,
+        highRiskContainer = RiskHighContainerDark,
+        highRiskContent = RiskHighContentDark,
+        successContainer = RiskLowContainerDark,
+        successContent = RiskLowContentDark,
+        geminiGradient = GeminiGradientDark
     )
 }
 
-private val LightFallbackColorScheme = lightColorScheme(
-    primary = SlatePrimaryLight,
-    onPrimary = SlateOnPrimaryLight,
-    primaryContainer = SlatePrimaryContainerLight,
-    onPrimaryContainer = SlateOnPrimaryContainerLight,
-    secondary = SlateSecondaryLight,
-    onSecondary = SlateOnSecondaryLight,
-    secondaryContainer = SlateSecondaryContainerLight,
-    onSecondaryContainer = SlateOnSecondaryContainerLight,
-    tertiary = SlateTertiaryLight,
-    onTertiary = SlateOnTertiaryLight,
-    tertiaryContainer = SlateTertiaryContainerLight,
-    onTertiaryContainer = SlateOnTertiaryContainerLight,
-    background = SlateBackgroundLight,
-    onBackground = SlateOnBackgroundLight,
-    surface = SlateSurfaceLight,
-    onSurface = SlateOnSurfaceLight,
-    surfaceVariant = SlateSurfaceVariantLight,
-    onSurfaceVariant = SlateOnSurfaceVariantLight,
-    outline = SlateOutlineLight,
-    outlineVariant = SlateOutlineVariantLight
+private val SpatialLightColorScheme = lightColorScheme(
+    primary = SpatialPrimaryLight,
+    onPrimary = SpatialOnPrimaryLight,
+    primaryContainer = SpatialPrimaryContainerLight,
+    onPrimaryContainer = SpatialOnPrimaryContainerLight,
+    secondary = SpatialSecondaryLight,
+    onSecondary = SpatialOnSecondaryLight,
+    secondaryContainer = SpatialSecondaryContainerLight,
+    onSecondaryContainer = SpatialOnSecondaryContainerLight,
+    tertiary = SpatialTertiaryLight,
+    onTertiary = SpatialOnTertiaryLight,
+    tertiaryContainer = SpatialTertiaryContainerLight,
+    onTertiaryContainer = SpatialOnTertiaryContainerLight,
+    background = SpatialBackgroundLight,
+    onBackground = SpatialOnBackgroundLight,
+    surface = SpatialSurfaceLight,
+    onSurface = SpatialOnSurfaceLight,
+    surfaceVariant = SpatialSurfaceVariantLight,
+    onSurfaceVariant = SpatialOnSurfaceVariantLight,
+    surfaceContainerHigh = SpatialSurfaceContainerHighLight,
+    surfaceContainerHighest = SpatialSurfaceContainerHighestLight,
+    outline = SpatialOutlineLight,
+    outlineVariant = SpatialOutlineVariantLight
 )
 
-private val DarkFallbackColorScheme = darkColorScheme(
-    primary = SlatePrimaryDark,
-    onPrimary = SlateOnPrimaryDark,
-    primaryContainer = SlatePrimaryContainerDark,
-    onPrimaryContainer = SlateOnPrimaryContainerDark,
-    secondary = SlateSecondaryDark,
-    onSecondary = SlateOnSecondaryDark,
-    secondaryContainer = SlateSecondaryContainerDark,
-    onSecondaryContainer = SlateOnSecondaryContainerDark,
-    tertiary = SlateTertiaryDark,
-    onTertiary = SlateOnTertiaryDark,
-    tertiaryContainer = SlateTertiaryContainerDark,
-    onTertiaryContainer = SlateOnTertiaryContainerDark,
-    background = SlateBackgroundDark,
-    onBackground = SlateOnBackgroundDark,
-    surface = SlateSurfaceDark,
-    onSurface = SlateOnSurfaceDark,
-    surfaceVariant = SlateSurfaceVariantDark,
-    onSurfaceVariant = SlateOnSurfaceVariantDark,
-    outline = SlateOutlineDark,
-    outlineVariant = SlateOutlineVariantDark
+private val SpatialDarkColorScheme = darkColorScheme(
+    primary = SpatialPrimaryDark,
+    onPrimary = SpatialOnPrimaryDark,
+    primaryContainer = SpatialPrimaryContainerDark,
+    onPrimaryContainer = SpatialOnPrimaryContainerDark,
+    secondary = SpatialSecondaryDark,
+    onSecondary = SpatialOnSecondaryDark,
+    secondaryContainer = SpatialSecondaryContainerDark,
+    onSecondaryContainer = SpatialOnSecondaryContainerDark,
+    tertiary = SpatialTertiaryDark,
+    onTertiary = SpatialOnTertiaryDark,
+    tertiaryContainer = SpatialTertiaryContainerDark,
+    onTertiaryContainer = SpatialOnTertiaryContainerDark,
+    background = SpatialBackgroundDark,
+    onBackground = SpatialOnBackgroundDark,
+    surface = SpatialSurfaceDark,
+    onSurface = SpatialOnSurfaceDark,
+    surfaceVariant = SpatialSurfaceVariantDark,
+    onSurfaceVariant = SpatialOnSurfaceVariantDark,
+    surfaceContainerHigh = SpatialSurfaceContainerHighDark,
+    surfaceContainerHighest = SpatialSurfaceContainerHighestDark,
+    outline = SpatialOutlineDark,
+    outlineVariant = SpatialOutlineVariantDark
 )
 
 val AppShapes = Shapes(
@@ -125,7 +113,6 @@ val AppShapes = Shapes(
 @Composable
 fun PersonalAgentTheme(
     themePreference: ThemePreference = ThemePreference.SYSTEM,
-    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
     val darkTheme = when (themePreference) {
@@ -134,14 +121,8 @@ fun PersonalAgentTheme(
         ThemePreference.DARK -> true
     }
 
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> DarkFallbackColorScheme
-        else -> LightFallbackColorScheme
-    }
+    val colorScheme = if (darkTheme) SpatialDarkColorScheme else SpatialLightColorScheme
+    val glassColors = if (darkTheme) DarkAgentGlassColors else LightAgentGlassColors
 
     val semanticColors = if (darkTheme) {
         AgentSemanticColors(
@@ -153,7 +134,15 @@ fun PersonalAgentTheme(
             highRiskContent = RiskHighContentDark,
             successContainer = RiskLowContainerDark,
             successContent = RiskLowContentDark,
-            geminiGradient = GeminiGradientDark
+            geminiGradient = GeminiGradientDark,
+            pdfBadgeContainer = Color(0xFF451A1A).copy(alpha = 0.85f),
+            pdfBadgeContent = Color(0xFFFCA5A5),
+            xlsxBadgeContainer = Color(0xFF143824).copy(alpha = 0.85f),
+            xlsxBadgeContent = Color(0xFF86EFAC),
+            docxBadgeContainer = Color(0xFF172B4D).copy(alpha = 0.85f),
+            docxBadgeContent = Color(0xFF93C5FD),
+            csvBadgeContainer = Color(0xFF123836).copy(alpha = 0.85f),
+            csvBadgeContent = Color(0xFF5EEAD4)
         )
     } else {
         AgentSemanticColors(
@@ -165,7 +154,15 @@ fun PersonalAgentTheme(
             highRiskContent = RiskHighContentLight,
             successContainer = RiskLowContainerLight,
             successContent = RiskLowContentLight,
-            geminiGradient = GeminiGradientLight
+            geminiGradient = GeminiGradientLight,
+            pdfBadgeContainer = Color(0xFFFEE2E2),
+            pdfBadgeContent = Color(0xFFDC2626),
+            xlsxBadgeContainer = Color(0xFFDCFCE7),
+            xlsxBadgeContent = Color(0xFF15803D),
+            docxBadgeContainer = Color(0xFFDBEAFE),
+            docxBadgeContent = Color(0xFF1D4ED8),
+            csvBadgeContainer = Color(0xFFCCFBF1),
+            csvBadgeContent = Color(0xFF0F766E)
         )
     }
 
@@ -181,7 +178,10 @@ fun PersonalAgentTheme(
         }
     }
 
-    CompositionLocalProvider(LocalAgentSemanticColors provides semanticColors) {
+    CompositionLocalProvider(
+        LocalAgentSemanticColors provides semanticColors,
+        LocalAgentGlassColors provides glassColors
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = AppTypography,

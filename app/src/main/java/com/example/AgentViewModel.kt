@@ -33,7 +33,7 @@ data class AgentUiState(
     val installedAppsCount: Int = 0,
     val quickActionChips: List<String> = DefaultQuickChips.items,
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
-    val agentMode: AgentMode = AgentMode.SMART_AUTO,
+    val agentMode: AgentMode = AgentMode.CHAT_ONLY,
     val connectionTestPassed: Boolean = false,
     val isSending: Boolean = false,
     val isAgentLoopRunning: Boolean = false,
@@ -110,6 +110,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     private val storage = LocalStorage(appContext)
     private val networkClient = NetworkClient()
     private val firebaseAiService = FirebaseAiService()
+    private val fileGenerationEngine = com.example.files.FileGenerationEngine(networkClient, firebaseAiService)
     private val sqlRepository = AgentSqlRepository(PersonalAgentDatabase.getInstance(appContext))
     private val sqlSearchFlow = MutableStateFlow("")
     private val threadSearchFlow = MutableStateFlow("")
@@ -193,6 +194,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             storage.ensureSessionId()
             storage.stateFlow.collect { persisted ->
+                ConversationRepository.syncFromPersisted(persisted.sessionId, persisted.chatMessages)
                 _uiState.update { current ->
                     current.copy(
                         isLoaded = true,
@@ -356,7 +358,6 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         val vs = _uiState.value.voiceSettings
         val sample = when (vs.voiceLanguage) {
             VoiceLanguage.TE_IN -> "నమస్కారం! నేను మీ పర్సనల్ ఏజెంట్. నేను మీకు ఎలా సహాయం చేయగలను?"
-            VoiceLanguage.AUTO -> "Hi! I am ${vs.voicePersona.displayName}, your personal agent. Ready in English and Telugu."
             VoiceLanguage.EN_IN -> "Hi! I am ${vs.voicePersona.displayName}, your personal agent. How can I help you today?"
         }
         AgentSpeechFeedback.speak(
@@ -393,7 +394,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleGoogleSearchGrounding() {
         val next = !_uiState.value.builtInGeminiSettings.googleSearchEnabled
         updateBuiltInGeminiSettings { it.copy(googleSearchEnabled = next) }
-        showMessage(if (next) "Google Search Grounding ON" else "Google Search Grounding OFF")
+        showMessage(if (next) "Web Search (Live Facts) ON" else "Web Search (Live Facts) OFF")
     }
 
     fun selectDefaultProvider(providerId: String) {
@@ -493,6 +494,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             val entity = sqlRepository.getThreadById(threadId) ?: return@launch
             val decoded = storage.decodeChatMessages(entity.messagesJson)
             storage.switchActiveChatSession(entity.id, decoded)
+            ConversationRepository.resetSessionExplicitly(entity.id, decoded)
             _uiState.update {
                 it.copy(
                     destination = AppDestination.CHAT,
@@ -585,6 +587,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         messages: List<ChatMessage>,
         approvals: List<ApprovalRecord>? = null
     ) {
+        ConversationRepository.syncFromPersisted(_uiState.value.sessionId, messages)
         if (approvals != null) {
             storage.saveChatAndApprovals(messages, approvals)
         } else {
@@ -675,14 +678,34 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // 3. Direct deterministic phone actions during Live Voice (calls, messages, alarms, apps, YouTube, scroll)
+            // 3. Direct deterministic phone actions during Live Voice (foreground-aware!)
+            val currentForegroundApp = AgentAccessibilityService.getCurrentForegroundApp(appContext.packageName)
+            val recentHistory = ConversationRepository.mergeWithPersisted(withUser)
             val localTool = withContext(Dispatchers.Default) {
-                HybridToolRouting.matchDirectLocalTool(text)
+                HybridToolRouting.matchDirectLocalTool(text, currentForegroundApp)
+            }
+            if (localTool != null && localTool.tool == ToolName.GENERATE_FILE) {
+                val targetFormat = com.example.files.GeneratedFileFormat.fromString(localTool.label)
+                val generatedOk = handleFileGenerationDispatch(
+                    userGoal = localTool.query ?: text,
+                    targetFormat = targetFormat,
+                    messagesWithUser = recentHistory,
+                    announceViaSpeech = false
+                )
+                val spoken = if (generatedOk) {
+                    "Yes, completed! Your ${targetFormat.spokenLabel} file is ready."
+                } else {
+                    "I couldn't complete that — failed to generate the ${targetFormat.spokenLabel} file right now."
+                }
+                speakLiveReply(spoken, emptyList(), onFinishedSpeaking)
+                return@launch
             }
             if (localTool != null && localTool.tool != ToolName.REPLY_TO_USER) {
                 val createdPlan = dispatchRoutedToolCall(localTool, text, "Live · Instant")
-                if (localTool.shouldAutoRun(state.safetyRules)) {
-                    val confirm = "On it! ${localTool.title}."
+                if (createdPlan == null) {
+                    _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.IDLE) }
+                } else if (localTool.shouldAutoRun(state.safetyRules)) {
+                    val confirm = HybridToolRouting.buildImmediateAckPhrase(localTool)
                     speakLiveReply(confirm, emptyList(), onFinishedSpeaking)
                 } else {
                     _uiState.update { it.copy(livePendingApprovalPlan = createdPlan) }
@@ -700,7 +723,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
             // 3b. Full AI Hybrid Tool Router inside Live Voice when the utterance looks like a phone action
             val looksLikeAction = withContext(Dispatchers.Default) {
-                SmartIntentClassifier.looksLikePhoneAction(text)
+                SmartIntentClassifier.looksLikePhoneAction(text, currentForegroundApp)
             }
             if (looksLikeAction) {
                 val installedNames = InstalledAppCache.getCached().map { it.displayName }
@@ -708,14 +731,17 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     state = state,
                     userGoal = text,
                     installedNames = installedNames,
-                    messagesWithUser = withUser,
-                    sqlContext = sqlContext
+                    messagesWithUser = recentHistory,
+                    sqlContext = sqlContext,
+                    currentForegroundApp = currentForegroundApp
                 )
                 if (routeResult is ToolRouteApiResult.Success && routeResult.toolCall.tool != ToolName.REPLY_TO_USER) {
                     val routed = routeResult.toolCall
                     val createdPlan = dispatchRoutedToolCall(routed, text, "Live · Smart Action")
-                    if (routed.shouldAutoRun(state.safetyRules)) {
-                        val confirm = "On it! ${routed.title}."
+                    if (createdPlan == null) {
+                        _uiState.update { it.copy(liveVoicePhase = LiveVoicePhase.IDLE) }
+                    } else if (routed.shouldAutoRun(state.safetyRules)) {
+                        val confirm = HybridToolRouting.buildImmediateAckPhrase(routed)
                         speakLiveReply(confirm, emptyList(), onFinishedSpeaking)
                     } else {
                         _uiState.update { it.copy(livePendingApprovalPlan = createdPlan) }
@@ -830,21 +856,35 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         if (streamOpened) AgentSpeechFeedback.stopSpeaking()
                         val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
                         if (result.isRateLimit && fallbackCustom != null) {
-                            val liveSysPrompt = buildString {
-                                appendLine("You are My Personal Agent in a real-time spoken voice conversation. Reply warmly in 2 to 3 concise sentences without markdown formatting.")
-                                if (sqlContext.isNotBlank()) appendLine(sqlContext)
-                            }
-                            when (val customRes = networkClient.sendChatMessage(fallbackCustom, withUser, systemPrompt = liveSysPrompt)) {
+                            val searchOn = state.builtInGeminiSettings.googleSearchEnabled &&
+                                fallbackCustom.apiFormat == ApiFormat.GEMINI_NATIVE
+                            val liveSysPrompt = SystemPromptBuilder.buildRichAssistantSystemPrompt(
+                                personalSqlContext = sqlContext,
+                                voiceLanguage = state.voiceSettings.voiceLanguage,
+                                isLiveVoice = true,
+                                hasLiveWebSearch = searchOn
+                            )
+                            val factualTemp = if (fallbackCustom.apiFormat == ApiFormat.OPENAI_COMPATIBLE) 0.3 else null
+                            when (
+                                val customRes = networkClient.sendChatMessage(
+                                    provider = fallbackCustom,
+                                    conversationHistory = withUser,
+                                    systemPrompt = liveSysPrompt,
+                                    temperature = factualTemp,
+                                    enableGoogleSearch = searchOn
+                                )
+                            ) {
                                 is ChatApiResult.Success -> {
                                     val replyMsg = ChatMessage(
                                         sender = MessageSender.AGENT,
                                         text = customRes.reply,
+                                        groundingSources = customRes.groundingSources,
                                         modelBadge = "Live · ${fallbackCustom.displayName} (Fallback)"
                                     )
                                     val updated = _uiState.value.chatMessages + replyMsg
                                     _uiState.update { it.copy(chatMessages = updated) }
                                     persistMessagesAndThread(updated)
-                                    speakLiveReply(customRes.reply, emptyList(), onFinishedSpeaking)
+                                    speakLiveReply(customRes.reply, customRes.groundingSources, onFinishedSpeaking)
                                     return@launch
                                 }
                                 is ChatApiResult.Error -> Unit
@@ -869,15 +909,29 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } else {
                 val customProvider = state.activeProvider!!
-                val liveSysPrompt = buildString {
-                    appendLine("You are My Personal Agent in a real-time spoken voice conversation. Reply warmly in 2 to 3 concise sentences without markdown formatting.")
-                    if (sqlContext.isNotBlank()) appendLine(sqlContext)
-                }
-                when (val res = networkClient.sendChatMessage(customProvider, withUser, systemPrompt = liveSysPrompt)) {
+                val searchOn = state.builtInGeminiSettings.googleSearchEnabled &&
+                    customProvider.apiFormat == ApiFormat.GEMINI_NATIVE
+                val liveSysPrompt = SystemPromptBuilder.buildRichAssistantSystemPrompt(
+                    personalSqlContext = sqlContext,
+                    voiceLanguage = state.voiceSettings.voiceLanguage,
+                    isLiveVoice = true,
+                    hasLiveWebSearch = searchOn
+                )
+                val factualTemp = if (customProvider.apiFormat == ApiFormat.OPENAI_COMPATIBLE) 0.3 else null
+                when (
+                    val res = networkClient.sendChatMessage(
+                        provider = customProvider,
+                        conversationHistory = withUser,
+                        systemPrompt = liveSysPrompt,
+                        temperature = factualTemp,
+                        enableGoogleSearch = searchOn
+                    )
+                ) {
                     is ChatApiResult.Success -> {
                         val replyMsg = ChatMessage(
                             sender = MessageSender.AGENT,
                             text = res.reply,
+                            groundingSources = res.groundingSources,
                             modelBadge = "Live · ${customProvider.displayName}"
                         )
                         val updated = _uiState.value.chatMessages + replyMsg
@@ -888,9 +942,10 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                             mode = "LIVE_VOICE",
                             userPrompt = text,
                             agentResponse = res.reply,
-                            toolUsed = customProvider.modelName
+                            toolUsed = customProvider.modelName,
+                            usedGoogleSearch = res.groundingSources.isNotEmpty()
                         )
-                        speakLiveReply(res.reply, emptyList(), onFinishedSpeaking)
+                        speakLiveReply(res.reply, res.groundingSources, onFinishedSpeaking)
                     }
                     is ChatApiResult.Error -> {
                         if (FirebaseAiService.isQuotaOrRateLimitMessage(res.message)) {
@@ -1268,14 +1323,48 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         maybeAttachMemorySuggestion(text, userMsg.id)
 
         viewModelScope.launch {
-            persistMessagesAndThread(withUser)
-
-            when (state.agentMode) {
-                AgentMode.SMART_AUTO -> handleSmartAutoDispatch(text, withUser)
-                AgentMode.CHAT_ONLY -> handleChatOnlyDispatch(withUser)
-                AgentMode.AGENT_CONTROL -> handleOnDeviceAgentPlan(text, withUser)
+            try {
+                persistMessagesAndThread(withUser)
+                when (state.agentMode) {
+                    AgentMode.CHAT_ONLY -> handleChatOnlyDispatch(withUser, skipPreflight = false)
+                    AgentMode.AGENT_CONTROL -> handleOnDeviceAgentPlan(text, withUser)
+                    AgentMode.SMART_AUTO -> handleSmartAutoDispatch(text, withUser)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportUnexpectedFailure(e.localizedMessage ?: "Something went wrong while processing your request")
             }
         }
+    }
+
+    private suspend fun reportUnexpectedFailure(reason: String) {
+        val failText = ConfirmationFormatter.formatStrictFailure(reason)
+        val errMsg = ChatMessage(
+            sender = MessageSender.AGENT,
+            text = failText,
+            isError = true,
+            excludeFromContext = true
+        )
+        val updated = _uiState.value.chatMessages + errMsg
+        _uiState.update {
+            it.copy(
+                isSending = false,
+                isAgentLoopRunning = false,
+                streamingAssistantText = "",
+                liveAgentStatusText = "",
+                livePhaseStartMillis = 0L,
+                chatMessages = updated
+            )
+        }
+        persistMessagesAndThread(updated)
+        AgentSpeechFeedback.announceOutcome(
+            context = appContext,
+            message = failText,
+            isSuccess = false,
+            voiceSettings = _uiState.value.voiceSettings,
+            showToastWhenOutsideApp = false
+        )
     }
 
     private suspend fun handleSmartAutoDispatch(
@@ -1283,6 +1372,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         messagesWithUser: List<ChatMessage>
     ) {
         val state = _uiState.value
+        val currentForegroundApp = AgentAccessibilityService.getCurrentForegroundApp(appContext.packageName)
+        val recentHistory = ConversationRepository.mergeWithPersisted(messagesWithUser)
 
         // 1. Safety Guardrail check first
         if (state.safetyRules.blockSensitiveFinancial) {
@@ -1290,7 +1381,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 SafetyGuardrail.detectSensitiveViolation(userGoal)
             }
             if (violation != null) {
-                recordHardBlockedRequest(userGoal, violation, messagesWithUser)
+                recordHardBlockedRequest(userGoal, violation, recentHistory)
                 return
             }
         }
@@ -1308,26 +1399,37 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 3. Deterministic local phone commands (instant <20ms)
-        val localTool = withContext(Dispatchers.Default) {
-            HybridToolRouting.matchDirectLocalTool(userGoal)
+        // 3. Unified Smart Intent Classifier (foreground-aware!)
+        val routeDecision = withContext(Dispatchers.Default) {
+            SmartIntentClassifier.decideUnifiedRoute(userGoal, currentForegroundApp)
         }
-        if (localTool != null && localTool.tool != ToolName.REPLY_TO_USER) {
-            dispatchRoutedToolCall(
-                toolCall = localTool,
-                userGoal = userGoal,
-                planDurationLabel = "Instant · 0.0s"
-            )
-            return
-        }
-
-        // 4. Smart Intent Classifier: conversational questions go straight to streaming Gemini + Google Search!
-        val looksLikeAction = withContext(Dispatchers.Default) {
-            SmartIntentClassifier.looksLikePhoneAction(userGoal)
-        }
-        if (!looksLikeAction) {
-            handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
-            return
+        when (routeDecision) {
+            UnifiedRouteDecision.DIRECT_CHAT -> {
+                handleChatOnlyDispatch(recentHistory, skipPreflight = true)
+                return
+            }
+            UnifiedRouteDecision.LOCAL_TOOL -> {
+                val localTool = withContext(Dispatchers.Default) {
+                    HybridToolRouting.matchDirectLocalTool(userGoal, currentForegroundApp)
+                }
+                if (localTool != null && localTool.tool == ToolName.GENERATE_FILE) {
+                    handleFileGenerationDispatch(
+                        userGoal = localTool.query ?: userGoal,
+                        targetFormat = com.example.files.GeneratedFileFormat.fromString(localTool.label),
+                        messagesWithUser = recentHistory
+                    )
+                    return
+                }
+                if (localTool != null && localTool.tool != ToolName.REPLY_TO_USER) {
+                    dispatchRoutedToolCall(
+                        toolCall = localTool,
+                        userGoal = userGoal,
+                        planDurationLabel = "Instant · 0.0s"
+                    )
+                    return
+                }
+            }
+            UnifiedRouteDecision.AI_TOOL_ROUTER -> Unit
         }
 
         // 5. Route action-like prompts via AI Hybrid Tool Router; if it decides REPLY_TO_USER, hand off to streaming chat
@@ -1349,8 +1451,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             state = state,
             userGoal = userGoal,
             installedNames = installedNames,
-            messagesWithUser = messagesWithUser,
-            sqlContext = sqlContext
+            messagesWithUser = recentHistory,
+            sqlContext = sqlContext,
+            currentForegroundApp = currentForegroundApp
         )
         val routeElapsed = formatElapsed(System.currentTimeMillis() - routeStartMillis)
         _uiState.update {
@@ -1363,11 +1466,11 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
         when (routeResult) {
             is ToolRouteApiResult.Error -> {
-                handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
+                handleChatOnlyDispatch(recentHistory, skipPreflight = true)
             }
             is ToolRouteApiResult.Success -> {
                 if (routeResult.toolCall.tool == ToolName.REPLY_TO_USER) {
-                    handleChatOnlyDispatch(messagesWithUser, skipPreflight = true)
+                    handleChatOnlyDispatch(recentHistory, skipPreflight = true)
                 } else {
                     dispatchRoutedToolCall(
                         toolCall = routeResult.toolCall,
@@ -1384,49 +1487,67 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         userGoal: String,
         installedNames: List<String>,
         messagesWithUser: List<ChatMessage>,
-        sqlContext: String
+        sqlContext: String,
+        currentForegroundApp: String? = null
     ): ToolRouteApiResult {
-        val primaryRouteResult = if (state.isUsingBuiltInGemini || state.activeProvider == null) {
-            firebaseAiService.routeHybridToolWithGemini(
-                userGoal = userGoal,
-                installedAppSample = installedNames,
-                safetyRules = state.safetyRules,
-                conversationHistory = messagesWithUser,
-                personalSqlContext = sqlContext
-            )
-        } else {
-            networkClient.routeHybridTool(
-                provider = state.activeProvider!!,
-                userGoal = userGoal,
-                installedAppSample = installedNames,
-                safetyRules = state.safetyRules,
-                conversationHistory = messagesWithUser
-            )
-        }
-        return if (primaryRouteResult is ToolRouteApiResult.Error &&
-            FirebaseAiService.isQuotaOrRateLimitMessage(primaryRouteResult.message)
-        ) {
+        val primaryRouteResult = try {
             if (state.isUsingBuiltInGemini || state.activeProvider == null) {
-                val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
-                if (fallbackCustom != null) {
-                    networkClient.routeHybridTool(
-                        provider = fallbackCustom,
-                        userGoal = userGoal,
-                        installedAppSample = installedNames,
-                        safetyRules = state.safetyRules,
-                        conversationHistory = messagesWithUser
-                    )
-                } else {
-                    primaryRouteResult
-                }
-            } else {
                 firebaseAiService.routeHybridToolWithGemini(
                     userGoal = userGoal,
                     installedAppSample = installedNames,
                     safetyRules = state.safetyRules,
                     conversationHistory = messagesWithUser,
-                    personalSqlContext = sqlContext
+                    personalSqlContext = sqlContext,
+                    currentForegroundApp = currentForegroundApp
                 )
+            } else {
+                networkClient.routeHybridTool(
+                    provider = state.activeProvider!!,
+                    userGoal = userGoal,
+                    installedAppSample = installedNames,
+                    safetyRules = state.safetyRules,
+                    conversationHistory = messagesWithUser,
+                    currentForegroundApp = currentForegroundApp
+                )
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ToolRouteApiResult.Error(e.localizedMessage ?: "Tool routing failed")
+        }
+
+        return if (primaryRouteResult is ToolRouteApiResult.Error &&
+            FirebaseAiService.isQuotaOrRateLimitMessage(primaryRouteResult.message)
+        ) {
+            try {
+                if (state.isUsingBuiltInGemini || state.activeProvider == null) {
+                    val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
+                    if (fallbackCustom != null) {
+                        networkClient.routeHybridTool(
+                            provider = fallbackCustom,
+                            userGoal = userGoal,
+                            installedAppSample = installedNames,
+                            safetyRules = state.safetyRules,
+                            conversationHistory = messagesWithUser,
+                            currentForegroundApp = currentForegroundApp
+                        )
+                    } else {
+                        primaryRouteResult
+                    }
+                } else {
+                    firebaseAiService.routeHybridToolWithGemini(
+                        userGoal = userGoal,
+                        installedAppSample = installedNames,
+                        safetyRules = state.safetyRules,
+                        conversationHistory = messagesWithUser,
+                        personalSqlContext = sqlContext,
+                        currentForegroundApp = currentForegroundApp
+                    )
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ToolRouteApiResult.Error(e.localizedMessage ?: primaryRouteResult.message)
             }
         } else {
             primaryRouteResult
@@ -1457,16 +1578,15 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            // 2b. Unmistakable direct phone commands ("open zomato", "open youtube and play...", "set volume...")
-            // execute immediately even if the user didn't toggle the Agent Mode chip first.
-            val directPhoneTool = withContext(Dispatchers.Default) {
-                HybridToolRouting.matchDirectLocalTool(latestUserText)
+            // 2b. Executive on-device file generation (PDF / Excel / Word / CSV) works directly in Chat mode too
+            val detectedFile = withContext(Dispatchers.Default) {
+                com.example.files.FileRequestDetector.detect(latestUserText)
             }
-            if (directPhoneTool != null && directPhoneTool.tool != ToolName.REPLY_TO_USER) {
-                dispatchRoutedToolCall(
-                    toolCall = directPhoneTool,
-                    userGoal = latestUserText,
-                    planDurationLabel = "Instant · 0.0s"
+            if (detectedFile != null) {
+                handleFileGenerationDispatch(
+                    userGoal = detectedFile.cleanGoal,
+                    targetFormat = detectedFile.format,
+                    messagesWithUser = messagesWithUser
                 )
                 return
             }
@@ -1528,24 +1648,42 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 is GeminiStreamResult.Error -> {
                     val fallbackCustom = state.activeProvider ?: state.providers.firstOrNull()
                     if (result.isRateLimit && fallbackCustom != null) {
-                        val customSysPrompt = if (sqlContext.isNotBlank()) {
-                            "${NetworkClient.DEFAULT_CHAT_SYSTEM_PROMPT}\n\n$sqlContext"
-                        } else {
-                            null
-                        }
-                        when (val fallbackRes = networkClient.sendChatMessage(fallbackCustom, messagesWithUser, systemPrompt = customSysPrompt)) {
+                        val fallbackSearchOn = state.builtInGeminiSettings.googleSearchEnabled &&
+                            fallbackCustom.apiFormat == ApiFormat.GEMINI_NATIVE
+                        val customSysPrompt = SystemPromptBuilder.buildRichAssistantSystemPrompt(
+                            personalSqlContext = sqlContext,
+                            voiceLanguage = state.voiceSettings.voiceLanguage,
+                            isLiveVoice = false,
+                            hasLiveWebSearch = fallbackSearchOn
+                        )
+                        val factualTemp = if (fallbackCustom.apiFormat == ApiFormat.OPENAI_COMPATIBLE) 0.3 else null
+                        when (
+                            val fallbackRes = networkClient.sendChatMessage(
+                                provider = fallbackCustom,
+                                conversationHistory = messagesWithUser,
+                                systemPrompt = customSysPrompt,
+                                temperature = factualTemp,
+                                enableGoogleSearch = fallbackSearchOn
+                            )
+                        ) {
                             is ChatApiResult.Success -> {
                                 sqlRepository.recordInteractionLog(
                                     sessionId = state.sessionId,
                                     mode = "CHAT",
                                     userPrompt = latestUserText,
                                     agentResponse = fallbackRes.reply,
-                                    toolUsed = fallbackCustom.modelName
+                                    toolUsed = fallbackCustom.modelName,
+                                    usedGoogleSearch = fallbackRes.groundingSources.isNotEmpty()
                                 )
+                                val badge = buildString {
+                                    append("${fallbackCustom.displayName} (Auto-Fallback)")
+                                    if (fallbackRes.groundingSources.isNotEmpty()) append(" · Google Search")
+                                }
                                 ChatMessage(
                                     sender = MessageSender.AGENT,
                                     text = fallbackRes.reply,
-                                    modelBadge = "${fallbackCustom.displayName} (Auto-Fallback)"
+                                    groundingSources = fallbackRes.groundingSources,
+                                    modelBadge = badge
                                 )
                             }
                             is ChatApiResult.Error -> ChatMessage(
@@ -1576,18 +1714,43 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             persistMessagesAndThread(updated)
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = replyMsg.text,
+                isSuccess = !replyMsg.isError,
+                voiceSettings = _uiState.value.voiceSettings,
+                showToastWhenOutsideApp = false
+            )
             return
         }
 
-        // Custom Base URL + API Key provider path (preserved 100%, with automatic Built-in Gemini fallback on 429 rate limits)
+        // Custom Base URL + API Key provider path (preserved 100%, with Google Search Grounding for Gemini Native,
+        // temperature = 0.3 for OpenAI-compatible providers like Groq, and automatic Built-in Gemini fallback on 429)
         val provider = state.activeProvider!!
-        _uiState.update { it.copy(isSending = true, streamingAssistantText = "") }
-        val customSysPrompt = if (sqlContext.isNotBlank()) {
-            "${NetworkClient.DEFAULT_CHAT_SYSTEM_PROMPT}\n\n$sqlContext"
-        } else {
-            null
+        val searchForGeminiNative = state.builtInGeminiSettings.googleSearchEnabled &&
+            provider.apiFormat == ApiFormat.GEMINI_NATIVE
+        val factualTemp = if (provider.apiFormat == ApiFormat.OPENAI_COMPATIBLE) 0.3 else null
+        val customSysPrompt = SystemPromptBuilder.buildRichAssistantSystemPrompt(
+            personalSqlContext = sqlContext,
+            voiceLanguage = state.voiceSettings.voiceLanguage,
+            isLiveVoice = false,
+            hasLiveWebSearch = searchForGeminiNative
+        )
+        _uiState.update {
+            it.copy(
+                isSending = true,
+                streamingAssistantText = "",
+                liveAgentStatusText = if (searchForGeminiNative) "Searching Google & thinking…" else "Thinking…",
+                livePhaseStartMillis = System.currentTimeMillis()
+            )
         }
-        val result = networkClient.sendChatMessage(provider, messagesWithUser, systemPrompt = customSysPrompt)
+        val result = networkClient.sendChatMessage(
+            provider = provider,
+            conversationHistory = messagesWithUser,
+            systemPrompt = customSysPrompt,
+            temperature = factualTemp,
+            enableGoogleSearch = searchForGeminiNative
+        )
         val replyMsg = when (result) {
             is ChatApiResult.Success -> {
                 sqlRepository.recordInteractionLog(
@@ -1595,12 +1758,18 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     mode = "CHAT",
                     userPrompt = latestUserText,
                     agentResponse = result.reply,
-                    toolUsed = provider.modelName
+                    toolUsed = provider.modelName,
+                    usedGoogleSearch = result.groundingSources.isNotEmpty()
                 )
+                val badge = buildString {
+                    append(provider.displayName)
+                    if (result.groundingSources.isNotEmpty()) append(" · Google Search")
+                }
                 ChatMessage(
                     sender = MessageSender.AGENT,
                     text = result.reply,
-                    modelBadge = provider.displayName
+                    groundingSources = result.groundingSources,
+                    modelBadge = badge
                 )
             }
             is ChatApiResult.Error -> {
@@ -1654,10 +1823,19 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 isSending = false,
                 streamingAssistantText = "",
+                liveAgentStatusText = "",
+                livePhaseStartMillis = 0L,
                 chatMessages = updated
             )
         }
         persistMessagesAndThread(updated)
+        AgentSpeechFeedback.announceOutcome(
+            context = appContext,
+            message = replyMsg.text,
+            isSuccess = !replyMsg.isError,
+            voiceSettings = _uiState.value.voiceSettings,
+            showToastWhenOutsideApp = false
+        )
     }
 
     private suspend fun handleOnDeviceAgentPlan(
@@ -1665,6 +1843,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         messagesWithUser: List<ChatMessage>
     ) {
         val state = _uiState.value
+        val currentForegroundApp = AgentAccessibilityService.getCurrentForegroundApp(appContext.packageName)
+        val recentHistory = ConversationRepository.mergeWithPersisted(messagesWithUser)
 
         // 1. On-device hard-block guardrail check BEFORE any routing or planning
         if (state.safetyRules.blockSensitiveFinancial) {
@@ -1672,7 +1852,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 SafetyGuardrail.detectSensitiveViolation(userGoal)
             }
             if (violation != null) {
-                recordHardBlockedRequest(userGoal, violation, messagesWithUser)
+                recordHardBlockedRequest(userGoal, violation, recentHistory)
                 return
             }
         }
@@ -1690,9 +1870,17 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 2. Ultra-fast local deterministic tool router (never swallows compound commands into open_app)
+        // 2. Ultra-fast local deterministic tool router (foreground-aware!)
         val localTool = withContext(Dispatchers.Default) {
-            HybridToolRouting.matchDirectLocalTool(userGoal)
+            HybridToolRouting.matchDirectLocalTool(userGoal, currentForegroundApp)
+        }
+        if (localTool != null && localTool.tool == ToolName.GENERATE_FILE) {
+            handleFileGenerationDispatch(
+                userGoal = localTool.query ?: userGoal,
+                targetFormat = com.example.files.GeneratedFileFormat.fromString(localTool.label),
+                messagesWithUser = recentHistory
+            )
+            return
         }
         if (localTool != null) {
             dispatchRoutedToolCall(
@@ -1722,8 +1910,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             state = state,
             userGoal = userGoal,
             installedNames = installedNames,
-            messagesWithUser = messagesWithUser,
-            sqlContext = sqlContext
+            messagesWithUser = recentHistory,
+            sqlContext = sqlContext,
+            currentForegroundApp = currentForegroundApp
         )
         val routeElapsed = formatElapsed(System.currentTimeMillis() - routeStartMillis)
         _uiState.update {
@@ -1736,23 +1925,39 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
         when (routeResult) {
             is ToolRouteApiResult.Error -> {
+                val failText = ConfirmationFormatter.formatStrictFailure(routeResult.message)
                 val errMsg = ChatMessage(
                     sender = MessageSender.AGENT,
-                    text = routeResult.message,
+                    text = failText,
                     isError = true,
                     excludeFromContext = true
                 )
                 val updated = _uiState.value.chatMessages + errMsg
                 _uiState.update { it.copy(chatMessages = updated) }
                 persistMessagesAndThread(updated)
+                AgentSpeechFeedback.announceOutcome(
+                    context = appContext,
+                    message = failText,
+                    isSuccess = false,
+                    voiceSettings = _uiState.value.voiceSettings,
+                    showToastWhenOutsideApp = false
+                )
             }
 
             is ToolRouteApiResult.Success -> {
-                dispatchRoutedToolCall(
-                    toolCall = routeResult.toolCall,
-                    userGoal = userGoal,
-                    planDurationLabel = "Routed in $routeElapsed"
-                )
+                if (routeResult.toolCall.tool == ToolName.GENERATE_FILE) {
+                    handleFileGenerationDispatch(
+                        userGoal = routeResult.toolCall.query ?: userGoal,
+                        targetFormat = com.example.files.GeneratedFileFormat.fromString(routeResult.toolCall.label),
+                        messagesWithUser = recentHistory
+                    )
+                } else {
+                    dispatchRoutedToolCall(
+                        toolCall = routeResult.toolCall,
+                        userGoal = userGoal,
+                        planDurationLabel = "Routed in $routeElapsed"
+                    )
+                }
             }
         }
     }
@@ -1764,9 +1969,10 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         plan: ActionPlan? = null
     ) {
         val actionId = plan?.actionId ?: UUID.randomUUID().toString()
+        val blockedText = "Blocked on-device by your Safety Guardrail ($violation). Banking, UPI, OTP, and password actions are hard-blocked while this protection is ON in Settings."
         val blockedMsg = ChatMessage(
             sender = MessageSender.AGENT,
-            text = "Blocked on-device by your Safety Guardrail ($violation). Banking, UPI, OTP, and password actions are hard-blocked while this protection is ON in Settings.",
+            text = blockedText,
             actionPlan = plan?.copy(riskLevel = RiskLevel.HIGH),
             isBlockedBySafety = true,
             blockedReason = violation,
@@ -1787,6 +1993,13 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
         }
         persistMessagesAndThread(nextMessages, nextApprovals)
+        AgentSpeechFeedback.announceOutcome(
+            context = appContext,
+            message = blockedText,
+            isSuccess = false,
+            voiceSettings = _uiState.value.voiceSettings,
+            showToastWhenOutsideApp = false
+        )
     }
 
     private suspend fun dispatchRoutedToolCall(
@@ -2087,12 +2300,76 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun executeRoutedToolPlan(plan: ActionPlan, toolCall: RoutedToolCall) {
         val blockSensitive = _uiState.value.safetyRules.blockSensitiveFinancial
+        val effectiveProvider = if (_uiState.value.isUsingBuiltInGemini) null else _uiState.value.activeProvider
+        val voiceSettings = _uiState.value.voiceSettings
 
-        when (toolCall.tool) {
-            ToolName.PLAY_YOUTUBE_VIDEO -> {
-                val query = toolCall.query?.takeIf { it.isNotBlank() } ?: plan.title
-                val service = AgentAccessibilityService.getInstance()
-                if (service != null) {
+        // Mandatory Accessibility check for all phone-control tools — NEVER silently fail or falsely say "Yes, completed!"
+        val service = AgentAccessibilityService.getInstance()
+        if (ToolName.requiresAccessibility(toolCall.tool) && service == null) {
+            refreshPermissionsStatus()
+            val errText = AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE
+            val helpMsg = ChatMessage(
+                sender = MessageSender.AGENT,
+                text = errText,
+                isError = true,
+                excludeFromContext = true
+            )
+            updateActionStatus(
+                actionId = plan.actionId,
+                status = ApprovalStatus.FAILED,
+                completedSteps = 0,
+                activeStep = -1,
+                notes = errText,
+                durationLabel = "Accessibility Off",
+                appendChatMessage = helpMsg,
+                persistNow = true
+            )
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = errText,
+                isSuccess = false,
+                voiceSettings = voiceSettings,
+                showToastWhenOutsideApp = false
+            )
+            return
+        }
+
+        // Immediate spoken acknowledgment when multi-step/phone commands start
+        if (voiceSettings.speakRepliesAloud &&
+            toolCall.tool !in setOf(ToolName.BOOK_RIDE, ToolName.PLAY_YOUTUBE_VIDEO, ToolName.SEND_MESSAGE)
+        ) {
+            AgentSpeechFeedback.speak(
+                context = appContext,
+                text = HybridToolRouting.buildImmediateAckPhrase(toolCall),
+                voiceSettings = voiceSettings
+            )
+        }
+
+        try {
+            val activeService = service!!
+            val mergedHistory = ConversationRepository.mergeWithPersisted(_uiState.value.chatMessages)
+
+            when (toolCall.tool) {
+                ToolName.BOOK_RIDE -> {
+                    updateActionStatus(
+                        actionId = plan.actionId,
+                        status = ApprovalStatus.RUNNING,
+                        completedSteps = 0,
+                        activeStep = 0,
+                        persistNow = true
+                    )
+                    activeService.startBookRide(
+                        plan = plan,
+                        rideApp = toolCall.appName,
+                        destination = toolCall.destination,
+                        provider = effectiveProvider,
+                        blockSensitive = blockSensitive,
+                        conversationHistory = mergedHistory
+                    )
+                }
+
+                ToolName.PLAY_YOUTUBE_VIDEO -> {
+                    val query = toolCall.query?.takeIf { it.isNotBlank() } ?: plan.title
                     updateActionStatus(
                         actionId = plan.actionId,
                         status = ApprovalStatus.RUNNING,
@@ -2100,59 +2377,19 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         activeStep = 0,
                         persistNow = false
                     )
-                    service.startPlayYouTubeVideo(
+                    activeService.startPlayYouTubeVideo(
                         plan = plan,
                         query = query,
-                        provider = _uiState.value.activeProvider,
+                        provider = effectiveProvider,
                         blockSensitive = blockSensitive,
-                        conversationHistory = _uiState.value.chatMessages
-                    )
-                } else {
-                    // Graceful fallback when Accessibility isn't enabled yet: still open YouTube search directly!
-                    val startMillis = System.currentTimeMillis()
-                    val result = withContext(Dispatchers.Main) {
-                        NativeToolExecutor.searchYouTube(appContext, query)
-                    }
-                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                    val note = if (result.success) {
-                        ConfirmationFormatter.formatSuccess(
-                            "${result.summary}. Enable Accessibility in Setup & Test -> Permissions Center to auto-tap the first video",
-                            elapsed
-                        )
-                    } else {
-                        ConfirmationFormatter.formatFailure(result.summary, elapsed)
-                    }
-                    val msg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = note,
-                        isError = !result.success,
-                        excludeFromContext = !result.success
-                    )
-                    updateActionStatus(
-                        actionId = plan.actionId,
-                        status = if (result.success) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED,
-                        completedSteps = if (result.success) plan.steps.size.coerceAtLeast(1) else 0,
-                        activeStep = -1,
-                        notes = note,
-                        durationLabel = if (result.success) "Opened search · $elapsed" else "Failed · $elapsed",
-                        appendChatMessage = msg,
-                        persistNow = true
-                    )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = note,
-                        isSuccess = result.success,
-                        voiceSettings = _uiState.value.voiceSettings
+                        conversationHistory = mergedHistory
                     )
                 }
-            }
 
-            ToolName.SEND_MESSAGE -> {
-                val contact = toolCall.contactOrNumber.orEmpty()
-                val app = toolCall.messagingApp ?: "whatsapp"
-                val text = toolCall.messageText.orEmpty()
-                val service = AgentAccessibilityService.getInstance()
-                if (service != null) {
+                ToolName.SEND_MESSAGE -> {
+                    val contact = toolCall.contactOrNumber.orEmpty()
+                    val app = toolCall.messagingApp ?: "whatsapp"
+                    val text = toolCall.messageText.orEmpty()
                     updateActionStatus(
                         actionId = plan.actionId,
                         status = ApprovalStatus.RUNNING,
@@ -2160,57 +2397,17 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         activeStep = 0,
                         persistNow = true
                     )
-                    service.startSendMessage(
+                    activeService.startSendMessage(
                         plan = plan,
                         contactOrNumber = contact,
                         messagingApp = app,
                         messageText = text,
                         blockSensitive = blockSensitive
                     )
-                } else {
-                    // Fallback when Accessibility is disabled: open composer pre-filled and guide user
-                    val startMillis = System.currentTimeMillis()
-                    val launch = withContext(Dispatchers.Main) {
-                        NativeToolExecutor.openMessageComposer(appContext, contact, app, text)
-                    }
-                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                    val note = if (launch.success) {
-                        ConfirmationFormatter.formatSuccess(
-                            "${launch.summary}. Enable Accessibility in Setup & Test -> Permissions Center to tap Send automatically",
-                            elapsed
-                        )
-                    } else {
-                        ConfirmationFormatter.formatFailure(launch.summary, elapsed)
-                    }
-                    val msg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = note,
-                        isError = !launch.success,
-                        excludeFromContext = !launch.success
-                    )
-                    updateActionStatus(
-                        actionId = plan.actionId,
-                        status = if (launch.success) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED,
-                        completedSteps = if (launch.success) 1 else 0,
-                        activeStep = -1,
-                        notes = note,
-                        durationLabel = if (launch.success) "Opened chat · $elapsed" else "Failed · $elapsed",
-                        appendChatMessage = msg,
-                        persistNow = true
-                    )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = note,
-                        isSuccess = launch.success,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
                 }
-            }
 
-            ToolName.TAP_ON_SCREEN -> {
-                val target = toolCall.targetText?.takeIf { it.isNotBlank() } ?: plan.title
-                val service = AgentAccessibilityService.getInstance()
-                if (service != null) {
+                ToolName.TAP_ON_SCREEN -> {
+                    val target = toolCall.targetText?.takeIf { it.isNotBlank() } ?: plan.title
                     updateActionStatus(
                         actionId = plan.actionId,
                         status = ApprovalStatus.RUNNING,
@@ -2218,44 +2415,16 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         activeStep = 0,
                         persistNow = true
                     )
-                    service.startTapOnScreen(
+                    activeService.startTapOnScreen(
                         plan = plan,
                         targetText = target,
                         blockSensitive = blockSensitive,
                         initialDelayMs = 150L
                     )
-                } else {
-                    val errText = ConfirmationFormatter.formatFailure(
-                        "Enable Accessibility Service in Setup & Test -> Permissions Center to tap items on screen."
-                    )
-                    val helpMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = errText,
-                        isError = true,
-                        excludeFromContext = true
-                    )
-                    updateActionStatus(
-                        actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
-                        completedSteps = 0,
-                        activeStep = -1,
-                        notes = "Accessibility Service required for tap_on_screen",
-                        appendChatMessage = helpMsg,
-                        persistNow = true
-                    )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = errText,
-                        isSuccess = false,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
                 }
-            }
 
-            ToolName.SCROLL_SCREEN -> {
-                val dir = toolCall.direction ?: "down"
-                val service = AgentAccessibilityService.getInstance()
-                if (service != null) {
+                ToolName.SCROLL_SCREEN -> {
+                    val dir = toolCall.direction ?: "down"
                     updateActionStatus(
                         actionId = plan.actionId,
                         status = ApprovalStatus.RUNNING,
@@ -2263,161 +2432,71 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         activeStep = 0,
                         persistNow = true
                     )
-                    service.startDirectScroll(plan, dir)
-                } else {
-                    val errText = ConfirmationFormatter.formatFailure(
-                        "Enable Accessibility Service in Setup & Test -> Permissions Center to scroll screens."
-                    )
-                    val helpMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = errText,
-                        isError = true,
-                        excludeFromContext = true
-                    )
+                    activeService.startDirectScroll(plan, dir)
+                }
+
+                ToolName.UI_AUTOMATE -> {
+                    val goal = plan.editedInstruction?.takeIf { it.isNotBlank() }
+                        ?: toolCall.goal?.takeIf { it.isNotBlank() }
+                        ?: plan.title
                     updateActionStatus(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        status = ApprovalStatus.RUNNING,
                         completedSteps = 0,
-                        activeStep = -1,
-                        notes = "Accessibility Service required for scroll",
-                        appendChatMessage = helpMsg,
+                        activeStep = 0,
                         persistNow = true
                     )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = errText,
-                        isSuccess = false,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
-                }
-            }
-
-            ToolName.UI_AUTOMATE -> {
-                val effectiveProvider = if (_uiState.value.isUsingBuiltInGemini) null else _uiState.value.activeProvider
-                val service = AgentAccessibilityService.getInstance()
-                if (service == null) {
-                    refreshPermissionsStatus()
-                    val errText = ConfirmationFormatter.formatFailure(
-                        "Accessibility Service is not enabled yet. Open Setup & Test -> Permissions Center to turn on \"My Personal Agent\", then tap Approve again."
-                    )
-                    val helpMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = errText,
-                        isError = true,
-                        excludeFromContext = true
-                    )
-                    val updated = _uiState.value.chatMessages + helpMsg
-                    _uiState.update { it.copy(chatMessages = updated) }
-                    storage.saveChatMessages(updated)
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = errText,
-                        isSuccess = false,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
-                    return
-                }
-
-                val goal = plan.editedInstruction?.takeIf { it.isNotBlank() }
-                    ?: toolCall.goal?.takeIf { it.isNotBlank() }
-                    ?: plan.title
-                updateActionStatus(
-                    actionId = plan.actionId,
-                    status = ApprovalStatus.RUNNING,
-                    completedSteps = 0,
-                    activeStep = 0,
-                    persistNow = true
-                )
-                service.startAiUiAutomation(
-                    plan = plan,
-                    goal = goal,
-                    provider = effectiveProvider,
-                    blockSensitive = blockSensitive,
-                    maxSteps = 15,
-                    conversationHistory = _uiState.value.chatMessages
-                )
-            }
-
-            else -> {
-                // Direct native Android tool execution (<300ms)
-                val startMillis = System.currentTimeMillis()
-                val phaseLabel = toolCall.reason.ifBlank { plan.title }
-                _uiState.update {
-                    it.copy(
-                        isAgentLoopRunning = true,
-                        liveAgentStatusText = phaseLabel,
-                        livePhaseStartMillis = startMillis
-                    )
-                }
-                updateActionStatus(
-                    actionId = plan.actionId,
-                    status = ApprovalStatus.RUNNING,
-                    completedSteps = 0,
-                    activeStep = 0,
-                    persistNow = false
-                )
-
-                val execResult = withContext(Dispatchers.Main) {
-                    NativeToolExecutor.executeDirectTool(appContext, toolCall)
-                }
-                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-
-                _uiState.update {
-                    it.copy(
-                        isAgentLoopRunning = false,
-                        liveAgentStatusText = "",
-                        livePhaseStartMillis = 0L
+                    activeService.startAiUiAutomation(
+                        plan = plan,
+                        goal = goal,
+                        provider = effectiveProvider,
+                        blockSensitive = blockSensitive,
+                        maxSteps = 15,
+                        conversationHistory = mergedHistory
                     )
                 }
 
-                if (execResult.success) {
-                    val confirmText = ConfirmationFormatter.formatSuccess(execResult.summary, elapsed)
-                    val doneMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = confirmText
-                    )
+                else -> {
+                    // Run through AgentAccessibilityService so open_app gets 2.5s foreground verification
+                    // and every tool reports strict 3-state ToolExecutionResult + ConversationRepository log
                     updateActionStatus(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.COMPLETED,
-                        completedSteps = plan.steps.size.coerceAtLeast(1),
-                        activeStep = -1,
-                        notes = confirmText,
-                        durationLabel = "${execResult.summary} · $elapsed",
-                        appendChatMessage = doneMsg,
-                        persistNow = true
-                    )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = confirmText,
-                        isSuccess = true,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
-                } else {
-                    val failText = ConfirmationFormatter.formatFailure(execResult.summary, elapsed)
-                    val errMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = failText,
-                        isError = true,
-                        excludeFromContext = true
-                    )
-                    updateActionStatus(
-                        actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        status = ApprovalStatus.RUNNING,
                         completedSteps = 0,
-                        activeStep = -1,
-                        notes = execResult.summary,
-                        durationLabel = "Failed · $elapsed",
-                        appendChatMessage = errMsg,
-                        persistNow = true
+                        activeStep = 0,
+                        persistNow = false
                     )
-                    AgentSpeechFeedback.announceOutcome(
-                        context = appContext,
-                        message = failText,
-                        isSuccess = false,
-                        voiceSettings = _uiState.value.voiceSettings
-                    )
+                    activeService.startDirectAction(plan, toolCall)
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val failText = ConfirmationFormatter.formatStrictFailure(
+                e.localizedMessage ?: "Tool execution failed unexpectedly"
+            )
+            val errMsg = ChatMessage(
+                sender = MessageSender.AGENT,
+                text = failText,
+                isError = true,
+                excludeFromContext = true
+            )
+            updateActionStatus(
+                actionId = plan.actionId,
+                status = ApprovalStatus.FAILED,
+                completedSteps = 0,
+                activeStep = -1,
+                notes = failText,
+                appendChatMessage = errMsg,
+                persistNow = true
+            )
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = failText,
+                isSuccess = false,
+                voiceSettings = voiceSettings,
+                showToastWhenOutsideApp = false
+            )
         }
     }
 
@@ -2506,6 +2585,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             val newSession = storage.startNewChatSession()
+            ConversationRepository.resetSessionExplicitly(newSession, emptyList())
             _uiState.update { it.copy(sessionId = newSession) }
         }
     }
@@ -2562,5 +2642,135 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         if (persistNow) {
             persistMessagesAndThread(updatedMessages, updatedHistory)
         }
+    }
+
+    private suspend fun handleFileGenerationDispatch(
+        userGoal: String,
+        targetFormat: com.example.files.GeneratedFileFormat,
+        messagesWithUser: List<ChatMessage>,
+        announceViaSpeech: Boolean = true
+    ): Boolean {
+        val state = _uiState.value
+        val startMillis = System.currentTimeMillis()
+        _uiState.update {
+            it.copy(
+                isSending = true,
+                liveAgentStatusText = "Designing ${targetFormat.badgeLabel} blueprint…",
+                livePhaseStartMillis = startMillis
+            )
+        }
+
+        val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
+            sqlRepository.buildPersonalContextBlock()
+        } else {
+            ""
+        }
+        val recentContext = ConversationMemoryHelper
+            .buildRecentChatMessages(messagesWithUser.dropLast(1), maxTurns = 6)
+            .joinToString("\n") { m ->
+                val role = if (m.sender == MessageSender.USER) "User" else "Assistant"
+                "$role: ${m.text.take(220)}"
+            }
+
+        val result = fileGenerationEngine.generateFile(
+            context = appContext,
+            userRequest = userGoal,
+            targetFormat = targetFormat,
+            useBuiltInGemini = state.isUsingBuiltInGemini,
+            builtInModel = state.builtInGeminiSettings.selectedModel,
+            activeProvider = state.activeProvider,
+            conversationContext = recentContext,
+            personalMemoryContext = sqlContext,
+            onStatusUpdate = { status ->
+                _uiState.update { it.copy(liveAgentStatusText = status) }
+            }
+        )
+
+        val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+        return when (result) {
+            is com.example.files.FileGenerationResult.Success -> {
+                val replyMsg = ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = result.executiveSummaryMarkdown,
+                    durationLabel = "${result.format.badgeLabel} · $elapsed",
+                    modelBadge = "${result.format.badgeLabel} Export",
+                    generatedFile = result.attachment
+                )
+                val updated = _uiState.value.chatMessages + replyMsg
+                _uiState.update {
+                    it.copy(
+                        chatMessages = updated,
+                        isSending = false,
+                        liveAgentStatusText = "",
+                        livePhaseStartMillis = 0L
+                    )
+                }
+                persistMessagesAndThread(updated)
+                sqlRepository.recordInteractionLog(
+                    sessionId = _uiState.value.sessionId,
+                    mode = "FILE_GEN",
+                    userPrompt = userGoal,
+                    agentResponse = "Generated ${result.attachment.fileName}",
+                    toolUsed = ToolName.GENERATE_FILE,
+                    usedGoogleSearch = false
+                )
+                if (announceViaSpeech) {
+                    AgentSpeechFeedback.announceOutcome(
+                        context = appContext,
+                        message = "Yes, completed! Your ${result.format.spokenLabel} file is ready.",
+                        isSuccess = true,
+                        voiceSettings = _uiState.value.voiceSettings,
+                        showToastWhenOutsideApp = false
+                    )
+                }
+                true
+            }
+
+            is com.example.files.FileGenerationResult.Error -> {
+                val errMsg = ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = result.message,
+                    isError = true,
+                    excludeFromContext = true
+                )
+                val updated = _uiState.value.chatMessages + errMsg
+                _uiState.update {
+                    it.copy(
+                        chatMessages = updated,
+                        isSending = false,
+                        liveAgentStatusText = "",
+                        livePhaseStartMillis = 0L
+                    )
+                }
+                persistMessagesAndThread(updated)
+                false
+            }
+        }
+    }
+
+    fun openGeneratedFile(attachment: GeneratedFileAttachment) {
+        com.example.files.FileExportManager.openFile(appContext, attachment)
+            .onFailure { err ->
+                showMessage("Could not open file: ${err.localizedMessage ?: "No compatible viewer app found."}")
+            }
+    }
+
+    fun saveGeneratedFileToDownloads(attachment: GeneratedFileAttachment) {
+        viewModelScope.launch {
+            com.example.files.FileExportManager.saveToDownloads(appContext, attachment)
+                .onSuccess {
+                    showMessage("Saved to Downloads!")
+                }
+                .onFailure { err ->
+                    showMessage("Save failed: ${err.localizedMessage ?: "Storage error"}")
+                }
+        }
+    }
+
+    fun shareGeneratedFile(attachment: GeneratedFileAttachment) {
+        com.example.files.FileExportManager.shareFile(appContext, attachment)
+            .onFailure { err ->
+                showMessage("Could not share file: ${err.localizedMessage ?: "Share error"}")
+            }
     }
 }

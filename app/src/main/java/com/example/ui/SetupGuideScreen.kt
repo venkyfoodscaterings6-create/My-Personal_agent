@@ -60,8 +60,11 @@ import com.example.EndpointTestDetail
 import com.example.R
 import com.example.SelfTestItem
 import com.example.SettingsFocusSection
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.LocalAgentSemanticColors
 import com.example.ui.theme.MonoCodeStyle
+import com.example.ui.theme.glassPanel
+import com.example.ui.theme.nestedGlassCard
 
 @Composable
 fun SetupGuideScreen(
@@ -82,50 +85,55 @@ fun SetupGuideScreen(
     val percent = (uiState.completedSetupSteps * 100) / totalSteps
     val perms = uiState.permissionsStatus
 
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // Flat Top Bar with Back Arrow
-        Row(
+        // Frosted Glass Top Bar with Back Arrow
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .background(glass.topBarFill)
+                .statusBarsPadding()
         ) {
-            IconButton(
-                onClick = onBack,
-                modifier = Modifier.testTag("setup_back_button")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                    contentDescription = "Back to Chat"
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier.testTag("setup_back_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                        contentDescription = "Back to Chat"
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.setup_title),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
-            Text(
-                text = stringResource(R.string.setup_title),
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-        }
 
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            HorizontalDivider(thickness = 0.5.dp, color = glass.hairlineDivider)
+        }
 
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Flat 3-step progress summary
+            // Frosted 3-step progress summary
             item(key = "progress") {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                        .glassPanel(cornerRadius = 20.dp)
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -160,9 +168,7 @@ fun SetupGuideScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MaterialTheme.colorScheme.surface)
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                        .glassPanel(cornerRadius = 22.dp)
                         .padding(14.dp)
                         .testTag("permissions_center_section"),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -229,8 +235,7 @@ fun SetupGuideScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                                .nestedGlassCard(cornerRadius = 14.dp)
                                 .padding(10.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
@@ -338,9 +343,7 @@ fun SetupGuideScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MaterialTheme.colorScheme.surface)
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                        .glassPanel(cornerRadius = 22.dp)
                         .padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
@@ -656,13 +659,9 @@ private fun FlatStepSection(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(
-                width = 1.dp,
-                color = if (isComplete) semantic.successContent.copy(alpha = 0.5f)
-                else MaterialTheme.colorScheme.outlineVariant,
-                shape = RoundedCornerShape(16.dp)
+            .glassPanel(
+                cornerRadius = 20.dp,
+                borderColorOverride = if (isComplete) semantic.successContent.copy(alpha = 0.55f) else null
             )
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)

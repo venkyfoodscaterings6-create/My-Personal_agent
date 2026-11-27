@@ -62,13 +62,18 @@ import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.StopCircle
@@ -126,18 +131,24 @@ import androidx.compose.ui.platform.LocalContext
 import com.example.ActionPlan
 import com.example.AgentMode
 import com.example.AiProvider
+import com.example.ApiFormat
 import com.example.ApprovalStatus
 import com.example.BuiltInGeminiSettings
 import com.example.ChatMessage
 import com.example.GeminiBuiltInModel
+import com.example.GeneratedFileAttachment
 import com.example.MemorySuggestion
 import com.example.MessageSender
 import com.example.R
 import com.example.RiskLevel
 import com.example.SuggestionKind
 import com.example.VoiceLanguage
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.LocalAgentSemanticColors
 import com.example.ui.theme.MonoCodeStyle
+import com.example.ui.theme.frostedPill
+import com.example.ui.theme.glassPanel
+import com.example.ui.theme.nestedGlassCard
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -180,6 +191,7 @@ fun ChatScreen(
     voicePartialText: String,
     voiceFinalEvent: Pair<Long, String>?,
     onToggleMic: () -> Unit,
+    onStopMicSilently: () -> Unit = {},
     onOpenLiveVoice: () -> Unit,
     onToggleGoogleSearch: () -> Unit,
     onToggleVoiceLanguage: () -> Unit,
@@ -197,6 +209,9 @@ fun ChatScreen(
     onCancelAction: (String) -> Unit,
     onOpenSettingsProviders: () -> Unit,
     onCopyMessage: (String) -> Unit,
+    onOpenGeneratedFile: (GeneratedFileAttachment) -> Unit = {},
+    onSaveGeneratedFile: (GeneratedFileAttachment) -> Unit = {},
+    onShareGeneratedFile: (GeneratedFileAttachment) -> Unit = {},
     memorySuggestions: Map<String, MemorySuggestion> = emptyMap(),
     onSaveToMemory: (ChatMessage) -> Unit = {},
     onAcceptSuggestion: (MemorySuggestion) -> Unit = {},
@@ -206,16 +221,16 @@ fun ChatScreen(
     var showProviderSheet by remember { mutableStateOf(false) }
     var editingPlan by remember { mutableStateOf<ActionPlan?>(null) }
 
+    val glass = LocalAgentGlassColors.current
+
     // Scaffold with zero automatic insets prevents double IME padding / black keyboard gaps.
     Scaffold(
         modifier = modifier.fillMaxSize(),
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = Color.Transparent,
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { _ ->
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
+            modifier = Modifier.fillMaxSize()
         ) {
             MinimalChatTopBar(
                 activeHeaderLabel = activeHeaderLabel,
@@ -247,6 +262,9 @@ fun ChatScreen(
                         livePhaseText = liveAgentStatusText,
                         livePhaseStartMillis = livePhaseStartMillis,
                         onCopyMessage = onCopyMessage,
+                        onOpenGeneratedFile = onOpenGeneratedFile,
+                        onSaveGeneratedFile = onSaveGeneratedFile,
+                        onShareGeneratedFile = onShareGeneratedFile,
                         onSaveToMemory = onSaveToMemory,
                         onAcceptSuggestion = onAcceptSuggestion,
                         onDismissSuggestion = onDismissSuggestion,
@@ -268,7 +286,7 @@ fun ChatScreen(
             // Strictly isolated bottom input bar with unified navBars.union(ime) inset handling
             BottomPillInputBar(
                 agentMode = agentMode,
-                isUsingBuiltInGemini = isUsingBuiltInGemini,
+                canUseWebSearch = isUsingBuiltInGemini || activeProvider?.apiFormat == ApiFormat.GEMINI_NATIVE,
                 googleSearchEnabled = builtInGeminiSettings.googleSearchEnabled,
                 isSending = isSending || isAgentLoopRunning,
                 isListening = isListening,
@@ -276,6 +294,7 @@ fun ChatScreen(
                 voicePartialText = voicePartialText,
                 voiceFinalEvent = voiceFinalEvent,
                 onToggleMic = onToggleMic,
+                onStopMicSilently = onStopMicSilently,
                 onOpenLiveVoice = onOpenLiveVoice,
                 onToggleGoogleSearch = onToggleGoogleSearch,
                 onToggleVoiceLanguage = onToggleVoiceLanguage,
@@ -291,7 +310,8 @@ fun ChatScreen(
         ModalBottomSheet(
             onDismissRequest = { showProviderSheet = false },
             sheetState = sheetState,
-            containerColor = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+            containerColor = glass.sheetFill,
             contentWindowInsets = { WindowInsets(0, 0, 0, 0) }
         ) {
             ProviderPickerSheetContent(
@@ -337,97 +357,107 @@ private fun MinimalChatTopBar(
     onOpenProviderPicker: () -> Unit,
     onNewChat: () -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     val pillInteraction = remember { MutableInteractionSource() }
 
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+            .background(glass.topBarFill)
+            .statusBarsPadding()
     ) {
-        IconButton(
-            onClick = onOpenDrawer,
-            modifier = Modifier.testTag("drawer_menu_button")
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Menu,
-                contentDescription = "Open menu",
-                tint = MaterialTheme.colorScheme.onSurface
-            )
-        }
-
-        // Centered compact tappable model pill with subtle 0.96f press-scale feedback
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+        Row(
             modifier = Modifier
-                .weight(1f, fill = false)
-                .padding(horizontal = 8.dp)
-                .pressScale(pillInteraction)
-                .clip(RoundedCornerShape(20.dp))
-                .clickable(
-                    interactionSource = pillInteraction,
-                    indication = androidx.compose.material3.ripple(),
-                    onClick = onOpenProviderPicker
-                )
-                .minimumInteractiveComponentSize()
-                .testTag("provider_selector_pill")
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                if (isUsingBuiltInGemini) {
-                    Icon(
-                        imageVector = Icons.Rounded.AutoAwesome,
-                        contentDescription = null,
-                        modifier = Modifier.size(15.dp),
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-                Text(
-                    text = activeHeaderLabel,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.widthIn(max = 175.dp)
-                )
-                Icon(
-                    imageVector = Icons.Rounded.KeyboardArrowDown,
-                    contentDescription = "Switch provider",
-                    modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            if (isSpeakingTts) {
-                IconButton(
-                    onClick = onStopSpeaking,
-                    modifier = Modifier.testTag("stop_tts_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Rounded.VolumeOff,
-                        contentDescription = stringResource(R.string.action_stop_speaking),
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-            }
             IconButton(
-                onClick = onNewChat,
-                modifier = Modifier.testTag("new_chat_button")
+                onClick = onOpenDrawer,
+                modifier = Modifier.testTag("drawer_menu_button")
             ) {
                 Icon(
-                    imageVector = Icons.Rounded.Add,
-                    contentDescription = "New chat",
+                    imageVector = Icons.Rounded.Menu,
+                    contentDescription = "Open menu",
                     tint = MaterialTheme.colorScheme.onSurface
                 )
             }
+
+            // Centered compact tappable frosted model pill with subtle 0.96f press-scale feedback
+            Box(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .padding(horizontal = 8.dp)
+                    .pressScale(pillInteraction)
+                    .frostedPill(cornerRadius = 20.dp, active = false)
+                    .clickable(
+                        interactionSource = pillInteraction,
+                        indication = androidx.compose.material3.ripple(),
+                        onClick = onOpenProviderPicker
+                    )
+                    .minimumInteractiveComponentSize()
+                    .testTag("provider_selector_pill")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    if (isUsingBuiltInGemini) {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp),
+                            tint = glass.accentBlue
+                        )
+                    }
+                    Text(
+                        text = activeHeaderLabel,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 175.dp)
+                    )
+                    Icon(
+                        imageVector = Icons.Rounded.KeyboardArrowDown,
+                        contentDescription = "Switch provider",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isSpeakingTts) {
+                    IconButton(
+                        onClick = onStopSpeaking,
+                        modifier = Modifier.testTag("stop_tts_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.VolumeOff,
+                            contentDescription = stringResource(R.string.action_stop_speaking),
+                            tint = glass.accentBlue
+                        )
+                    }
+                }
+                IconButton(
+                    onClick = onNewChat,
+                    modifier = Modifier.testTag("new_chat_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Add,
+                        contentDescription = "New chat",
+                        tint = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
         }
+        HorizontalDivider(
+            thickness = 0.5.dp,
+            color = glass.hairlineDivider
+        )
     }
 }
 
@@ -462,16 +492,10 @@ private fun MinimalEmptyGreeting(
             ) {
                 chips.forEach { chipText ->
                     val chipInteraction = remember(chipText) { MutableInteractionSource() }
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.52f),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
-                        ),
+                    Box(
                         modifier = Modifier
                             .pressScale(chipInteraction)
-                            .clip(RoundedCornerShape(20.dp))
+                            .glassPanel(cornerRadius = 18.dp)
                             .clickable(
                                 interactionSource = chipInteraction,
                                 indication = androidx.compose.material3.ripple(),
@@ -503,6 +527,9 @@ private fun ChatMessageFeed(
     livePhaseText: String,
     livePhaseStartMillis: Long,
     onCopyMessage: (String) -> Unit,
+    onOpenGeneratedFile: (GeneratedFileAttachment) -> Unit,
+    onSaveGeneratedFile: (GeneratedFileAttachment) -> Unit,
+    onShareGeneratedFile: (GeneratedFileAttachment) -> Unit,
     onSaveToMemory: (ChatMessage) -> Unit,
     onAcceptSuggestion: (MemorySuggestion) -> Unit,
     onDismissSuggestion: (String) -> Unit,
@@ -558,6 +585,10 @@ private fun ChatMessageFeed(
                     clipboard.setText(AnnotatedString(message.text))
                     onCopyMessage("Copied to clipboard")
                 },
+                onCopyCodeFeedback = onCopyMessage,
+                onOpenGeneratedFile = onOpenGeneratedFile,
+                onSaveGeneratedFile = onSaveGeneratedFile,
+                onShareGeneratedFile = onShareGeneratedFile,
                 onSaveToMemory = { onSaveToMemory(message) },
                 onAcceptSuggestion = onAcceptSuggestion,
                 onDismissSuggestion = onDismissSuggestion,
@@ -569,20 +600,26 @@ private fun ChatMessageFeed(
 
         if (isSending) {
             item(key = "gemini_thinking_row", contentType = "thinking") {
+                val glass = LocalAgentGlassColors.current
                 if (streamingAssistantText.isNotBlank()) {
                     Column(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(glass.aiBubbleFill)
+                            .border(1.dp, glass.aiBubbleBorder, RoundedCornerShape(18.dp))
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text(
-                            text = streamingAssistantText,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onBackground
+                        GeminiMarkdownText(
+                            messageId = "streaming_reply",
+                            content = streamingAssistantText,
+                            onCopyCode = onCopyMessage
                         )
                         Text(
                             text = "Streaming…",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary
+                            color = glass.accentBlue
                         )
                     }
                 } else {
@@ -639,10 +676,14 @@ private fun GeminiThinkingRow(
 
     val sparklePath = remember { Path() }
 
+    val glass = LocalAgentGlassColors.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(glass.aiBubbleFill)
+            .border(1.dp, glass.aiBubbleBorder, RoundedCornerShape(18.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp)
             .testTag("gemini_thinking_indicator"),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -787,6 +828,10 @@ private fun ChatMessageRow(
     shouldAnimateEntrance: Boolean,
     onEntranceAnimated: () -> Unit,
     onCopy: () -> Unit,
+    onCopyCodeFeedback: (String) -> Unit,
+    onOpenGeneratedFile: (GeneratedFileAttachment) -> Unit,
+    onSaveGeneratedFile: (GeneratedFileAttachment) -> Unit,
+    onShareGeneratedFile: (GeneratedFileAttachment) -> Unit,
     onSaveToMemory: () -> Unit,
     onAcceptSuggestion: (MemorySuggestion) -> Unit,
     onDismissSuggestion: (String) -> Unit,
@@ -798,7 +843,9 @@ private fun ChatMessageRow(
         SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(message.timestampMillis))
     }
 
+    val glass = LocalAgentGlassColors.current
     if (message.sender == MessageSender.USER) {
+        val userBubbleShape = RoundedCornerShape(20.dp)
         Column(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.End,
@@ -807,26 +854,24 @@ private fun ChatMessageRow(
             Box(
                 modifier = Modifier
                     .widthIn(max = 310.dp)
-                    .clip(RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp))
-                    .background(MaterialTheme.colorScheme.secondaryContainer)
+                    .clip(userBubbleShape)
+                    .background(glass.userBubbleFill)
+                    .border(1.dp, glass.userBubbleBorderBrush(), userBubbleShape)
                     .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
                 Text(
                     text = message.text,
                     style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                    color = glass.userBubbleText
                 )
             }
 
             if (suggestion != null) {
                 Row(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f))
-                        .border(
-                            1.dp,
-                            MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
-                            RoundedCornerShape(16.dp)
+                        .nestedGlassCard(
+                            cornerRadius = 18.dp,
+                            borderColorOverride = glass.accentBlue.copy(alpha = 0.42f)
                         )
                         .clickable { onAcceptSuggestion(suggestion) }
                         .padding(start = 10.dp, end = 6.dp, top = 5.dp, bottom = 5.dp)
@@ -837,14 +882,14 @@ private fun ChatMessageRow(
                     Icon(
                         imageVector = Icons.Outlined.BookmarkAdd,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        tint = glass.accentBlue,
                         modifier = Modifier.size(14.dp)
                     )
                     val prefix = if (suggestion.kind == SuggestionKind.TASK) "+ Add Task:" else "+ Save Memory:"
                     Text(
                         text = "$prefix ${suggestion.title.take(30)}",
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.widthIn(max = 220.dp)
@@ -860,7 +905,7 @@ private fun ChatMessageRow(
                         Icon(
                             imageVector = Icons.Rounded.Close,
                             contentDescription = "Dismiss suggestion",
-                            tint = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(14.dp)
                         )
                     }
@@ -932,94 +977,109 @@ private fun ChatMessageRow(
                 modifier = entranceModifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (message.isError) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.ErrorOutline,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.error
-                        )
-                        Text(
-                            text = message.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.error
+                // Left-aligned frosted glass container for AI replies
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(glass.aiBubbleFill)
+                        .border(1.dp, glass.aiBubbleBorder, RoundedCornerShape(18.dp))
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (message.isError) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.ErrorOutline,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Text(
+                                text = message.text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    } else {
+                        GeminiMarkdownText(
+                            messageId = message.id,
+                            content = message.text,
+                            onCopyCode = onCopyCodeFeedback
                         )
                     }
-                } else {
-                    Text(
-                        text = message.text,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
-                }
 
-                if (message.actionPlan != null) {
-                    Spacer(modifier = Modifier.height(2.dp))
-                    CompactInlineApprovalBox(
-                        plan = message.actionPlan,
-                        status = message.approvalStatus ?: ApprovalStatus.PENDING,
-                        completedStepsCount = message.completedStepsCount,
-                        activeStepIndex = message.activeStepIndex,
-                        isBlockedBySafety = message.isBlockedBySafety,
-                        blockedReason = message.blockedReason,
-                        showStepPlan = showStepPlan,
-                        livePhaseText = livePhaseText,
-                        livePhaseStartMillis = livePhaseStartMillis,
-                        durationLabel = message.durationLabel,
-                        onApprove = { onApprove(message.actionPlan.actionId) },
-                        onEditStep = { onEditStep(message.actionPlan) },
-                        onCancel = { onCancel(message.actionPlan.actionId) }
-                    )
-                }
+                    if (message.generatedFile != null) {
+                        GeneratedFileCard(
+                            attachment = message.generatedFile,
+                            onOpen = { onOpenGeneratedFile(message.generatedFile) },
+                            onSave = { onSaveGeneratedFile(message.generatedFile) },
+                            onShare = { onShareGeneratedFile(message.generatedFile) }
+                        )
+                    }
 
-                if (message.groundingSources.isNotEmpty()) {
-                    val context = LocalContext.current
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(top = 2.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        message.groundingSources.take(5).forEach { src ->
-                            Row(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f))
-                                    .border(
-                                        1.dp,
-                                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
-                                        RoundedCornerShape(12.dp)
-                                    )
-                                    .clickable {
-                                        runCatching {
-                                            context.startActivity(
-                                                Intent(Intent.ACTION_VIEW, Uri.parse(src.uri))
-                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            )
+                    if (message.actionPlan != null) {
+                        CompactInlineApprovalBox(
+                            plan = message.actionPlan,
+                            status = message.approvalStatus ?: ApprovalStatus.PENDING,
+                            completedStepsCount = message.completedStepsCount,
+                            activeStepIndex = message.activeStepIndex,
+                            isBlockedBySafety = message.isBlockedBySafety,
+                            blockedReason = message.blockedReason,
+                            showStepPlan = showStepPlan,
+                            livePhaseText = livePhaseText,
+                            livePhaseStartMillis = livePhaseStartMillis,
+                            durationLabel = message.durationLabel,
+                            onApprove = { onApprove(message.actionPlan.actionId) },
+                            onEditStep = { onEditStep(message.actionPlan) },
+                            onCancel = { onCancel(message.actionPlan.actionId) }
+                        )
+                    }
+
+                    if (message.groundingSources.isNotEmpty()) {
+                        val context = LocalContext.current
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            message.groundingSources.take(5).forEachIndexed { idx, src ->
+                                Row(
+                                    modifier = Modifier
+                                        .frostedPill(cornerRadius = 14.dp, active = false)
+                                        .clickable {
+                                            if (GeminiMarkdownParser.isSafeWebUrl(src.uri)) {
+                                                runCatching {
+                                                    context.startActivity(
+                                                        Intent(Intent.ACTION_VIEW, Uri.parse(src.uri))
+                                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    )
+                                                }
+                                            }
                                         }
-                                    }
-                                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Public,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Text(
-                                    text = src.title.take(28),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                                        .testTag("source_chip_${message.id}_$idx"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Link,
+                                        contentDescription = "Open source ${src.title}",
+                                        tint = glass.accentBlue,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Text(
+                                        text = src.title.take(28),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     }
@@ -1122,25 +1182,24 @@ fun CompactInlineApprovalBox(
     modifier: Modifier = Modifier
 ) {
     val semantic = LocalAgentSemanticColors.current
+    val glass = LocalAgentGlassColors.current
     val (riskBg, riskFg) = when (plan.riskLevel) {
         RiskLevel.LOW -> semantic.lowRiskContainer to semantic.lowRiskContent
         RiskLevel.MEDIUM -> semantic.mediumRiskContainer to semantic.mediumRiskContent
         RiskLevel.HIGH -> semantic.highRiskContainer to semantic.highRiskContent
     }
-    val borderColor = when {
+    val borderOverride = when {
         isBlockedBySafety -> semantic.highRiskContent
-        status == ApprovalStatus.RUNNING -> MaterialTheme.colorScheme.primary
+        status == ApprovalStatus.RUNNING -> glass.accentBlue
         status == ApprovalStatus.COMPLETED -> semantic.successContent.copy(alpha = 0.6f)
-        else -> MaterialTheme.colorScheme.outlineVariant
+        else -> null
     }
     val isRunningOrDone = status == ApprovalStatus.RUNNING || status == ApprovalStatus.COMPLETED
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, borderColor, RoundedCornerShape(16.dp))
+            .nestedGlassCard(cornerRadius = 18.dp, borderColorOverride = borderOverride)
             .padding(14.dp)
             .testTag("approval_card_${plan.actionId}"),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -1320,7 +1379,11 @@ fun CompactInlineApprovalBox(
             ) {
                 Button(
                     onClick = onApprove,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = glass.accentBlue,
+                        contentColor = Color.White
+                    ),
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
@@ -1331,11 +1394,12 @@ fun CompactInlineApprovalBox(
 
                 OutlinedButton(
                     onClick = onCancel,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                        containerColor = glass.pillFill,
+                        contentColor = MaterialTheme.colorScheme.onSurface
                     ),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    border = BorderStroke(1.dp, glass.nestedCardBorder),
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
@@ -1414,7 +1478,7 @@ private fun StopAgentFloatingBar(
 @Composable
 private fun BottomPillInputBar(
     agentMode: AgentMode,
-    isUsingBuiltInGemini: Boolean,
+    canUseWebSearch: Boolean,
     googleSearchEnabled: Boolean,
     isSending: Boolean,
     isListening: Boolean,
@@ -1422,6 +1486,7 @@ private fun BottomPillInputBar(
     voicePartialText: String,
     voiceFinalEvent: Pair<Long, String>?,
     onToggleMic: () -> Unit,
+    onStopMicSilently: () -> Unit,
     onOpenLiveVoice: () -> Unit,
     onToggleGoogleSearch: () -> Unit,
     onToggleVoiceLanguage: () -> Unit,
@@ -1431,14 +1496,20 @@ private fun BottomPillInputBar(
 ) {
     // STRICTLY ISOLATED TYPING & FOCUS STATE: typing never recomposes chat list or top bar.
     var draft by rememberSaveable { mutableStateOf("") }
+    var draftPopulatedByVoice by remember { mutableStateOf(false) }
     var isFocused by remember { mutableStateOf(false) }
     val sendInteraction = remember { MutableInteractionSource() }
     val micInteraction = remember { MutableInteractionSource() }
 
-    // Stream live voice transcript directly into the isolated draft field
+    // Stream patient accumulated voice transcript directly into the live input box
     LaunchedEffect(isListening, voicePartialText) {
         if (isListening && voicePartialText.isNotBlank()) {
             draft = voicePartialText
+            draftPopulatedByVoice = true
+        } else if (!isListening && voicePartialText.isEmpty() && draftPopulatedByVoice && voiceFinalEvent == null) {
+            // Auto-send committed the accumulated voice text; clear the live draft cleanly
+            draft = ""
+            draftPopulatedByVoice = false
         }
     }
 
@@ -1446,6 +1517,7 @@ private fun BottomPillInputBar(
         val text = voiceFinalEvent?.second
         if (!text.isNullOrBlank()) {
             draft = text
+            draftPopulatedByVoice = false
             onConsumeVoiceFinal()
         }
     }
@@ -1456,9 +1528,11 @@ private fun BottomPillInputBar(
         label = "input_focus_border"
     )
 
-    val capsuleBg = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
-    val unfocusedBorder = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
-    val geminiGradient = LocalAgentSemanticColors.current.geminiGradient
+    val glass = LocalAgentGlassColors.current
+    val capsuleBg = glass.inputFill
+    val borderStart = glass.borderStart
+    val borderEnd = glass.borderEnd
+    val accentBlue = glass.accentBlue
 
     // Single unified navigationBars.union(ime) inset padding — zero black gap above keyboard.
     Box(
@@ -1470,77 +1544,67 @@ private fun BottomPillInputBar(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(28.dp))
+                .clip(RoundedCornerShape(24.dp))
                 .drawBehind {
-                    val corner = CornerRadius(28.dp.toPx(), 28.dp.toPx())
+                    val corner = CornerRadius(24.dp.toPx(), 24.dp.toPx())
                     drawRoundRect(color = capsuleBg, cornerRadius = corner)
 
                     val p = focusProgress.value
-                    val strokePx = (1.dp + 0.75.dp * p).toPx()
+                    val strokePx = (1.dp + 0.5.dp * p).toPx()
                     val halfStroke = strokePx / 2f
                     val insetSize = Size(size.width - strokePx, size.height - strokePx)
                     val topLeft = Offset(halfStroke, halfStroke)
 
-                    if (p <= 0.01f) {
-                        drawRoundRect(
-                            color = unfocusedBorder,
-                            topLeft = topLeft,
-                            size = insetSize,
-                            cornerRadius = corner,
-                            style = Stroke(width = strokePx)
-                        )
-                    } else {
-                        val blendedStops = geminiGradient.map { accent ->
-                            lerp(unfocusedBorder, accent.copy(alpha = 0.85f), p)
-                        }
-                        drawRoundRect(
-                            brush = Brush.horizontalGradient(colors = blendedStops),
-                            topLeft = topLeft,
-                            size = insetSize,
-                            cornerRadius = corner,
-                            style = Stroke(width = strokePx)
-                        )
-                    }
+                    val topLeftColor = lerp(borderStart, accentBlue.copy(alpha = 0.85f), p)
+                    val bottomRightColor = lerp(borderEnd, accentBlue.copy(alpha = 0.28f), p)
+                    drawRoundRect(
+                        brush = Brush.linearGradient(colors = listOf(topLeftColor, bottomRightColor)),
+                        topLeft = topLeft,
+                        size = insetSize,
+                        cornerRadius = corner,
+                        style = Stroke(width = strokePx)
+                    )
                 }
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 8.dp, top = 11.dp, bottom = 8.dp),
+                    .padding(start = 14.dp, end = 8.dp, top = 11.dp, bottom = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(end = 8.dp, top = 2.dp, bottom = 2.dp)
+                        .padding(start = 2.dp, end = 8.dp, top = 2.dp, bottom = 2.dp)
                 ) {
                     if (draft.isEmpty()) {
                         Text(
                             text = when {
                                 isListening -> when (voiceLanguage) {
                                     VoiceLanguage.TE_IN -> "వింటున్నాను (తెలుగు)…"
-                                    VoiceLanguage.AUTO -> "Listening (EN + తెలుగు)…"
-                                    VoiceLanguage.EN_IN -> stringResource(R.string.voice_listening_hint)
+                                    VoiceLanguage.EN_IN -> "Listening (EN-IN)…"
                                 }
-                                agentMode == AgentMode.SMART_AUTO -> stringResource(R.string.input_placeholder_smart)
-                                agentMode == AgentMode.CHAT_ONLY -> "Ask anything…"
-                                else -> "Tell your agent what to do…"
+                                agentMode == AgentMode.AGENT_CONTROL -> "Message agent…"
+                                else -> "Message…"
                             },
                             style = MaterialTheme.typography.bodyLarge,
                             color = if (isListening) {
-                                MaterialTheme.colorScheme.primary
+                                accentBlue
                             } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f)
                             }
                         )
                     }
                     BasicTextField(
                         value = draft,
-                        onValueChange = { draft = it },
+                        onValueChange = {
+                            draft = it
+                            draftPopulatedByVoice = false
+                        },
                         textStyle = MaterialTheme.typography.bodyLarge.copy(
                             color = MaterialTheme.colorScheme.onSurface
                         ),
-                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        cursorBrush = SolidColor(accentBlue),
                         maxLines = 5,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1549,6 +1613,7 @@ private fun BottomPillInputBar(
                     )
                 }
 
+                // Separate Chat | Agent toggle on left; Web Search, EN/తెలుగు, Live Voice, Mic, Send on right
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -1563,22 +1628,12 @@ private fun BottomPillInputBar(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        // Google Search Grounding toggle button (visible in Built-in Gemini Smart & Chat modes)
-                        if (isUsingBuiltInGemini && agentMode != AgentMode.AGENT_CONTROL) {
+                        // Web Search (Live Facts) toggle in Chat mode for Built-in Gemini & Gemini Native
+                        if (canUseWebSearch && agentMode != AgentMode.AGENT_CONTROL) {
                             Box(
                                 modifier = Modifier
                                     .size(34.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (googleSearchEnabled) MaterialTheme.colorScheme.primaryContainer
-                                        else MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
-                                    )
-                                    .border(
-                                        1.dp,
-                                        if (googleSearchEnabled) MaterialTheme.colorScheme.primary
-                                        else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
-                                        CircleShape
-                                    )
+                                    .frostedPill(cornerRadius = 17.dp, active = googleSearchEnabled)
                                     .clickable(onClick = onToggleGoogleSearch)
                                     .testTag("google_search_toggle"),
                                 contentAlignment = Alignment.Center
@@ -1586,32 +1641,26 @@ private fun BottomPillInputBar(
                                 Icon(
                                     imageVector = Icons.Rounded.Public,
                                     contentDescription = stringResource(R.string.action_toggle_google_search),
-                                    tint = if (googleSearchEnabled) MaterialTheme.colorScheme.onPrimaryContainer
+                                    tint = if (googleSearchEnabled) accentBlue
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(17.dp)
                                 )
                             }
                         }
 
-                        // Compact EN / తెలుగు voice language pill
+                        // One-tap EN (India) / తెలుగు voice language pill
                         Box(
                             modifier = Modifier
-                                .height(36.dp)
-                                .clip(RoundedCornerShape(18.dp))
-                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.85f))
-                                .border(
-                                    1.dp,
-                                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
-                                    RoundedCornerShape(18.dp)
-                                )
+                                .height(34.dp)
+                                .frostedPill(cornerRadius = 17.dp, active = false)
                                 .clickable(onClick = onToggleVoiceLanguage)
-                                .padding(horizontal = 9.dp)
+                                .padding(horizontal = 8.dp)
                                 .testTag("voice_language_toggle"),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
                                 text = voiceLanguage.shortChipLabel,
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                         }
@@ -1619,14 +1668,8 @@ private fun BottomPillInputBar(
                         // 1-tap Live Voice + 3D Agent conversation launcher
                         Box(
                             modifier = Modifier
-                                .size(38.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.secondaryContainer)
-                                .border(
-                                    1.dp,
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
-                                    CircleShape
-                                )
+                                .size(36.dp)
+                                .frostedPill(cornerRadius = 18.dp, active = true)
                                 .clickable(onClick = onOpenLiveVoice)
                                 .testTag("open_live_voice_button"),
                             contentAlignment = Alignment.Center
@@ -1634,8 +1677,8 @@ private fun BottomPillInputBar(
                             Icon(
                                 imageVector = Icons.Rounded.GraphicEq,
                                 contentDescription = stringResource(R.string.action_open_live_voice),
-                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                                modifier = Modifier.size(19.dp)
+                                tint = accentBlue,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
 
@@ -1651,22 +1694,32 @@ private fun BottomPillInputBar(
                             onClick = {
                                 val toSend = draft.trim()
                                 if (toSend.isNotBlank()) {
+                                    if (isListening) {
+                                        onStopMicSilently()
+                                    }
                                     draft = ""
+                                    draftPopulatedByVoice = false
                                     onSend(toSend)
                                 }
                             },
                             enabled = draft.isNotBlank() && !isSending,
                             interactionSource = sendInteraction,
                             shape = CircleShape,
+                            colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
+                                containerColor = accentBlue,
+                                contentColor = Color.White,
+                                disabledContainerColor = glass.pillFill,
+                                disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+                            ),
                             modifier = Modifier
-                                .size(40.dp)
+                                .size(38.dp)
                                 .pressScale(sendInteraction)
                                 .testTag("send_message_button")
                         ) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Rounded.Send,
                                 contentDescription = stringResource(R.string.action_send),
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(17.dp)
                             )
                         }
                     }
@@ -1677,17 +1730,104 @@ private fun BottomPillInputBar(
 }
 
 @Composable
+private fun SlidingModeTogglePill(
+    agentMode: AgentMode,
+    onToggleMode: (AgentMode) -> Unit
+) {
+    val glass = LocalAgentGlassColors.current
+    val isAgentSelected = agentMode == AgentMode.AGENT_CONTROL
+    val slideIndex = animateFloatAsState(
+        targetValue = if (isAgentSelected) 1f else 0f,
+        animationSpec = tween(durationMillis = 190, easing = FastOutSlowInEasing),
+        label = "mode_pill_slide"
+    )
+
+    val trackBg = glass.nestedCardFill
+    val activeThumbColor = glass.accentBlue.copy(alpha = 0.88f)
+
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(18.dp))
+            .border(1.dp, glass.luminousBorderBrush(), RoundedCornerShape(18.dp))
+            .drawBehind {
+                val radius = CornerRadius(18.dp.toPx(), 18.dp.toPx())
+                drawRoundRect(color = trackBg, cornerRadius = radius)
+
+                val pad = 3.dp.toPx()
+                val thumbWidth = (size.width - pad * 2f) / 2f
+                val thumbHeight = size.height - pad * 2f
+                val left = pad + slideIndex.value * thumbWidth
+                drawRoundRect(
+                    color = activeThumbColor,
+                    topLeft = Offset(left, pad),
+                    size = Size(thumbWidth, thumbHeight),
+                    cornerRadius = CornerRadius(15.dp.toPx(), 15.dp.toPx())
+                )
+            }
+            .padding(3.dp)
+            .testTag("mode_toggle_pill"),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        ModeSegmentChip(
+            label = "Chat",
+            selected = !isAgentSelected,
+            onClick = { onToggleMode(AgentMode.CHAT_ONLY) },
+            modifier = Modifier.testTag("mode_chat_option")
+        )
+        ModeSegmentChip(
+            label = "Agent",
+            selected = isAgentSelected,
+            onClick = { onToggleMode(AgentMode.AGENT_CONTROL) },
+            modifier = Modifier.testTag("mode_agent_option")
+        )
+    }
+}
+
+@Composable
+private fun ModeSegmentChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val contentColor = if (selected) {
+        Color.White
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Box(
+        modifier = modifier
+            .width(48.dp)
+            .clip(RoundedCornerShape(15.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+            ),
+            color = contentColor,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
 private fun VoiceMicButton(
     isListening: Boolean,
     enabled: Boolean,
     interactionSource: MutableInteractionSource,
     onClick: () -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     val pulseColor = MaterialTheme.colorScheme.error
     val bgColor = if (isListening) {
         MaterialTheme.colorScheme.error
     } else {
-        MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+        glass.pillFill
     }
     val fgColor = if (isListening) {
         MaterialTheme.colorScheme.onError
@@ -1697,7 +1837,7 @@ private fun VoiceMicButton(
     val borderColor = if (isListening) {
         Color.Transparent
     } else {
-        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
+        glass.borderStart
     }
 
     val ringModifier = if (isListening) {
@@ -1752,102 +1892,6 @@ private fun VoiceMicButton(
 }
 
 @Composable
-private fun SlidingModeTogglePill(
-    agentMode: AgentMode,
-    onToggleMode: (AgentMode) -> Unit
-) {
-    val activeIndex = when (agentMode) {
-        AgentMode.SMART_AUTO -> 0f
-        AgentMode.CHAT_ONLY -> 1f
-        AgentMode.AGENT_CONTROL -> 2f
-    }
-    val slideIndex = animateFloatAsState(
-        targetValue = activeIndex,
-        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
-        label = "mode_pill_slide"
-    )
-
-    val trackBg = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)
-    val trackBorder = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f)
-    val activeThumbColor = MaterialTheme.colorScheme.primaryContainer
-
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(18.dp))
-            .border(1.dp, trackBorder, RoundedCornerShape(18.dp))
-            .drawBehind {
-                val radius = CornerRadius(18.dp.toPx(), 18.dp.toPx())
-                drawRoundRect(color = trackBg, cornerRadius = radius)
-
-                val pad = 3.dp.toPx()
-                val thumbWidth = (size.width - pad * 2f) / 3f
-                val thumbHeight = size.height - pad * 2f
-                val left = pad + slideIndex.value * thumbWidth
-                drawRoundRect(
-                    color = activeThumbColor,
-                    topLeft = Offset(left, pad),
-                    size = Size(thumbWidth, thumbHeight),
-                    cornerRadius = CornerRadius(15.dp.toPx(), 15.dp.toPx())
-                )
-            }
-            .padding(3.dp)
-            .testTag("mode_toggle_pill"),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        ModeSegmentChip(
-            label = "Smart",
-            selected = agentMode == AgentMode.SMART_AUTO,
-            onClick = { onToggleMode(AgentMode.SMART_AUTO) },
-            modifier = Modifier.testTag("mode_smart_option")
-        )
-        ModeSegmentChip(
-            label = "Chat",
-            selected = agentMode == AgentMode.CHAT_ONLY,
-            onClick = { onToggleMode(AgentMode.CHAT_ONLY) },
-            modifier = Modifier.testTag("mode_chat_option")
-        )
-        ModeSegmentChip(
-            label = "Agent",
-            selected = agentMode == AgentMode.AGENT_CONTROL,
-            onClick = { onToggleMode(AgentMode.AGENT_CONTROL) },
-            modifier = Modifier.testTag("mode_agent_option")
-        )
-    }
-}
-
-@Composable
-private fun ModeSegmentChip(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val contentColor = if (selected) {
-        MaterialTheme.colorScheme.onPrimaryContainer
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    Box(
-        modifier = modifier
-            .width(46.dp)
-            .clip(RoundedCornerShape(15.dp))
-            .clickable(onClick = onClick)
-            .padding(vertical = 6.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall.copy(
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
-            ),
-            color = contentColor,
-            maxLines = 1
-        )
-    }
-}
-
-@Composable
 private fun ProviderPickerSheetContent(
     providers: List<AiProvider>,
     activeProviderId: String?,
@@ -1857,6 +1901,7 @@ private fun ProviderPickerSheetContent(
     onSelect: (String) -> Unit,
     onManageProviders: () -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1876,10 +1921,10 @@ private fun ProviderPickerSheetContent(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(
-                        if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
-                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                    .glassPanel(
+                        cornerRadius = 18.dp,
+                        fillColor = if (isSelected) glass.accentBlue.copy(alpha = 0.22f) else glass.panelFill,
+                        borderColorOverride = if (isSelected) glass.accentBlue.copy(alpha = 0.55f) else null
                     )
                     .clickable { onSelectBuiltIn(model) }
                     .padding(horizontal = 14.dp, vertical = 10.dp)
@@ -1905,7 +1950,7 @@ private fun ProviderPickerSheetContent(
                     Icon(
                         imageVector = Icons.Rounded.Check,
                         contentDescription = "Active",
-                        tint = MaterialTheme.colorScheme.primary
+                        tint = glass.accentBlue
                     )
                 }
             }
@@ -1914,7 +1959,8 @@ private fun ProviderPickerSheetContent(
         if (providers.isNotEmpty()) {
             HorizontalDivider(
                 modifier = Modifier.padding(vertical = 4.dp),
-                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                thickness = 0.5.dp,
+                color = glass.hairlineDivider
             )
             Text(
                 text = "Your Custom Providers",
@@ -1926,10 +1972,10 @@ private fun ProviderPickerSheetContent(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(
-                            if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
-                            else MaterialTheme.colorScheme.surface
+                        .glassPanel(
+                            cornerRadius = 18.dp,
+                            fillColor = if (isSelected) glass.accentBlue.copy(alpha = 0.22f) else glass.panelFill,
+                            borderColorOverride = if (isSelected) glass.accentBlue.copy(alpha = 0.55f) else null
                         )
                         .clickable { onSelect(provider.id) }
                         .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -1956,7 +2002,7 @@ private fun ProviderPickerSheetContent(
                         Icon(
                             imageVector = Icons.Rounded.Check,
                             contentDescription = "Active",
-                            tint = MaterialTheme.colorScheme.primary
+                            tint = glass.accentBlue
                         )
                     }
                 }
@@ -1965,7 +2011,8 @@ private fun ProviderPickerSheetContent(
 
         HorizontalDivider(
             modifier = Modifier.padding(vertical = 4.dp),
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+            thickness = 0.5.dp,
+            color = glass.hairlineDivider
         )
 
         TextButton(
@@ -2014,11 +2061,180 @@ fun StatusPill(status: ApprovalStatus) {
 }
 
 @Composable
+private fun GeneratedFileCard(
+    attachment: GeneratedFileAttachment,
+    onOpen: () -> Unit,
+    onSave: () -> Unit,
+    onShare: () -> Unit
+) {
+    val glass = LocalAgentGlassColors.current
+    val semantic = LocalAgentSemanticColors.current
+    val format = remember(attachment.fileType) {
+        com.example.files.GeneratedFileFormat.fromString(attachment.fileType)
+    }
+    val (badgeBg, badgeFg) = when (format) {
+        com.example.files.GeneratedFileFormat.PDF -> semantic.pdfBadgeContainer to semantic.pdfBadgeContent
+        com.example.files.GeneratedFileFormat.XLSX -> semantic.xlsxBadgeContainer to semantic.xlsxBadgeContent
+        com.example.files.GeneratedFileFormat.DOCX -> semantic.docxBadgeContainer to semantic.docxBadgeContent
+        com.example.files.GeneratedFileFormat.CSV -> semantic.csvBadgeContainer to semantic.csvBadgeContent
+    }
+    val sizeLabel = remember(attachment.sizeBytes) {
+        com.example.files.FileBlueprintParser.formatFileSize(attachment.sizeBytes)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .nestedGlassCard(cornerRadius = 18.dp)
+            .padding(14.dp)
+            .testTag("generated_file_card_${format.id}"),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(width = 50.dp, height = 44.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(badgeBg)
+                    .border(1.dp, badgeFg.copy(alpha = 0.35f), RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        imageVector = Icons.Rounded.Description,
+                        contentDescription = "${format.badgeLabel} file",
+                        tint = badgeFg,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = format.badgeLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = badgeFg
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = attachment.fileName,
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${format.spokenLabel} document · $sizeLabel",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = onOpen,
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = glass.accentBlue,
+                    contentColor = Color.White
+                ),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("file_open_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.OpenInNew,
+                    contentDescription = "Open file",
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(5.dp))
+                Text(
+                    text = "Open",
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1
+                )
+            }
+
+            OutlinedButton(
+                onClick = onSave,
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = glass.pillFill,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                ),
+                border = BorderStroke(1.dp, glass.nestedCardBorder),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("file_save_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Download,
+                    contentDescription = "Save to Downloads",
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(5.dp))
+                Text(
+                    text = "Save",
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1
+                )
+            }
+
+            OutlinedButton(
+                onClick = onShare,
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = glass.pillFill,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                ),
+                border = BorderStroke(1.dp, glass.nestedCardBorder),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("file_share_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Share,
+                    contentDescription = "Share file",
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(5.dp))
+                Text(
+                    text = "Share",
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun EditStepDialog(
     plan: ActionPlan,
     onDismiss: () -> Unit,
     onSave: (String) -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     var draft by remember(plan.actionId) {
         mutableStateOf(
             plan.editedInstruction
@@ -2028,6 +2244,8 @@ fun EditStepDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = glass.dialogFill,
+        shape = RoundedCornerShape(24.dp),
         title = { Text("Edit Instruction") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

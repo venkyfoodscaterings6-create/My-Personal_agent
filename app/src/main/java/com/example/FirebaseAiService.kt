@@ -84,33 +84,15 @@ class FirebaseAiService {
     private fun buildSystemInstruction(
         personalSqlContext: String,
         voiceLanguage: VoiceLanguage,
-        isLiveVoice: Boolean
+        isLiveVoice: Boolean,
+        hasLiveWebSearch: Boolean
     ): String {
-        return buildString {
-            appendLine("You are My Personal Agent, a smart, warm, privacy-first personal AI assistant running on the user's Android phone.")
-            if (isLiveVoice) {
-                appendLine("You are in a real-time hands-free voice conversation. Keep answers natural, conversational, and concise (2 to 4 short spoken sentences unless the user asks for deep detail). Avoid markdown asterisks, code blocks, or long bullet lists.")
-            } else {
-                appendLine("Always remember and use the prior conversation history when answering follow-up questions. Be clear, direct, and helpful.")
-            }
-            when (voiceLanguage) {
-                VoiceLanguage.TE_IN -> {
-                    appendLine("The user's voice language is set to Telugu (తెలుగు). Respond naturally in clear spoken Telugu unless the user explicitly asks for English.")
-                }
-                VoiceLanguage.AUTO -> {
-                    appendLine("The user speaks English and Telugu. Automatically match the user's language: if they speak or write in Telugu (or Telugu transliterated in English script), reply naturally in Telugu; otherwise reply in natural English.")
-                }
-                VoiceLanguage.EN_IN -> {
-                    appendLine("Respond naturally in clear English unless the user speaks in Telugu.")
-                }
-            }
-            appendLine("Safety rule: Never assist with banking transfers, UPI PINs, OTPs, or entering passwords.")
-            if (personalSqlContext.isNotBlank()) {
-                appendLine()
-                appendLine(personalSqlContext)
-                appendLine("Use these saved memories and open tasks naturally whenever relevant to personalize your answer.")
-            }
-        }
+        return SystemPromptBuilder.buildRichAssistantSystemPrompt(
+            personalSqlContext = personalSqlContext,
+            voiceLanguage = voiceLanguage,
+            isLiveVoice = isLiveVoice,
+            hasLiveWebSearch = hasLiveWebSearch
+        )
     }
 
     private fun buildHistoryContent(history: List<ChatMessage>): List<Content> {
@@ -198,7 +180,8 @@ class FirebaseAiService {
         val sysPrompt = buildSystemInstruction(
             personalSqlContext = personalSqlContext,
             voiceLanguage = voiceLanguage,
-            isLiveVoice = isLiveVoice
+            isLiveVoice = isLiveVoice,
+            hasLiveWebSearch = enableGoogleSearch
         )
         val historyContents = buildHistoryContent(conversationHistory)
         val attempts = buildFallbackAttempts(modelChoice, enableGoogleSearch)
@@ -297,52 +280,19 @@ class FirebaseAiService {
         installedAppSample: List<String>,
         safetyRules: SafetyRules,
         conversationHistory: List<ChatMessage>,
-        personalSqlContext: String
+        personalSqlContext: String,
+        currentForegroundApp: String? = null
     ): ToolRouteApiResult = withContext(Dispatchers.IO) {
-        val appsHint = installedAppSample.take(30).joinToString(", ")
-        val recentHistoryText = ConversationMemoryHelper.formatRecentAgentHistory(conversationHistory, maxTurns = 8)
-
-        val systemPrompt = buildString {
-            appendLine("You are an Android Hybrid Tool Router. Output ONLY ONE valid JSON object (no markdown, no explanation).")
-            appendLine("Available tools:")
-            appendLine("""0) {"tool":"reply_to_user","message":"Warm natural reply","reason":"Conversational reply or knowledge question"}""")
-            appendLine("""1) {"tool":"play_youtube_video","query":"song or video name","reason":"Play video on YouTube"}""")
-            appendLine("""2) {"tool":"open_app","appName":"App Name","reason":"Open app ONLY when user asks ONLY to open an app"}""")
-            appendLine("""3) {"tool":"search_youtube","query":"search text","reason":"Search YouTube without playing"}""")
-            appendLine("""4) {"tool":"search_web","query":"search text","reason":"Search the web"}""")
-            appendLine("""5) {"tool":"open_maps","destination":"place","reason":"Navigate in Maps"}""")
-            appendLine("""6) {"tool":"set_alarm","hour":7,"minute":30,"label":"Wake up","reason":"Set alarm"}""")
-            appendLine("""7) {"tool":"set_timer","seconds":300,"label":"Tea","reason":"Set timer"}""")
-            appendLine("""8) {"tool":"open_setting","settingName":"wifi|bluetooth|sound|display|battery|location","reason":"Open setting"}""")
-            appendLine("""9) {"tool":"call_contact","contactOrNumber":"Mom","reason":"Call contact"}""")
-            appendLine("""10) {"tool":"send_message","contactOrNumber":"Ravi","messagingApp":"whatsapp|sms","messageText":"Hi","reason":"Send WhatsApp or SMS message"}""")
-            appendLine("""11) {"tool":"tap_on_screen","targetText":"Skip","reason":"Tap visible button/text on current screen"}""")
-            appendLine("""12) {"tool":"scroll_screen","direction":"down|up|left|right","reason":"Scroll current screen"}""")
-            appendLine("""13) {"tool":"press_back","reason":"Navigate back"}""")
-            appendLine("""14) {"tool":"press_home","reason":"Go to home screen"}""")
-            appendLine("""15) {"tool":"open_recents","reason":"Open recent apps"}""")
-            appendLine("""16) {"tool":"open_notifications","reason":"Open notification shade"}""")
-            appendLine("""17) {"tool":"open_quick_settings","reason":"Open Quick Settings panel"}""")
-            appendLine("""18) {"tool":"set_volume","stream":"media|ring|alarm|notification","levelPercent":60,"reason":"Set volume level 0-100"}""")
-            appendLine("""19) {"tool":"ui_automate","goal":"full multi-step goal","title":"Short title","steps":["Step 1","Step 2"],"riskLevel":"MEDIUM","reason":"Multi-step UI automation"}""")
-            appendLine("RULES:")
-            appendLine("- Greetings, small talk, or general questions MUST route to reply_to_user(message).")
-            appendLine("- NEVER pick open_app for compound requests like 'open YouTube and play...'.")
-            if (safetyRules.blockSensitiveFinancial) {
-                appendLine("- NEVER route banking, UPI, OTP, payment, or password actions.")
-            }
-            if (appsHint.isNotBlank()) appendLine("Installed apps: $appsHint")
-            if (personalSqlContext.isNotBlank()) appendLine(personalSqlContext)
-        }
-
-        val userPrompt = buildString {
-            if (recentHistoryText.isNotBlank()) {
-                appendLine("RECENT HISTORY:")
-                appendLine(recentHistoryText)
-                appendLine()
-            }
-            append("CURRENT REQUEST: $userGoal")
-        }
+        val systemPrompt = HybridToolRouting.buildRouterSystemPrompt(
+            installedAppSample = installedAppSample,
+            safetyRules = safetyRules,
+            personalSqlContext = personalSqlContext
+        )
+        val userPrompt = HybridToolRouting.buildRouterUserPrompt(
+            userGoal = userGoal,
+            currentForegroundApp = currentForegroundApp,
+            conversationHistory = conversationHistory
+        )
 
         val startNanos = System.nanoTime()
         val routerModels = listOf(
@@ -380,7 +330,8 @@ class FirebaseAiService {
                         riskLevel = RiskLevel.MEDIUM,
                         reason = "Multi-step on-device task"
                     )
-                return@withContext ToolRouteApiResult.Success(parsed, latencyMs)
+                val guarded = HybridToolRouting.applyForegroundContextGuard(parsed, userGoal, currentForegroundApp)
+                return@withContext ToolRouteApiResult.Success(guarded, latencyMs)
             } catch (e: TimeoutCancellationException) {
                 Log.e(TAG, "Gemini tool router timed out on $modelId", e)
                 lastError = "Built-in Gemini router timed out. Please try again."
@@ -407,15 +358,19 @@ class FirebaseAiService {
     ): NextActionApiResult = withContext(Dispatchers.IO) {
         val systemPrompt = buildString {
             appendLine("You control an Android phone via AccessibilityService. Reply with ONE compact JSON object only.")
-            appendLine("""Actions: {"action":"open_app","appName":"..."} | {"action":"tap","index":3} | {"action":"type_text","index":2,"text":"...","submit":true} | {"action":"scroll","direction":"down"} | {"action":"back"} | {"action":"home"} | {"action":"done","summary":"Yes, completed! ..."}""")
-            appendLine("- Never interact with banking, UPI, OTP, or password fields.")
+            appendLine("""Actions: {"action":"open_app","appName":"..."} | {"action":"tap","index":3} | {"action":"type_text","index":2,"text":"...","submit":true} | {"action":"scroll","direction":"down"} | {"action":"back"} | {"action":"home"} | {"action":"done","summary":"...","evidence":"exact visible screen text proving completion"}""")
+            appendLine("- If the current foreground app in SCREEN is ALREADY the needed app, NEVER return open_app — act directly on visible elements.")
+            appendLine("- NEVER return done on Step 1 before performing a real action, and NEVER return done when the last action produced zero screen change.")
+            appendLine("- Always include \"evidence\" inside \"done\" quoting exact visible text on the current screen.")
+            appendLine("- For ride booking (Uber/Ola/Rapido): set destination and reach the ride-selection screen, then return done. NEVER tap the final Confirm / Book / Pay button.")
+            appendLine("- Never interact with bank transfers, UPI PINs, OTPs, or password fields.")
         }
 
-        val recentContext = ConversationMemoryHelper.formatRecentAgentHistory(conversationHistory, maxTurns = 6)
+        val recentContext = ConversationRepository.formatRecentConversationBlock(conversationHistory, maxMessages = 10)
         val userPrompt = buildString {
             if (recentContext.isNotBlank()) {
-                appendLine("RECENT CONVERSATION:")
                 appendLine(recentContext)
+                appendLine()
             }
             appendLine("GOAL: $goal")
             appendLine("STEP: $stepNumber/$maxSteps")
@@ -444,7 +399,7 @@ class FirebaseAiService {
                     systemInstruction = content { text(systemPrompt) },
                     generationConfig = generationConfig {
                         temperature = 0.1f
-                        maxOutputTokens = 160
+                        maxOutputTokens = 180
                         responseMimeType = "application/json"
                     }
                 )
@@ -474,6 +429,7 @@ class FirebaseAiService {
                         submit = json.optBoolean("submit", false),
                         direction = json.optString("direction").takeIf { it.isNotBlank() },
                         summary = json.optString("summary").takeIf { it.isNotBlank() },
+                        evidence = json.optString("evidence").takeIf { it.isNotBlank() },
                         reason = json.optString("reason").trim().ifBlank { actionType }
                     )
                 )
@@ -629,5 +585,52 @@ class FirebaseAiService {
         val rateMatch = Regex("""rate=(\d+)""", RegexOption.IGNORE_CASE).find(mimeType)
         val parsedRate = rateMatch?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(8_000, 48_000) ?: 24_000
         return raw to parsedRate
+    }
+
+    /**
+     * Generates a structured executive document JSON blueprint using Built-in Firebase AI Logic
+     * with automatic multi-model fallback when quota limits occur.
+     */
+    suspend fun generateExecutiveBlueprintJson(
+        modelChoice: GeminiBuiltInModel,
+        systemPrompt: String,
+        userPrompt: String,
+        maxOutputTokens: Int = 3500,
+        temperature: Float = 0.25f
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val candidateModels = listOf(
+            modelChoice.modelId,
+            GeminiBuiltInModel.FLASH.modelId,
+            GeminiBuiltInModel.FLASH_LITE.modelId
+        ).distinct()
+
+        var lastError: Exception? = null
+        for (modelId in candidateModels) {
+            try {
+                val model = Firebase.ai.generativeModel(
+                    modelName = modelId,
+                    generationConfig = generationConfig {
+                        this.temperature = temperature
+                        this.maxOutputTokens = maxOutputTokens
+                        responseMimeType = "application/json"
+                    },
+                    systemInstruction = content { text(systemPrompt) }
+                )
+                val response = withTimeout(55_000L) {
+                    model.generateContent(userPrompt)
+                }
+                val text = response.text?.trim().orEmpty()
+                if (text.isNotBlank()) {
+                    return@withContext Result.success(text)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Log.w(TAG, "Blueprint JSON generation failed on $modelId: ${e.localizedMessage}")
+                if (!isRecoverableFallbackError(e)) break
+            }
+        }
+        Result.failure(lastError ?: IllegalStateException("Empty blueprint response from Gemini."))
     }
 }

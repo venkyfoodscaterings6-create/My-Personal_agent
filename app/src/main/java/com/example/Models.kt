@@ -55,7 +55,7 @@ enum class GeminiBuiltInModel(
 data class BuiltInGeminiSettings(
     val useBuiltInGemini: Boolean = true,
     val selectedModel: GeminiBuiltInModel = GeminiBuiltInModel.FLASH,
-    val googleSearchEnabled: Boolean = false,
+    val googleSearchEnabled: Boolean = true,
     val injectSqlMemory: Boolean = true
 )
 
@@ -87,14 +87,12 @@ enum class VoiceLanguage(
     val shortChipLabel: String,
     val displayName: String
 ) {
-    AUTO("en-IN", "Auto", "Auto (EN + తెలుగు)"),
-    EN_IN("en-IN", "EN", "English"),
+    EN_IN("en-IN", "EN", "English (India)"),
     TE_IN("te-IN", "తెలుగు", "Telugu (తెలుగు)");
 
     fun next(): VoiceLanguage = when (this) {
-        AUTO -> EN_IN
         EN_IN -> TE_IN
-        TE_IN -> AUTO
+        TE_IN -> EN_IN
     }
 }
 
@@ -216,7 +214,7 @@ data class SafetyRules(
 data class VoiceSettings(
     val autoSendVoiceCommands: Boolean = true,
     val speakRepliesAloud: Boolean = true,
-    val voiceLanguage: VoiceLanguage = VoiceLanguage.AUTO,
+    val voiceLanguage: VoiceLanguage = VoiceLanguage.EN_IN,
     val persistentAskNotificationEnabled: Boolean = true,
     val wakeWordEnabled: Boolean = false,
     val wakePhrase: String = DEFAULT_WAKE_PHRASE,
@@ -324,8 +322,37 @@ data class OnDeviceAgentAction(
     val submit: Boolean = false,
     val direction: String? = null,
     val summary: String? = null,
+    val evidence: String? = null,
     val reason: String = ""
 )
+
+sealed class ToolExecutionResult {
+    data class VerifiedSuccess(
+        val summary: String,
+        val customUserMessage: String? = null
+    ) : ToolExecutionResult()
+
+    data class PartialSuccess(
+        val whatWorked: String,
+        val whatFailed: String
+    ) : ToolExecutionResult()
+
+    data class Failed(
+        val reason: String
+    ) : ToolExecutionResult()
+
+    val isVerifiedSuccess: Boolean
+        get() = this is VerifiedSuccess
+
+    fun toUserMessage(elapsed: String? = null): String {
+        return ConfirmationFormatter.formatToolResult(this, elapsed)
+    }
+}
+
+object AgentReliabilityConstants {
+    const val ACCESSIBILITY_OFF_MESSAGE =
+        "My Accessibility Service is turned off. Please enable it in Settings so I can control your phone."
+}
 
 object ToolName {
     const val REPLY_TO_USER = "reply_to_user"
@@ -339,6 +366,7 @@ object ToolName {
     const val OPEN_SETTING = "open_setting"
     const val CALL_CONTACT = "call_contact"
     const val SEND_MESSAGE = "send_message"
+    const val BOOK_RIDE = "book_ride"
     const val TAP_ON_SCREEN = "tap_on_screen"
     const val SCROLL_SCREEN = "scroll_screen"
     const val SCROLL = SCROLL_SCREEN
@@ -351,6 +379,14 @@ object ToolName {
     const val OPEN_QUICK_SETTINGS = "open_quick_settings"
     const val SET_VOLUME = "set_volume"
     const val UI_AUTOMATE = "ui_automate"
+    const val GENERATE_FILE = "generate_file"
+
+    fun requiresAccessibility(tool: String): Boolean {
+        return tool !in setOf(
+            REPLY_TO_USER,
+            GENERATE_FILE
+        )
+    }
 }
 
 @Immutable
@@ -451,6 +487,15 @@ enum class MessageSender {
 
 @Immutable
 @JsonClass(generateAdapter = true)
+data class GeneratedFileAttachment(
+    val fileName: String,
+    val fileType: String,
+    val filePath: String,
+    val sizeBytes: Long
+)
+
+@Immutable
+@JsonClass(generateAdapter = true)
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
     val sender: MessageSender,
@@ -466,7 +511,8 @@ data class ChatMessage(
     val excludeFromContext: Boolean = false,
     val durationLabel: String? = null,
     val groundingSources: List<GroundingSource> = emptyList(),
-    val modelBadge: String? = null
+    val modelBadge: String? = null,
+    val generatedFile: GeneratedFileAttachment? = null
 )
 
 @Immutable
@@ -637,7 +683,7 @@ object SafetyGuardrail {
         RulePattern(
             category = "Banking / Money Transfer",
             regex = Regex(
-                """\b(bank(ing|s)?|net\s*banking|neft|imps|rtgs|ifsc|wire\s+transfer|transfer\s+money|send\s+money|pay\s+bill|debit\s+card|credit\s+card|cvv|card\s+number)\b""",
+                """\b(net\s*banking|bank\s*(?:transfer|account|balance|app|statement|login|otp|pin|password)|mobile\s+banking|internet\s+banking|neft|imps|rtgs|ifsc|wire\s+transfer|transfer\s+money|send\s+money|pay\s+bill|debit\s+card|credit\s+card|cvv|card\s+number)\b""",
                 RegexOption.IGNORE_CASE
             )
         ),
@@ -1053,14 +1099,226 @@ object HybridToolRouting {
         RegexOption.IGNORE_CASE
     )
     private val pronounContacts = setOf("him", "her", "them", "that", "there", "it")
+    private val bookRideWithAppAndDestRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?(?:(?:open|launch|go\s+to)\s+(uber|ola|rapido)\s+(?:and|then)\s+)?(?:book|get(?:\s+me)?|request|order|call)\s+(?:a\s+|an\s+)?(?:(?:ride|cab|taxi|auto|bike)\s+(?:in|on|via|with|using)\s+(uber|ola|rapido)|(uber|ola|rapido)(?:\s+(?:ride|cab|taxi|auto|bike))?|(?:ride|cab|taxi|auto|bike))(?:\s+to\s+(.+?))?(?:\s+(?:in|on|via|with|using)\s+(uber|ola|rapido))?[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val youtubeFollowUpPlayOnCurrentScreenRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?(?:play|open|watch|click|tap)\s+(?:the\s+)?(?:(first|1st|second|2nd|third|3rd|next|top|this|that)\s+(?:video|one|song|short|result)|a\s+video|the\s+video)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val youtubeFollowUpSearchRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?(?:search|find|look\s+up)(?:\s+for)?\s+(.+?)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val rideConfirmButtonRegex = Regex(
+        """\b(confirm\s+(?:uber|ola|rapido|ride|cab|auto|bike|pickup|booking|drop|trip|order|and\s+request|location)?|book\s+(?:now|ride|cab|auto|bike|uber|ola|rapido)|request\s+(?:uber|ola|rapido|ride|cab)|choose\s+(?:uber|ola|rapido)\s*\w*\s*confirm|pay\s+now|place\s+booking|confirm\s*&\s*book)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun isRideConfirmButton(label: String): Boolean {
+        val cleaned = label.trim().lowercase()
+        if (cleaned.isBlank()) return false
+        if (cleaned == "confirm" || cleaned == "book" || cleaned == "book now" || cleaned == "pay" || cleaned == "pay now") {
+            return true
+        }
+        return rideConfirmButtonRegex.containsMatchIn(cleaned)
+    }
+
+    fun normalizeRideAppName(raw: String?): String {
+        val compact = AppNameFuzzyMatcher.normalize(raw.orEmpty())
+        return when {
+            compact.contains("ola") -> "Ola"
+            compact.contains("rapido") -> "Rapido"
+            else -> "Uber"
+        }
+    }
+
+    fun ridePackageForApp(raw: String?): String {
+        return when (normalizeRideAppName(raw)) {
+            "Ola" -> "com.olacabs.customer"
+            "Rapido" -> "com.rapido.passenger"
+            else -> "com.ubercab"
+        }
+    }
+
+    fun buildRideReadyMessage(rideApp: String): String {
+        val pretty = normalizeRideAppName(rideApp)
+        return "I've set your destination in $pretty. Please review the fare and tap Confirm to book."
+    }
+
+    fun buildImmediateAckPhrase(toolCall: RoutedToolCall): String {
+        return when (toolCall.tool) {
+            ToolName.BOOK_RIDE -> "On it, opening ${normalizeRideAppName(toolCall.appName)}…"
+            ToolName.PLAY_YOUTUBE_VIDEO -> "Playing that on YouTube…"
+            ToolName.SEARCH_YOUTUBE -> "Searching YouTube…"
+            ToolName.OPEN_APP -> "On it, opening ${FastPathMatcher.prettifyAppName(toolCall.appName ?: "the app")}…"
+            ToolName.SEND_MESSAGE -> {
+                val appLabel = if (toolCall.messagingApp?.contains("whatsapp", ignoreCase = true) == true) "WhatsApp" else "Messages"
+                "On it, opening $appLabel…"
+            }
+            ToolName.OPEN_MAPS -> "Opening Maps…"
+            ToolName.CALL_CONTACT -> "Calling ${toolCall.contactOrNumber ?: "contact"}…"
+            ToolName.SET_ALARM -> "Setting your alarm…"
+            ToolName.SET_TIMER -> "Starting your timer…"
+            ToolName.OPEN_SETTING -> "Opening Settings…"
+            ToolName.TAP_ON_SCREEN -> "Tapping ${toolCall.targetText ?: "that"}…"
+            ToolName.SCROLL_SCREEN -> "Scrolling ${toolCall.direction ?: "down"}…"
+            ToolName.UI_AUTOMATE -> "On it, working on your screen…"
+            else -> "On it…"
+        }
+    }
+
+    fun isPackageMatchingAppName(currentPackage: String?, appName: String?): Boolean {
+        val pkg = currentPackage?.trim()?.lowercase().orEmpty()
+        val app = appName?.trim().orEmpty()
+        if (pkg.isBlank() || app.isBlank()) return false
+        val norm = AppNameFuzzyMatcher.normalize(app)
+        if (norm.isBlank()) return false
+        val hints = AppNameFuzzyMatcher.aliasPackageHints(norm)
+        if (hints.any { it.equals(pkg, ignoreCase = true) }) return true
+        return pkg.contains(norm)
+    }
 
     /**
-     * Ultra-fast local router for greetings, deterministic native tools, and dedicated YouTube/messaging patterns.
+     * Post-router context guard: if currentForegroundApp is ALREADY the app the user is referring to
+     * and the command asks to act inside it (not merely switch back to it), NEVER relaunch with open_app.
+     */
+    fun applyForegroundContextGuard(
+        toolCall: RoutedToolCall,
+        userGoal: String,
+        currentForegroundApp: String?
+    ): RoutedToolCall {
+        val fg = currentForegroundApp?.trim().orEmpty()
+        if (fg.isBlank()) return toolCall
+
+        if (toolCall.tool == ToolName.OPEN_APP && isPackageMatchingAppName(fg, toolCall.appName)) {
+            val lowerGoal = userGoal.trim().lowercase()
+            val isActionInsideApp = lowerGoal.contains("play") ||
+                lowerGoal.contains("video") ||
+                lowerGoal.contains("search") ||
+                lowerGoal.contains("scroll") ||
+                lowerGoal.contains("tap") ||
+                lowerGoal.contains("click") ||
+                lowerGoal.contains("first") ||
+                lowerGoal.contains("second") ||
+                lowerGoal.contains("book") ||
+                lowerGoal.contains("ride")
+            if (isActionInsideApp) {
+                return RoutedToolCall(
+                    tool = ToolName.UI_AUTOMATE,
+                    goal = "Act directly on the currently open app ($fg) WITHOUT relaunching it: $userGoal",
+                    title = userGoal.take(56),
+                    steps = listOf(
+                        "Inspect current screen in $fg",
+                        "Execute directly on screen: ${userGoal.take(80)}",
+                        "Verify screen changed before completing"
+                    ),
+                    riskLevel = RiskLevel.LOW,
+                    reason = "Acting directly on currently open app"
+                )
+            }
+        }
+        return toolCall
+    }
+
+    fun buildRouterSystemPrompt(
+        installedAppSample: List<String>,
+        safetyRules: SafetyRules,
+        personalSqlContext: String = ""
+    ): String {
+        val appsHint = installedAppSample.take(30).joinToString(", ")
+        return buildString {
+            appendLine("You are an Android Hybrid Tool Router. Output ONLY ONE valid JSON object (no markdown, no explanation).")
+            appendLine("Available tools:")
+            appendLine("""0) {"tool":"reply_to_user","message":"Warm natural reply","reason":"Conversational reply or knowledge question"}""")
+            appendLine("""1) {"tool":"play_youtube_video","query":"song or video name","reason":"Play video on YouTube"}""")
+            appendLine("""2) {"tool":"open_app","appName":"App Name","reason":"Open app ONLY when user asks ONLY to open an app and it is not already in foreground"}""")
+            appendLine("""3) {"tool":"search_youtube","query":"search text","reason":"Search YouTube without playing"}""")
+            appendLine("""4) {"tool":"search_web","query":"search text","reason":"Search the web"}""")
+            appendLine("""5) {"tool":"open_maps","destination":"place","reason":"Navigate in Maps"}""")
+            appendLine("""6) {"tool":"set_alarm","hour":7,"minute":30,"label":"Wake up","reason":"Set alarm"}""")
+            appendLine("""7) {"tool":"set_timer","seconds":300,"label":"Tea","reason":"Set timer"}""")
+            appendLine("""8) {"tool":"open_setting","settingName":"wifi|bluetooth|sound|display|battery|location","reason":"Open setting"}""")
+            appendLine("""9) {"tool":"call_contact","contactOrNumber":"Mom","reason":"Call contact"}""")
+            appendLine("""10) {"tool":"send_message","contactOrNumber":"Ravi","messagingApp":"whatsapp|sms","messageText":"Hi","reason":"Send WhatsApp or SMS message"}""")
+            appendLine("""11) {"tool":"tap_on_screen","targetText":"Skip","reason":"Tap visible button/text on current screen"}""")
+            appendLine("""12) {"tool":"scroll_screen","direction":"down|up|left|right","reason":"Scroll current screen"}""")
+            appendLine("""13) {"tool":"press_back","reason":"Navigate back"}""")
+            appendLine("""14) {"tool":"press_home","reason":"Go to home screen"}""")
+            appendLine("""15) {"tool":"open_recents","reason":"Open recent apps"}""")
+            appendLine("""16) {"tool":"open_notifications","reason":"Open notification shade"}""")
+            appendLine("""17) {"tool":"open_quick_settings","reason":"Open Quick Settings panel"}""")
+            appendLine("""18) {"tool":"set_volume","stream":"media|ring|alarm|notification","levelPercent":60,"reason":"Set volume level 0-100"}""")
+            appendLine("""19) {"tool":"book_ride","appName":"Uber|Ola|Rapido","destination":"Airport","reason":"Open ride app and set destination, stopping before final Confirm/Book"}""")
+            appendLine("""20) {"tool":"ui_automate","goal":"full multi-step goal","title":"Short title","steps":["Step 1","Step 2"],"riskLevel":"MEDIUM","reason":"Multi-step UI automation on current screen or app"}""")
+            appendLine("CRITICAL RULES:")
+            appendLine("- If `currentForegroundApp` is ALREADY the app the user is referring to (e.g., YouTube is already open and the user says 'play a video', 'play the first one', 'search lofi', or 'scroll down'), DO NOT relaunch the app from scratch. Act directly on the current screen using `tap_on_screen`, `scroll_screen`, `play_youtube_video`, or `ui_automate`.")
+            appendLine("- Greetings, small talk, thanks, or general conversational questions ('Hi', 'Hello', 'Good morning', 'How are you?', 'Thank you', or Telugu equivalents) MUST ALWAYS route to reply_to_user(message) — NEVER open_app or ui_automate!")
+            appendLine("- Use RECENT CONVERSATION and COMPLETED ACTION LOGS to resolve follow-ups like 'play the first one', 'send him I am on the way', 'scroll down', or 'pause'.")
+            appendLine("- NEVER pick open_app for compound requests like 'open YouTube and play...', 'open WhatsApp and send hi to Ravi', or 'open Uber and book a cab'.")
+            appendLine("- For booking a cab/ride/auto/bike in Uber, Ola, or Rapido (defaulting to Uber if not specified), ALWAYS pick book_ride(appName, destination). Ride booking is ALLOWED and stops safely before final Confirm/Pay.")
+            appendLine("- For playing any video/song on YouTube (even in Telugu or English), ALWAYS pick play_youtube_video.")
+            appendLine("- For sending a WhatsApp or SMS message, ALWAYS pick send_message with resolved contactOrNumber, messagingApp, and messageText.")
+            appendLine("- For tapping a single visible button or text on the current screen (e.g., 'click Skip', 'tap Subscribe', 'press Like'), pick tap_on_screen(targetText).")
+            appendLine("- For volume changes, pick set_volume(stream, levelPercent).")
+            appendLine("- For system actions (back, home, recents, notifications, quick settings), pick the matching native tool.")
+            appendLine("- For multi-step workflows inside any app, pick ui_automate.")
+            appendLine("- ${SystemPromptBuilder.INDIAN_ENGLISH_VOICE_GRACE_RULE}")
+            if (safetyRules.blockSensitiveFinancial) {
+                appendLine("- NEVER route bank transfers, UPI PIN entry, OTP reading, or password actions.")
+            }
+            if (appsHint.isNotBlank()) {
+                appendLine("Installed apps sample: $appsHint")
+            }
+            if (personalSqlContext.isNotBlank()) {
+                appendLine(personalSqlContext)
+            }
+        }
+    }
+
+    fun buildRouterUserPrompt(
+        userGoal: String,
+        currentForegroundApp: String?,
+        conversationHistory: List<ChatMessage>,
+        actionLogs: List<ActionLogEntry> = ConversationRepository.getRecentActionLogs()
+    ): String {
+        val fgApp = currentForegroundApp?.trim().takeIf { !it.isNullOrBlank() } ?: "unknown"
+        val recentTurns = ConversationMemoryHelper.buildRecentChatMessages(conversationHistory, maxTurns = 10)
+        return buildString {
+            appendLine("currentForegroundApp: $fgApp")
+            if (recentTurns.isNotEmpty()) {
+                appendLine("recentConversation (last ${recentTurns.size} messages):")
+                recentTurns.forEach { msg ->
+                    val role = if (msg.sender == MessageSender.USER) "User" else "Agent"
+                    val snippet = msg.text.replace(Regex("\\s+"), " ").trim().take(200)
+                    appendLine("- $role: $snippet")
+                }
+            }
+            if (actionLogs.isNotEmpty()) {
+                appendLine("recentCompletedActions:")
+                actionLogs.takeLast(6).forEach { log ->
+                    appendLine("- (${log.status}) ${log.summary.take(180)}")
+                }
+            }
+            appendLine()
+            append("CURRENT USER REQUEST: $userGoal")
+        }
+    }
+
+    /**
+     * Ultra-fast local router for greetings, deterministic native tools, ride booking,
+     * foreground-aware follow-ups, and dedicated YouTube/messaging patterns.
      * Strictly NEVER launches an app on greetings and NEVER swallows compound multi-step commands into open_app.
      */
-    fun matchDirectLocalTool(rawCommand: String): RoutedToolCall? {
+    fun matchDirectLocalTool(
+        rawCommand: String,
+        currentForegroundApp: String? = null
+    ): RoutedToolCall? {
         val text = rawCommand.trim().replace(Regex("\\s+"), " ")
         if (text.isBlank()) return null
+        val fgPkg = currentForegroundApp?.trim()?.lowercase().orEmpty()
 
         // 0. Natural greetings & small talk -> reply_to_user immediately (NEVER open_app!)
         if (greetingRegex.matches(text)) {
@@ -1083,6 +1341,97 @@ object HybridToolRouting {
                 riskLevel = RiskLevel.LOW,
                 reason = "Conversational greeting"
             )
+        }
+
+        // 0b. Executive On-Device File Generation requests ("create an Excel monthly expense tracker", "make a PDF study plan", etc.)
+        val detectedFile = com.example.files.FileRequestDetector.detect(text)
+        if (detectedFile != null) {
+            return RoutedToolCall(
+                tool = ToolName.GENERATE_FILE,
+                label = detectedFile.format.id,
+                query = detectedFile.cleanGoal,
+                goal = detectedFile.cleanGoal,
+                title = "Generate ${detectedFile.format.badgeLabel} Document",
+                steps = listOf(
+                    "Build executive ${detectedFile.format.badgeLabel} blueprint",
+                    "Render formatted ${detectedFile.format.badgeLabel} on device",
+                    "Attach ready-to-open file card"
+                ),
+                riskLevel = RiskLevel.LOW,
+                reason = "Executive file generation (${detectedFile.format.badgeLabel})"
+            )
+        }
+
+        // 0c. Ride booking requests (Uber / Ola / Rapido, defaulting to Uber)
+        val rideMatch = bookRideWithAppAndDestRegex.matchEntire(text)
+        if (rideMatch != null) {
+            val rawApp = rideMatch.groupValues[1].ifBlank {
+                rideMatch.groupValues[2].ifBlank {
+                    rideMatch.groupValues[3].ifBlank { rideMatch.groupValues[5] }
+                }
+            }
+            val rideApp = normalizeRideAppName(rawApp)
+            val destination = rideMatch.groupValues[4].trim().trim('"', '\'').takeIf { it.isNotBlank() }
+            val title = if (destination != null) {
+                "Book $rideApp to ${destination.take(36)}"
+            } else {
+                "Book a ride in $rideApp"
+            }
+            val steps = buildList {
+                add("Open $rideApp")
+                if (destination != null) {
+                    add("Enter destination \"$destination\" and select drop location")
+                    add("Reach ride-selection screen and stop before Confirm/Book")
+                } else {
+                    add("Open ride destination screen and wait for your selection")
+                }
+            }
+            return RoutedToolCall(
+                tool = ToolName.BOOK_RIDE,
+                appName = rideApp,
+                destination = destination,
+                title = title,
+                steps = steps,
+                riskLevel = RiskLevel.MEDIUM,
+                reason = if (destination != null) "Booking $rideApp ride to $destination" else "Opening $rideApp to book a ride"
+            )
+        }
+
+        // 0d. Foreground-aware YouTube follow-ups when YouTube is ALREADY open on screen
+        //     (NEVER relaunch YouTube with open_app when it's already in the foreground!)
+        if (fgPkg.contains("youtube")) {
+            if (youtubeFollowUpPlayOnCurrentScreenRegex.matches(text)) {
+                return RoutedToolCall(
+                    tool = ToolName.UI_AUTOMATE,
+                    goal = "YouTube is ALREADY open on screen. Do NOT relaunch YouTube. Directly tap and play the requested video on the current screen: \"$text\"",
+                    title = "Play video on current YouTube screen",
+                    steps = listOf(
+                        "Inspect current YouTube screen",
+                        "Tap the requested non-ad video card directly",
+                        "Verify video player opened"
+                    ),
+                    riskLevel = RiskLevel.LOW,
+                    reason = "Playing video directly on YouTube"
+                )
+            }
+            val fgSearchMatch = youtubeFollowUpSearchRegex.matchEntire(text)
+            if (fgSearchMatch != null) {
+                val query = fgSearchMatch.groupValues[1].trim().trim('"', '\'')
+                if (query.isNotBlank()) {
+                    return RoutedToolCall(
+                        tool = ToolName.UI_AUTOMATE,
+                        goal = "YouTube is ALREADY open on screen. Do NOT relaunch YouTube. Tap the Search icon on the current YouTube screen, type \"$query\", and submit the search.",
+                        title = "Search \"$query\" in YouTube",
+                        steps = listOf(
+                            "Tap Search inside current YouTube screen",
+                            "Type \"$query\" and submit",
+                            "Verify search results appeared"
+                        ),
+                        riskLevel = RiskLevel.LOW,
+                        reason = "Searching \"$query\" in YouTube"
+                    )
+                }
+            }
         }
 
         // 1. Dedicated fast compound YouTube playback: "open youtube and play <query>" / "play <query> on youtube"
@@ -1425,6 +1774,7 @@ object HybridToolRouting {
             "open_setting", "open_settings" -> ToolName.OPEN_SETTING
             "call_contact", "call", "make_call" -> ToolName.CALL_CONTACT
             "send_message", "draft_message", "message", "send_whatsapp", "send_sms" -> ToolName.SEND_MESSAGE
+            "book_ride", "book_cab", "book_uber", "book_ola", "book_rapido", "ride_booking" -> ToolName.BOOK_RIDE
             "tap_on_screen", "tap_screen", "tap", "click" -> ToolName.TAP_ON_SCREEN
             "scroll_screen", "scroll", "swipe" -> ToolName.SCROLL_SCREEN
             "press_home", "go_home", "home" -> ToolName.PRESS_HOME
@@ -1434,6 +1784,7 @@ object HybridToolRouting {
             "open_quick_settings", "quick_settings" -> ToolName.OPEN_QUICK_SETTINGS
             "set_volume", "volume" -> ToolName.SET_VOLUME
             "ui_automate", "automate" -> ToolName.UI_AUTOMATE
+            "generate_file", "create_file", "export_file", "make_pdf", "make_excel", "make_docx", "make_csv" -> ToolName.GENERATE_FILE
             else -> return null
         }
 
@@ -1442,6 +1793,7 @@ object HybridToolRouting {
         } else {
             "SMS"
         }
+        val normalizedRideApp = if (canonicalTool == ToolName.BOOK_RIDE) normalizeRideAppName(appName) else appName
 
         val defaultTitle = str("title") ?: when (canonicalTool) {
             ToolName.REPLY_TO_USER -> "Reply"
@@ -1455,6 +1807,11 @@ object HybridToolRouting {
             ToolName.OPEN_SETTING -> "Open ${(settingName ?: "Device").replaceFirstChar { it.uppercase() }} Settings"
             ToolName.CALL_CONTACT -> "Call ${contactOrNumber ?: "Contact"}"
             ToolName.SEND_MESSAGE -> "Send $appPretty to ${contactOrNumber ?: "Contact"}"
+            ToolName.BOOK_RIDE -> if (!destination.isNullOrBlank()) {
+                "Book $normalizedRideApp to ${destination.take(36)}"
+            } else {
+                "Book a ride in $normalizedRideApp"
+            }
             ToolName.TAP_ON_SCREEN -> "Tap \"${targetText ?: fallbackGoal}\""
             ToolName.SCROLL_SCREEN -> "Scroll ${direction ?: "down"}"
             ToolName.PRESS_HOME -> "Go to Home screen"
@@ -1463,6 +1820,7 @@ object HybridToolRouting {
             ToolName.OPEN_NOTIFICATIONS -> "Open Notifications"
             ToolName.OPEN_QUICK_SETTINGS -> "Open Quick Settings"
             ToolName.SET_VOLUME -> "Set ${stream ?: "media"} volume to ${levelPercent ?: 50}%"
+            ToolName.GENERATE_FILE -> "Generate ${(label ?: "PDF").uppercase()} Document"
             else -> fallbackGoal.take(56).ifBlank { "Run On-Device Task" }
         }
 
@@ -1491,6 +1849,15 @@ object HybridToolRouting {
                     "Open $appPretty chat with message: \"${messageText.orEmpty().take(80)}\"",
                     "Tap the Send button and verify delivery"
                 )
+                ToolName.BOOK_RIDE -> buildList {
+                    add("Open $normalizedRideApp")
+                    if (!destination.isNullOrBlank()) {
+                        add("Enter destination \"$destination\" and pick drop location")
+                        add("Reach ride selection screen and stop before Confirm/Book")
+                    } else {
+                        add("Open ride destination screen and wait for your selection")
+                    }
+                }
                 ToolName.TAP_ON_SCREEN -> listOf("Find and tap \"${targetText ?: fallbackGoal}\" on current screen")
                 ToolName.SCROLL_SCREEN -> listOf("Scroll ${direction ?: "down"} on current screen")
                 ToolName.PRESS_HOME -> listOf("Navigate to Android Home screen")
@@ -1508,14 +1875,14 @@ object HybridToolRouting {
         }
 
         val computedRisk = when (canonicalTool) {
-            ToolName.CALL_CONTACT, ToolName.SEND_MESSAGE -> RiskLevel.MEDIUM
+            ToolName.CALL_CONTACT, ToolName.SEND_MESSAGE, ToolName.BOOK_RIDE -> RiskLevel.MEDIUM
             ToolName.UI_AUTOMATE -> RiskLevel.fromRaw(str("riskLevel") ?: "MEDIUM")
             else -> RiskLevel.LOW
         }
 
         return RoutedToolCall(
             tool = canonicalTool,
-            appName = appName,
+            appName = normalizedRideApp,
             query = query,
             destination = destination,
             hour = hour,
@@ -1661,6 +2028,27 @@ object SendButtonMatcher {
 }
 
 object ConfirmationFormatter {
+    private val forbiddenSuccessPrefixRegex = Regex("""yes,?\s*completed[!:,.\-\s]*""", RegexOption.IGNORE_CASE)
+
+    private fun stripAccidentalSuccessPrefix(raw: String): String {
+        return forbiddenSuccessPrefixRegex.replace(raw, "").trim()
+    }
+
+    fun formatToolResult(result: ToolExecutionResult, elapsed: String? = null): String {
+        return when (result) {
+            is ToolExecutionResult.VerifiedSuccess -> {
+                if (!result.customUserMessage.isNullOrBlank()) {
+                    val custom = result.customUserMessage.trim()
+                    if (!elapsed.isNullOrBlank() && !custom.contains(elapsed)) "$custom ($elapsed)" else custom
+                } else {
+                    formatSuccess(result.summary, elapsed)
+                }
+            }
+            is ToolExecutionResult.PartialSuccess -> formatPartialSuccess(result.whatWorked, result.whatFailed, elapsed)
+            is ToolExecutionResult.Failed -> formatStrictFailure(result.reason, elapsed)
+        }
+    }
+
     fun formatSuccess(detail: String, elapsed: String? = null): String {
         val cleaned = detail.trim().trimEnd('.')
         val body = when {
@@ -1674,17 +2062,87 @@ object ConfirmationFormatter {
         return if (!elapsed.isNullOrBlank()) "$body ($elapsed)" else body
     }
 
-    fun formatFailure(reason: String, elapsed: String? = null): String {
-        val cleaned = reason.trim()
-        val body = when {
-            cleaned.isBlank() -> "I couldn't complete that task."
-            cleaned.startsWith("I couldn't", ignoreCase = true) ||
-                cleaned.startsWith("Could not", ignoreCase = true) ||
-                cleaned.startsWith("Unable to", ignoreCase = true) ||
-                cleaned.startsWith("Enable ", ignoreCase = true) -> cleaned
-            else -> "I couldn't complete that: $cleaned"
+    fun formatPartialSuccess(whatWorked: String, whatFailed: String, elapsed: String? = null): String {
+        val worked = stripAccidentalSuccessPrefix(whatWorked).trim().trimEnd('.')
+            .removePrefix("I ").removePrefix("i ")
+        val failed = stripAccidentalSuccessPrefix(whatFailed).trim().trimEnd('.')
+            .removePrefix("I couldn't ").removePrefix("couldn't ")
+        val body = "I ${worked.ifBlank { "started the action" }}, but I couldn't ${failed.ifBlank { "finish the final step" }}."
+        return if (!elapsed.isNullOrBlank() && !body.contains(elapsed)) "$body ($elapsed)" else body
+    }
+
+    fun formatStrictFailure(reason: String, elapsed: String? = null): String {
+        val cleaned = stripAccidentalSuccessPrefix(reason).trim().trimEnd('.')
+        val body = if (cleaned.isBlank()) {
+            "I couldn't complete that — unknown error."
+        } else if (cleaned.equals(AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE.trimEnd('.'), ignoreCase = true)) {
+            AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE
+        } else if (cleaned.startsWith("I couldn't complete that", ignoreCase = true)) {
+            "$cleaned."
+        } else {
+            "I couldn't complete that — $cleaned."
         }
         return if (!elapsed.isNullOrBlank() && !body.contains(elapsed)) "$body ($elapsed)" else body
+    }
+
+    fun formatFailure(reason: String, elapsed: String? = null): String {
+        return formatStrictFailure(reason, elapsed)
+    }
+}
+
+sealed class DoneValidationResult {
+    data class Accepted(val evidence: String) : DoneValidationResult()
+    data class Rejected(val reason: String, val shouldRetry: Boolean) : DoneValidationResult()
+}
+
+object UiAutomationVerification {
+    fun validateDoneAction(
+        stepNumber: Int,
+        maxSteps: Int,
+        anyRealActionPerformed: Boolean,
+        anyScreenChanged: Boolean,
+        lastActionChangedScreen: Boolean,
+        evidence: String?,
+        visibleScreenText: String
+    ): DoneValidationResult {
+        if (stepNumber <= 1 && !anyRealActionPerformed) {
+            return DoneValidationResult.Rejected(
+                reason = "Cannot accept done on Step 1 before taking a real action on screen.",
+                shouldRetry = stepNumber < maxSteps
+            )
+        }
+        if (!anyScreenChanged) {
+            return DoneValidationResult.Rejected(
+                reason = "No action took effect on the screen",
+                shouldRetry = false
+            )
+        }
+        if (!lastActionChangedScreen) {
+            return DoneValidationResult.Rejected(
+                reason = "Last action produced zero screen change.",
+                shouldRetry = stepNumber < maxSteps
+            )
+        }
+        val trimmedEvidence = evidence?.trim().orEmpty()
+        if (trimmedEvidence.isBlank()) {
+            return DoneValidationResult.Rejected(
+                reason = "Missing exact visible screen evidence proving completion.",
+                shouldRetry = stepNumber < maxSteps
+            )
+        }
+        val normalizedScreen = visibleScreenText.lowercase()
+        val evidenceTokens = trimmedEvidence.lowercase()
+            .split(Regex("[^a-z0-9\\u0C00-\\u0C7F]+"))
+            .filter { it.length >= 2 }
+        val matchesVisible = normalizedScreen.contains(trimmedEvidence.lowercase()) ||
+            (evidenceTokens.isNotEmpty() && evidenceTokens.count { normalizedScreen.contains(it) } >= (evidenceTokens.size + 1) / 2)
+        if (!matchesVisible && normalizedScreen.isNotBlank()) {
+            return DoneValidationResult.Rejected(
+                reason = "Reported evidence \"$trimmedEvidence\" is not visible on the current screen.",
+                shouldRetry = stepNumber < maxSteps
+            )
+        }
+        return DoneValidationResult.Accepted(trimmedEvidence)
     }
 }
 
@@ -1803,7 +2261,7 @@ object SpeechTextCleaner {
         if (containsTeluguScript(text)) return VoiceLanguage.TE_IN
         return when (preferred) {
             VoiceLanguage.TE_IN -> VoiceLanguage.TE_IN
-            VoiceLanguage.EN_IN, VoiceLanguage.AUTO -> VoiceLanguage.EN_IN
+            VoiceLanguage.EN_IN -> VoiceLanguage.EN_IN
         }
     }
 
@@ -1912,33 +2370,188 @@ object SpeechTextCleaner {
     }
 }
 
+enum class UnifiedRouteDecision {
+    DIRECT_CHAT,
+    LOCAL_TOOL,
+    AI_TOOL_ROUTER
+}
+
 object SmartIntentClassifier {
-    private val phoneActionPattern = Regex(
-        """\b(open|launch|start|play|call|dial|ring|send|text|message|whatsapp|sms|alarm|timer|navigate|directions?|maps?|route\s+to|turn\s+on|turn\s+off|toggle|enable|disable|scroll|swipe|tap|click|press|volume|mute|unmute|brightness|wifi|wi-fi|bluetooth|settings?|notifications?|recents?|youtube|zomato|swiggy|uber|ola|rapido|spotify|instagram|chrome|gmail|search\s+on|find\s+on|order\s+on|book\s+a\s+cab|book\s+uber)\b""",
+    private val conversationalStarterPattern = Regex(
+        """^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening|night)|thanks?|thank\s+you|what|why|how|who|when|where|which|explain|tell\s+me\s+about|write|draft|summarize|translate|compare|give\s+me|help\s+me\s+(?:understand|study|learn|prepare|write)|define|difference\s+between|meaning\s+of|solve|calculate|list\s+|suggest|recommend|is\s+|are\s+|does\s+|do\s+|was\s+|were\s+|did\s+|can\s+you\s+(?:explain|tell|write|summarize|translate|help\s+me\s+understand))\b""",
         RegexOption.IGNORE_CASE
     )
-    private val conversationalQuestionPattern = Regex(
-        """^(?:what|why|how|who|when|where|which|explain|tell\s+me\s+about|write|draft|summarize|translate|compare|give\s+me\s+ideas|help\s+me\s+understand|define|difference\s+between|can\s+you\s+explain)\b""",
+
+    private val explicitPhoneImperativePattern = Regex(
+        """\b(?:open\s+[a-z0-9]|launch\s+[a-z0-9]|start\s+[a-z0-9]|play\s+.+\s+(?:on\s+youtube|song|video|music)|play\s+(?:youtube|music|song|the\s+(?:first|second|third|next)\s+(?:video|one)|a\s+video)|call\s+\S+|dial\s+\S+|ring\s+\S+|send\s+(?:a\s+)?(?:whatsapp|sms|text|message)|whatsapp\s+\S+|text\s+\S+\s+(?:that|saying|hi|hello)|set\s+(?:an?\s+)?(?:alarm|timer)|navigate\s+to|directions?\s+to|route\s+to|turn\s+(?:on|off)\s+(?:wi-?fi|bluetooth|flashlight|location|hotspot|dnd|airplane)|toggle\s+(?:wi-?fi|bluetooth|location)|scroll\s+(?:down|up|left|right)|swipe\s+(?:down|up|left|right)|tap\s+(?:on\s+)?\S+|click\s+(?:on\s+)?\S+|press\s+(?:back|home|\S+)|go\s+(?:back|home)|set\s+volume|increase\s+volume|decrease\s+volume|mute\s+(?:phone|media|ring)|unmute|open\s+(?:notifications?|quick\s+settings?|recents?|settings?)|book\s+(?:a\s+|an\s+)?(?:ride|cab|taxi|auto|bike|uber|ola|rapido)|order\s+.+\s+(?:on|from)\s+(?:zomato|swiggy))\b""",
         RegexOption.IGNORE_CASE
     )
+
+    private val generalPhoneActionPattern = Regex(
+        """\b(?:open|launch|play|call|dial|send|message|whatsapp|sms|alarm|timer|navigate|directions?|turn\s+on|turn\s+off|toggle|enable|disable|scroll|swipe|tap|click|press|volume|mute|unmute|brightness|notifications?|recents?|quick\s+settings?|search\s+on|find\s+on|order\s+on|book\s+a\s+ride|book\s+a\s+cab|book\s+uber|book\s+ola|book\s+rapido)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    /**
+     * Unified Smart Mode router: decides without any manual Chat/Agent switch whether
+     * an utterance goes directly to rich formatted chat, instant deterministic local tool,
+     * or the AI Hybrid Tool Router.
+     */
+    fun decideUnifiedRoute(
+        rawInput: String,
+        currentForegroundApp: String? = null
+    ): UnifiedRouteDecision {
+        val text = rawInput.trim()
+        if (text.isBlank()) return UnifiedRouteDecision.DIRECT_CHAT
+
+        val localMatch = HybridToolRouting.matchDirectLocalTool(text, currentForegroundApp)
+        if (localMatch != null) {
+            return if (localMatch.tool == ToolName.REPLY_TO_USER) {
+                UnifiedRouteDecision.DIRECT_CHAT
+            } else {
+                UnifiedRouteDecision.LOCAL_TOOL
+            }
+        }
+
+        if (conversationalStarterPattern.containsMatchIn(text)) {
+            return if (explicitPhoneImperativePattern.containsMatchIn(text)) {
+                UnifiedRouteDecision.AI_TOOL_ROUTER
+            } else {
+                UnifiedRouteDecision.DIRECT_CHAT
+            }
+        }
+
+        return if (explicitPhoneImperativePattern.containsMatchIn(text) || generalPhoneActionPattern.containsMatchIn(text)) {
+            UnifiedRouteDecision.AI_TOOL_ROUTER
+        } else {
+            UnifiedRouteDecision.DIRECT_CHAT
+        }
+    }
 
     /**
      * Determines whether a prompt in Unified Smart Mode or Live Voice should pass through the
      * Hybrid Tool Router vs. go straight to low-latency streaming Gemini chat.
      */
-    fun looksLikePhoneAction(rawInput: String): Boolean {
-        val text = rawInput.trim()
-        if (text.isBlank()) return false
-        if (HybridToolRouting.matchDirectLocalTool(text) != null) return true
-        if (conversationalQuestionPattern.containsMatchIn(text)) {
-            // Still allow explicit phone imperatives even if phrased politely ("Can you open Zomato and search biryani?")
-            val explicitImperative = Regex(
-                """\b(open|launch|call|whatsapp|send\s+(?:a\s+)?(?:message|sms|text)|set\s+(?:an?\s+)?(?:alarm|timer)|play\s+.+\s+on\s+youtube|navigate\s+to|turn\s+(?:on|off))\b""",
-                RegexOption.IGNORE_CASE
-            )
-            return explicitImperative.containsMatchIn(text)
+    fun looksLikePhoneAction(rawInput: String, currentForegroundApp: String? = null): Boolean {
+        return decideUnifiedRoute(rawInput, currentForegroundApp) != UnifiedRouteDecision.DIRECT_CHAT
+    }
+}
+
+/**
+ * Builds accurate, date-aware, Gemini-style system prompts shared across
+ * Built-in Firebase AI Logic, Gemini Native, Anthropic, and OpenAI-Compatible providers.
+ */
+object SystemPromptBuilder {
+    const val INDIAN_ENGLISH_VOICE_GRACE_RULE =
+        "The user often speaks in natural Indian English or Telugu-influenced English via voice-to-text, which may contain minor transcription typos or pauses. Always infer their true intent gracefully and respond helpfully instead of failing."
+
+    const val STRICT_ACCURACY_RULE =
+        "Never fabricate or guess facts, dates, prices, or current events. If you do not have live web data for a real-time question, state that clearly instead of guessing."
+
+    fun formatCurrentDateTime(nowMillis: Long = System.currentTimeMillis()): String {
+        val dateStr = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(nowMillis))
+        val timeStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(nowMillis))
+        return "Current date: $dateStr, Time: $timeStr"
+    }
+
+    fun buildRichAssistantSystemPrompt(
+        personalSqlContext: String,
+        voiceLanguage: VoiceLanguage,
+        isLiveVoice: Boolean = false,
+        hasLiveWebSearch: Boolean = false,
+        nowMillis: Long = System.currentTimeMillis()
+    ): String = buildString {
+        appendLine("You are My Personal Agent, a smart, warm, privacy-first personal AI assistant running on the user's Android phone.")
+        appendLine(formatCurrentDateTime(nowMillis))
+        if (isLiveVoice) {
+            appendLine("You are in a real-time hands-free voice conversation. Keep answers natural, conversational, and concise (2 to 4 short spoken sentences unless the user asks for deep detail). Avoid markdown asterisks, code blocks, or long bullet lists.")
+        } else {
+            appendLine("Format replies like the Google Gemini app: lead with a clear direct answer, then organize details with short headings (## / ###), bullet points, **bold** key terms, code blocks when helpful, and tasteful relevant emojis.")
+            appendLine("Always remember and use prior conversation history when answering follow-up questions.")
         }
-        return phoneActionPattern.containsMatchIn(text)
+        appendLine(STRICT_ACCURACY_RULE)
+        if (hasLiveWebSearch) {
+            appendLine("Live Google Search grounding is enabled for up-to-date facts — rely on verified search results for current events, scores, prices, and recent releases.")
+        }
+        appendLine(INDIAN_ENGLISH_VOICE_GRACE_RULE)
+        when (voiceLanguage) {
+            VoiceLanguage.TE_IN -> {
+                appendLine("The user's voice language is set to Telugu (తెలుగు). Respond naturally in clear Telugu unless the user explicitly asks for English.")
+            }
+            VoiceLanguage.EN_IN -> {
+                appendLine("Respond naturally in clear English (or Telugu if the user writes or speaks in Telugu).")
+            }
+        }
+        appendLine("Safety rule: Never assist with banking transfers, UPI PINs, OTPs, or entering passwords.")
+        if (personalSqlContext.isNotBlank()) {
+            appendLine()
+            appendLine(personalSqlContext)
+            appendLine("Use these saved memories and open tasks naturally whenever relevant to personalize your answer.")
+        }
+    }
+}
+
+/**
+ * Pure-Kotlin accumulation buffer for Patient Voice Recognition.
+ * Appends multiple speech segments cleanly across pauses without duplicating overlapping edges.
+ */
+class PatientSpeechBuffer {
+    private var committed: String = ""
+    private var livePartial: String = ""
+
+    fun clear() {
+        committed = ""
+        livePartial = ""
+    }
+
+    fun updatePartial(partial: String): String {
+        livePartial = partial.trim()
+        return combinedText()
+    }
+
+    fun commitSegment(segment: String): String {
+        val cleaned = segment.trim()
+        livePartial = ""
+        if (cleaned.isNotBlank()) {
+            committed = mergeWithoutOverlap(committed, cleaned)
+        }
+        return committed
+    }
+
+    fun finalizeAll(): String {
+        if (livePartial.isNotBlank()) {
+            committed = mergeWithoutOverlap(committed, livePartial)
+            livePartial = ""
+        }
+        return committed.trim()
+    }
+
+    fun hasText(): Boolean = committed.isNotBlank() || livePartial.isNotBlank()
+
+    fun combinedText(): String = mergeWithoutOverlap(committed, livePartial)
+
+    companion object {
+        fun mergeWithoutOverlap(existing: String, addition: String): String {
+            val a = existing.trim()
+            val b = addition.trim()
+            if (a.isEmpty()) return b
+            if (b.isEmpty()) return a
+            if (b.startsWith(a, ignoreCase = true)) return b
+            if (a.endsWith(b, ignoreCase = true)) return a
+
+            val aWords = a.split(Regex("\\s+"))
+            val bWords = b.split(Regex("\\s+"))
+            val maxOverlap = min(aWords.size, bWords.size).coerceAtMost(5)
+            for (k in maxOverlap downTo 1) {
+                val tail = aWords.takeLast(k).joinToString(" ")
+                val head = bWords.take(k).joinToString(" ")
+                if (tail.equals(head, ignoreCase = true)) {
+                    val rest = bWords.drop(k).joinToString(" ")
+                    return if (rest.isBlank()) a else "$a $rest"
+                }
+            }
+            return "$a $b"
+        }
     }
 }
 

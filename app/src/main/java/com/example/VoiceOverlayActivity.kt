@@ -86,8 +86,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.LocalAgentSemanticColors
 import com.example.ui.theme.PersonalAgentTheme
+import com.example.ui.theme.frostedPill
+import com.example.ui.theme.nestedGlassCard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -104,10 +107,12 @@ class VoiceOverlayActivity : ComponentActivity() {
     private var launchNonce by mutableStateOf(0L)
     private var launchWakeTriggered by mutableStateOf(false)
     private var launchPrefilledCommand by mutableStateOf<String?>(null)
+    private var launchForegroundApp by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         configureAppCheck(this, intent)
+        captureForegroundAppBeforeOverlay()
         readLaunchExtras(intent)
         window.setBackgroundDrawableResource(android.R.color.transparent)
         enableEdgeToEdge(
@@ -141,6 +146,7 @@ class VoiceOverlayActivity : ComponentActivity() {
                     launchNonce = launchNonce,
                     wakeTriggered = launchWakeTriggered,
                     prefilledCommand = launchPrefilledCommand,
+                    foregroundAppAtLaunch = launchForegroundApp,
                     onCloseOverlay = { closeQuietly() }
                 )
             }
@@ -150,7 +156,15 @@ class VoiceOverlayActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        captureForegroundAppBeforeOverlay()
         readLaunchExtras(intent)
+    }
+
+    private fun captureForegroundAppBeforeOverlay() {
+        val detected = AgentAccessibilityService.getCurrentForegroundApp(packageName)
+        if (!detected.isNullOrBlank()) {
+            launchForegroundApp = detected
+        }
     }
 
     override fun onStart() {
@@ -203,6 +217,7 @@ private fun VoiceOverlaySheetContent(
     launchNonce: Long,
     wakeTriggered: Boolean,
     prefilledCommand: String?,
+    foregroundAppAtLaunch: String?,
     onCloseOverlay: () -> Unit
 ) {
     val context = LocalContext.current
@@ -220,6 +235,7 @@ private fun VoiceOverlaySheetContent(
     var lastHandledLaunchNonce by remember { mutableStateOf(0L) }
 
     val latestVoiceSettings by rememberUpdatedState(persistedState.voiceSettings)
+    val latestForegroundApp by rememberUpdatedState(foregroundAppAtLaunch)
     val voiceLanguage = persistedState.voiceSettings.voiceLanguage
 
     fun dispatchToAccessibilityAndClose(
@@ -231,56 +247,88 @@ private fun VoiceOverlaySheetContent(
         voiceSettings: VoiceSettings
     ) {
         val service = AgentAccessibilityService.getInstance()
+        if (service == null) {
+            val errMsg = AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE
+            errorNote = errMsg
+            scope.launch {
+                val chatErr = ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = errMsg,
+                    isError = true,
+                    excludeFromContext = true
+                )
+                ConversationRepository.appendMessages(storage, listOf(chatErr))
+                storage.updateActionStatusInStorage(
+                    actionId = plan.actionId,
+                    status = ApprovalStatus.FAILED,
+                    completedSteps = 0,
+                    activeStep = -1,
+                    notes = errMsg
+                )
+            }
+            AgentSpeechFeedback.announceOutcome(
+                context = context.applicationContext,
+                message = errMsg,
+                isSuccess = false,
+                voiceSettings = voiceSettings,
+                showToastWhenOutsideApp = false
+            )
+            return
+        }
+
+        // Speak immediate short acknowledgment for actions that don't speak their own inside AgentAccessibilityService
+        if (voiceSettings.speakRepliesAloud &&
+            toolCall.tool !in setOf(ToolName.BOOK_RIDE, ToolName.PLAY_YOUTUBE_VIDEO, ToolName.SEND_MESSAGE)
+        ) {
+            AgentSpeechFeedback.speak(
+                context = context.applicationContext,
+                text = HybridToolRouting.buildImmediateAckPhrase(toolCall),
+                voiceSettings = voiceSettings
+            )
+        }
+
         onCloseOverlay()
 
         when (toolCall.tool) {
+            ToolName.BOOK_RIDE -> {
+                service.startBookRide(
+                    plan = plan,
+                    rideApp = toolCall.appName,
+                    destination = toolCall.destination,
+                    provider = activeProvider,
+                    blockSensitive = blockSensitive,
+                    conversationHistory = history,
+                    initialDelayMs = 240L
+                )
+            }
+
             ToolName.PLAY_YOUTUBE_VIDEO -> {
                 val query = toolCall.query?.takeIf { it.isNotBlank() } ?: plan.title
-                if (service != null) {
-                    service.startPlayYouTubeVideo(
-                        plan = plan,
-                        query = query,
-                        provider = activeProvider,
-                        blockSensitive = blockSensitive,
-                        conversationHistory = history
-                    )
-                } else {
-                    val res = NativeToolExecutor.searchYouTube(context.applicationContext, query)
-                    val msg = if (res.success) {
-                        ConfirmationFormatter.formatSuccess(res.summary)
-                    } else {
-                        ConfirmationFormatter.formatFailure(res.summary)
-                    }
-                    AgentSpeechFeedback.announceOutcome(context.applicationContext, msg, res.success, voiceSettings)
-                }
+                service.startPlayYouTubeVideo(
+                    plan = plan,
+                    query = query,
+                    provider = activeProvider,
+                    blockSensitive = blockSensitive,
+                    conversationHistory = history
+                )
             }
 
             ToolName.SEND_MESSAGE -> {
                 val contact = toolCall.contactOrNumber.orEmpty()
                 val app = toolCall.messagingApp ?: "whatsapp"
                 val text = toolCall.messageText.orEmpty()
-                if (service != null) {
-                    service.startSendMessage(
-                        plan = plan,
-                        contactOrNumber = contact,
-                        messagingApp = app,
-                        messageText = text,
-                        blockSensitive = blockSensitive
-                    )
-                } else {
-                    val res = NativeToolExecutor.openMessageComposer(context.applicationContext, contact, app, text)
-                    val msg = if (res.success) {
-                        ConfirmationFormatter.formatSuccess(res.summary)
-                    } else {
-                        ConfirmationFormatter.formatFailure(res.summary)
-                    }
-                    AgentSpeechFeedback.announceOutcome(context.applicationContext, msg, res.success, voiceSettings)
-                }
+                service.startSendMessage(
+                    plan = plan,
+                    contactOrNumber = contact,
+                    messagingApp = app,
+                    messageText = text,
+                    blockSensitive = blockSensitive
+                )
             }
 
             ToolName.TAP_ON_SCREEN -> {
                 val target = toolCall.targetText?.takeIf { it.isNotBlank() } ?: plan.title
-                service?.startTapOnScreen(
+                service.startTapOnScreen(
                     plan = plan,
                     targetText = target,
                     blockSensitive = blockSensitive,
@@ -289,36 +337,24 @@ private fun VoiceOverlaySheetContent(
             }
 
             ToolName.SCROLL_SCREEN -> {
-                service?.startDirectScroll(plan, toolCall.direction ?: "down")
+                service.startDirectScroll(plan, toolCall.direction ?: "down")
             }
 
             ToolName.UI_AUTOMATE -> {
-                if (service != null) {
-                    val goal = toolCall.goal?.takeIf { it.isNotBlank() } ?: plan.title
-                    service.startAiUiAutomation(
-                        plan = plan,
-                        goal = goal,
-                        provider = activeProvider,
-                        blockSensitive = blockSensitive,
-                        maxSteps = 15,
-                        conversationHistory = history,
-                        initialDelayMs = 280L
-                    )
-                }
+                val goal = toolCall.goal?.takeIf { it.isNotBlank() } ?: plan.title
+                service.startAiUiAutomation(
+                    plan = plan,
+                    goal = goal,
+                    provider = activeProvider,
+                    blockSensitive = blockSensitive,
+                    maxSteps = 15,
+                    conversationHistory = history,
+                    initialDelayMs = 280L
+                )
             }
 
             else -> {
-                if (service != null) {
-                    service.startDirectAction(plan, toolCall)
-                } else {
-                    val res = NativeToolExecutor.executeDirectTool(context.applicationContext, toolCall)
-                    val msg = if (res.success) {
-                        ConfirmationFormatter.formatSuccess(res.summary)
-                    } else {
-                        ConfirmationFormatter.formatFailure(res.summary)
-                    }
-                    AgentSpeechFeedback.announceOutcome(context.applicationContext, msg, res.success, voiceSettings)
-                }
+                service.startDirectAction(plan, toolCall)
             }
         }
     }
@@ -344,299 +380,367 @@ private fun VoiceOverlaySheetContent(
         statusNote = "Understanding command…"
 
         scope.launch {
-            val latestState = storage.readLatestState()
-            val useBuiltIn = latestState.builtInGeminiSettings.useBuiltInGemini || latestState.providers.isEmpty()
-            val activeProvider = if (useBuiltIn) {
-                null
-            } else {
-                latestState.providers.firstOrNull { it.isDefault }
-                    ?: latestState.providers.firstOrNull()
-            }
-            val userMsg = ChatMessage(sender = MessageSender.USER, text = command)
-            val historyWithUser = latestState.chatMessages + userMsg
-            storage.appendChatAndApproval(listOf(userMsg))
-
-            // 1. On-device financial/UPI/OTP/password hard-block check
-            if (latestState.safetyRules.blockSensitiveFinancial) {
-                val violation = withContext(Dispatchers.Default) {
-                    SafetyGuardrail.detectSensitiveViolation(command)
-                }
-                if (violation != null) {
-                    val blockedActionId = UUID.randomUUID().toString()
-                    val blockedMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = "Blocked on-device by your Safety Guardrail ($violation). Banking, UPI, OTP, and password actions are hard-blocked.",
-                        isBlockedBySafety = true,
-                        blockedReason = violation,
-                        approvalStatus = ApprovalStatus.BLOCKED,
-                        excludeFromContext = true
-                    )
-                    val blockedRec = ApprovalRecord(
-                        actionId = blockedActionId,
-                        title = "Blocked Request: ${command.take(56)}",
-                        riskLevel = RiskLevel.HIGH,
-                        steps = listOf("Blocked locally ($violation)"),
-                        status = ApprovalStatus.BLOCKED,
-                        notes = "Blocked by on-device financial/credential guardrail."
-                    )
-                    storage.appendChatAndApproval(listOf(blockedMsg), blockedRec)
-                    isRouting = false
-                    statusNote = null
-                    blockedReason = violation
-                    return@launch
-                }
-            }
-
-            // 1b. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
-            val sqlIntent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(command) }
-            if (sqlIntent != null) {
-                val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
-                val reply = when (sqlIntent) {
-                    is SqlDirectIntent.SaveMemory -> {
-                        sqlRepo.addMemory(sqlIntent.category, sqlIntent.title, sqlIntent.content, isPinned = true)
-                        "Saved to your personal SQL memory: ${sqlIntent.content}"
-                    }
-                    is SqlDirectIntent.AddTask -> {
-                        sqlRepo.addTask(sqlIntent.title, priority = sqlIntent.priority)
-                        "Added to your tasks: ${sqlIntent.title}"
-                    }
-                    SqlDirectIntent.ListTasks -> {
-                        val pending = PersonalAgentDatabase.getInstance(context.applicationContext).taskDao().getPendingTasks(6)
-                        if (pending.isEmpty()) "You have no open tasks right now."
-                        else "Your open tasks are: " + pending.joinToString("; ") { it.title }
-                    }
-                    SqlDirectIntent.ListMemories -> {
-                        val mems = PersonalAgentDatabase.getInstance(context.applicationContext).memoryDao().getTopMemories(5)
-                        if (mems.isEmpty()) "No memories saved yet. Say 'Remember that...' to save one."
-                        else "Here is what I remember: " + mems.joinToString("; ") { it.content }
-                    }
-                }
-                val replyMsg = ChatMessage(sender = MessageSender.AGENT, text = reply, modelBadge = "SQL Memory")
-                storage.appendChatAndApproval(listOf(replyMsg))
-                sqlRepo.recordInteractionLog(latestState.sessionId, "VOICE_OVERLAY", command, reply, toolUsed = "sql_memory")
-                isRouting = false
-                statusNote = null
-                replyText = reply
-                AgentSpeechFeedback.announceOutcome(
-                    context = context.applicationContext,
-                    message = reply,
-                    isSuccess = true,
-                    voiceSettings = latestState.voiceSettings,
-                    showToastWhenOutsideApp = false
-                )
-                return@launch
-            }
-
-            // 2. Local deterministic fast router first
-            val localTool = withContext(Dispatchers.Default) {
-                HybridToolRouting.matchDirectLocalTool(command)
-            }
-
-            val resolvedTool: RoutedToolCall? = if (localTool != null) {
-                localTool
-            } else {
-                val installed = InstalledAppCache.getCached().ifEmpty {
-                    InstalledAppCache.refresh(context.applicationContext)
-                }.map { it.displayName }
-
-                val routed = if (activeProvider != null) {
-                    networkClient.routeHybridTool(
-                        provider = activeProvider,
-                        userGoal = command,
-                        installedAppSample = installed,
-                        safetyRules = latestState.safetyRules,
-                        conversationHistory = historyWithUser
-                    )
+            var activeVoiceSettings = latestVoiceSettings
+            try {
+                val latestState = storage.readLatestState()
+                activeVoiceSettings = latestState.voiceSettings
+                val useBuiltIn = latestState.builtInGeminiSettings.useBuiltInGemini || latestState.providers.isEmpty()
+                val activeProvider = if (useBuiltIn) {
+                    null
                 } else {
-                    val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
-                    val sqlCtx = if (latestState.builtInGeminiSettings.injectSqlMemory) {
-                        sqlRepo.buildPersonalContextBlock()
-                    } else {
-                        ""
-                    }
-                    FirebaseAiService().routeHybridToolWithGemini(
-                        userGoal = command,
-                        installedAppSample = installed,
-                        safetyRules = latestState.safetyRules,
-                        conversationHistory = historyWithUser,
-                        personalSqlContext = sqlCtx
-                    )
+                    latestState.providers.firstOrNull { it.isDefault }
+                        ?: latestState.providers.firstOrNull()
                 }
 
-                when (routed) {
-                    is ToolRouteApiResult.Error -> {
-                        val errMsg = ChatMessage(
+                // Read live foreground app BEFORE routing so follow-up commands act directly on the open app
+                val currentForegroundApp = latestForegroundApp
+                    ?.takeIf { it.isNotBlank() && it != context.packageName }
+                    ?: AgentAccessibilityService.getCurrentForegroundApp(context.packageName)
+
+                // Always merge and append to the SINGLETON ConversationRepository (NEVER creating a new session!)
+                ConversationRepository.mergeWithPersisted(latestState.chatMessages)
+                val userMsg = ChatMessage(sender = MessageSender.USER, text = command)
+                val historyWithUser = ConversationRepository.appendMessages(storage, listOf(userMsg))
+
+                // 1. On-device financial/UPI/OTP/password hard-block check
+                if (latestState.safetyRules.blockSensitiveFinancial) {
+                    val violation = withContext(Dispatchers.Default) {
+                        SafetyGuardrail.detectSensitiveViolation(command)
+                    }
+                    if (violation != null) {
+                        val blockedActionId = UUID.randomUUID().toString()
+                        val blockedText = "Blocked on-device by your Safety Guardrail ($violation). Banking, UPI, OTP, and password actions are hard-blocked."
+                        val blockedMsg = ChatMessage(
                             sender = MessageSender.AGENT,
-                            text = routed.message,
-                            isError = true,
+                            text = blockedText,
+                            isBlockedBySafety = true,
+                            blockedReason = violation,
+                            approvalStatus = ApprovalStatus.BLOCKED,
                             excludeFromContext = true
                         )
-                        storage.appendChatAndApproval(listOf(errMsg))
+                        val blockedRec = ApprovalRecord(
+                            actionId = blockedActionId,
+                            title = "Blocked Request: ${command.take(56)}",
+                            riskLevel = RiskLevel.HIGH,
+                            steps = listOf("Blocked locally ($violation)"),
+                            status = ApprovalStatus.BLOCKED,
+                            notes = "Blocked by on-device financial/credential guardrail."
+                        )
+                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec)
                         isRouting = false
                         statusNote = null
-                        errorNote = routed.message
+                        blockedReason = violation
+                        AgentSpeechFeedback.announceOutcome(
+                            context = context.applicationContext,
+                            message = blockedText,
+                            isSuccess = false,
+                            voiceSettings = latestState.voiceSettings,
+                            showToastWhenOutsideApp = false
+                        )
                         return@launch
                     }
-                    is ToolRouteApiResult.Success -> routed.toolCall
                 }
-            }
 
-            if (resolvedTool == null) {
-                isRouting = false
-                statusNote = null
-                errorNote = "Could not understand that command."
-                return@launch
-            }
-
-            // 2b. Natural greetings & conversational replies — reply warmly inline, NEVER open an app!
-            if (resolvedTool.tool == ToolName.REPLY_TO_USER) {
-                val warmReply = resolvedTool.replyMessage
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "Hello! How can I help you today?"
-                val replyMsg = ChatMessage(
-                    sender = MessageSender.AGENT,
-                    text = warmReply
-                )
-                storage.appendChatAndApproval(listOf(replyMsg))
-                isRouting = false
-                statusNote = null
-                replyText = warmReply
-                if (latestState.voiceSettings.speakRepliesAloud) {
-                    AgentSpeechFeedback.speak(
-                        context = context.applicationContext,
-                        text = warmReply,
-                        voiceSettings = latestState.voiceSettings
-                    )
-                }
-                return@launch
-            }
-
-            // 3. Re-verify safety guardrail on routed tool arguments
-            if (latestState.safetyRules.blockSensitiveFinancial) {
-                val violation = withContext(Dispatchers.Default) {
-                    SafetyGuardrail.detectSensitiveViolation(
-                        resolvedTool.title,
-                        resolvedTool.appName,
-                        resolvedTool.query,
-                        resolvedTool.messageText,
-                        resolvedTool.targetText,
-                        resolvedTool.goal,
-                        *resolvedTool.steps.toTypedArray()
-                    )
-                }
-                if (violation != null) {
-                    val blockedActionId = UUID.randomUUID().toString()
-                    val blockedMsg = ChatMessage(
-                        sender = MessageSender.AGENT,
-                        text = "Blocked on-device by your Safety Guardrail ($violation).",
-                        isBlockedBySafety = true,
-                        blockedReason = violation,
-                        approvalStatus = ApprovalStatus.BLOCKED,
-                        excludeFromContext = true
-                    )
-                    val blockedRec = ApprovalRecord(
-                        actionId = blockedActionId,
-                        title = resolvedTool.title.ifBlank { command.take(56) },
-                        riskLevel = RiskLevel.HIGH,
-                        steps = resolvedTool.steps,
-                        status = ApprovalStatus.BLOCKED,
-                        notes = "Blocked by on-device financial/credential guardrail."
-                    )
-                    storage.appendChatAndApproval(listOf(blockedMsg), blockedRec)
+                // 1b. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
+                val sqlIntent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(command) }
+                if (sqlIntent != null) {
+                    val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
+                    val reply = when (sqlIntent) {
+                        is SqlDirectIntent.SaveMemory -> {
+                            sqlRepo.addMemory(sqlIntent.category, sqlIntent.title, sqlIntent.content, isPinned = true)
+                            "Saved to your personal SQL memory: ${sqlIntent.content}"
+                        }
+                        is SqlDirectIntent.AddTask -> {
+                            sqlRepo.addTask(sqlIntent.title, priority = sqlIntent.priority)
+                            "Added to your tasks: ${sqlIntent.title}"
+                        }
+                        SqlDirectIntent.ListTasks -> {
+                            val pending = PersonalAgentDatabase.getInstance(context.applicationContext).taskDao().getPendingTasks(6)
+                            if (pending.isEmpty()) "You have no open tasks right now."
+                            else "Your open tasks are: " + pending.joinToString("; ") { it.title }
+                        }
+                        SqlDirectIntent.ListMemories -> {
+                            val mems = PersonalAgentDatabase.getInstance(context.applicationContext).memoryDao().getTopMemories(5)
+                            if (mems.isEmpty()) "No memories saved yet. Say 'Remember that...' to save one."
+                            else "Here is what I remember: " + mems.joinToString("; ") { it.content }
+                        }
+                    }
+                    val replyMsg = ChatMessage(sender = MessageSender.AGENT, text = reply, modelBadge = "SQL Memory")
+                    ConversationRepository.appendMessages(storage, listOf(replyMsg))
+                    sqlRepo.recordInteractionLog(latestState.sessionId, "VOICE_OVERLAY", command, reply, toolUsed = "sql_memory")
                     isRouting = false
                     statusNote = null
-                    blockedReason = violation
+                    replyText = reply
                     AgentSpeechFeedback.announceOutcome(
                         context = context.applicationContext,
-                        message = "Blocked by your safety guardrail: $violation",
+                        message = reply,
+                        isSuccess = true,
+                        voiceSettings = latestState.voiceSettings,
+                        showToastWhenOutsideApp = false
+                    )
+                    return@launch
+                }
+
+                // 2. Local deterministic fast router first (foreground-aware!)
+                val localTool = withContext(Dispatchers.Default) {
+                    HybridToolRouting.matchDirectLocalTool(command, currentForegroundApp)
+                }
+
+                val resolvedTool: RoutedToolCall? = if (localTool != null) {
+                    localTool
+                } else {
+                    val installed = InstalledAppCache.getCached().ifEmpty {
+                        InstalledAppCache.refresh(context.applicationContext)
+                    }.map { it.displayName }
+
+                    val routed = if (activeProvider != null) {
+                        networkClient.routeHybridTool(
+                            provider = activeProvider,
+                            userGoal = command,
+                            installedAppSample = installed,
+                            safetyRules = latestState.safetyRules,
+                            conversationHistory = historyWithUser,
+                            currentForegroundApp = currentForegroundApp
+                        )
+                    } else {
+                        val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
+                        val sqlCtx = if (latestState.builtInGeminiSettings.injectSqlMemory) {
+                            sqlRepo.buildPersonalContextBlock()
+                        } else {
+                            ""
+                        }
+                        FirebaseAiService().routeHybridToolWithGemini(
+                            userGoal = command,
+                            installedAppSample = installed,
+                            safetyRules = latestState.safetyRules,
+                            conversationHistory = historyWithUser,
+                            personalSqlContext = sqlCtx,
+                            currentForegroundApp = currentForegroundApp
+                        )
+                    }
+
+                    when (routed) {
+                        is ToolRouteApiResult.Error -> {
+                            val failText = ConfirmationFormatter.formatStrictFailure(routed.message)
+                            val errMsg = ChatMessage(
+                                sender = MessageSender.AGENT,
+                                text = failText,
+                                isError = true,
+                                excludeFromContext = true
+                            )
+                            ConversationRepository.appendMessages(storage, listOf(errMsg))
+                            isRouting = false
+                            statusNote = null
+                            errorNote = failText
+                            AgentSpeechFeedback.announceOutcome(
+                                context = context.applicationContext,
+                                message = failText,
+                                isSuccess = false,
+                                voiceSettings = latestState.voiceSettings,
+                                showToastWhenOutsideApp = false
+                            )
+                            return@launch
+                        }
+                        is ToolRouteApiResult.Success -> routed.toolCall
+                    }
+                }
+
+                if (resolvedTool == null) {
+                    val failText = ConfirmationFormatter.formatStrictFailure("Could not understand that command")
+                    val errMsg = ChatMessage(
+                        sender = MessageSender.AGENT,
+                        text = failText,
+                        isError = true,
+                        excludeFromContext = true
+                    )
+                    ConversationRepository.appendMessages(storage, listOf(errMsg))
+                    isRouting = false
+                    statusNote = null
+                    errorNote = failText
+                    AgentSpeechFeedback.announceOutcome(
+                        context = context.applicationContext,
+                        message = failText,
                         isSuccess = false,
                         voiceSettings = latestState.voiceSettings,
                         showToastWhenOutsideApp = false
                     )
                     return@launch
                 }
-            }
 
-            val plan = ActionPlan(
-                actionId = UUID.randomUUID().toString(),
-                title = resolvedTool.title.ifBlank { command.take(56) },
-                riskLevel = resolvedTool.riskLevel,
-                steps = resolvedTool.steps.ifEmpty { listOf(resolvedTool.reason.ifBlank { command.take(80) }) },
-                isDemo = false,
-                routedToolJson = resolvedTool.toJsonString()
-            )
+                // 2b. Natural greetings & conversational replies — reply warmly inline, NEVER open an app!
+                if (resolvedTool.tool == ToolName.REPLY_TO_USER) {
+                    val warmReply = resolvedTool.replyMessage
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "Hello! How can I help you today?"
+                    val replyMsg = ChatMessage(
+                        sender = MessageSender.AGENT,
+                        text = warmReply
+                    )
+                    ConversationRepository.appendMessages(storage, listOf(replyMsg))
+                    isRouting = false
+                    statusNote = null
+                    replyText = warmReply
+                    if (latestState.voiceSettings.speakRepliesAloud) {
+                        AgentSpeechFeedback.speak(
+                            context = context.applicationContext,
+                            text = warmReply,
+                            voiceSettings = latestState.voiceSettings
+                        )
+                    }
+                    return@launch
+                }
 
-            // Check whether AccessibilityService is needed for this tool
-            val needsAccessibility = resolvedTool.tool in setOf(
-                ToolName.TAP_ON_SCREEN,
-                ToolName.SCROLL_SCREEN,
-                ToolName.PRESS_BACK,
-                ToolName.PRESS_HOME,
-                ToolName.OPEN_RECENTS,
-                ToolName.OPEN_NOTIFICATIONS,
-                ToolName.OPEN_QUICK_SETTINGS,
-                ToolName.UI_AUTOMATE,
-                ToolName.SEND_MESSAGE
-            )
-            if (needsAccessibility && AgentAccessibilityService.getInstance() == null) {
-                val err = ConfirmationFormatter.formatFailure(
-                    "Enable Accessibility Service in My Personal Agent -> Setup & Test first."
+                // 3. Re-verify safety guardrail on routed tool arguments
+                if (latestState.safetyRules.blockSensitiveFinancial) {
+                    val violation = withContext(Dispatchers.Default) {
+                        SafetyGuardrail.detectSensitiveViolation(
+                            resolvedTool.title,
+                            resolvedTool.appName,
+                            resolvedTool.query,
+                            resolvedTool.messageText,
+                            resolvedTool.targetText,
+                            resolvedTool.goal,
+                            *resolvedTool.steps.toTypedArray()
+                        )
+                    }
+                    if (violation != null) {
+                        val blockedActionId = UUID.randomUUID().toString()
+                        val blockedMsg = ChatMessage(
+                            sender = MessageSender.AGENT,
+                            text = "Blocked on-device by your Safety Guardrail ($violation).",
+                            isBlockedBySafety = true,
+                            blockedReason = violation,
+                            approvalStatus = ApprovalStatus.BLOCKED,
+                            excludeFromContext = true
+                        )
+                        val blockedRec = ApprovalRecord(
+                            actionId = blockedActionId,
+                            title = resolvedTool.title.ifBlank { command.take(56) },
+                            riskLevel = RiskLevel.HIGH,
+                            steps = resolvedTool.steps,
+                            status = ApprovalStatus.BLOCKED,
+                            notes = "Blocked by on-device financial/credential guardrail."
+                        )
+                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec)
+                        isRouting = false
+                        statusNote = null
+                        blockedReason = violation
+                        AgentSpeechFeedback.announceOutcome(
+                            context = context.applicationContext,
+                            message = "Blocked by your safety guardrail: $violation",
+                            isSuccess = false,
+                            voiceSettings = latestState.voiceSettings,
+                            showToastWhenOutsideApp = false
+                        )
+                        return@launch
+                    }
+                }
+
+                val plan = ActionPlan(
+                    actionId = UUID.randomUUID().toString(),
+                    title = resolvedTool.title.ifBlank { command.take(56) },
+                    riskLevel = resolvedTool.riskLevel,
+                    steps = resolvedTool.steps.ifEmpty { listOf(resolvedTool.reason.ifBlank { command.take(80) }) },
+                    isDemo = false,
+                    routedToolJson = resolvedTool.toJsonString()
                 )
+
+                // Mandatory Accessibility Service check for all phone-control tools
+                if (ToolName.requiresAccessibility(resolvedTool.tool) && AgentAccessibilityService.getInstance() == null) {
+                    val err = AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE
+                    val errMsg = ChatMessage(
+                        sender = MessageSender.AGENT,
+                        text = err,
+                        isError = true,
+                        excludeFromContext = true
+                    )
+                    ConversationRepository.appendMessages(storage, listOf(errMsg))
+                    isRouting = false
+                    statusNote = null
+                    errorNote = err
+                    AgentSpeechFeedback.announceOutcome(
+                        context = context.applicationContext,
+                        message = err,
+                        isSuccess = false,
+                        voiceSettings = latestState.voiceSettings,
+                        showToastWhenOutsideApp = false
+                    )
+                    return@launch
+                }
+
+                // LOW and MEDIUM risk actions auto-run immediately without approval;
+                // HIGH risk actions ALWAYS show the compact Approval Card inside this overlay.
+                val shouldAutoRun = resolvedTool.shouldAutoRun(latestState.safetyRules)
+
+                val initialStatus = if (shouldAutoRun) ApprovalStatus.RUNNING else ApprovalStatus.PENDING
+                val cardMsg = ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = if (shouldAutoRun) {
+                        "Running on-device…"
+                    } else {
+                        "Review the steps below and tap Approve to run on your phone."
+                    },
+                    actionPlan = plan,
+                    approvalStatus = initialStatus,
+                    activeStepIndex = if (shouldAutoRun) 0 else -1
+                )
+                val record = ApprovalRecord(
+                    actionId = plan.actionId,
+                    title = plan.title,
+                    riskLevel = plan.riskLevel,
+                    steps = plan.steps,
+                    status = initialStatus
+                )
+                ConversationRepository.appendMessages(storage, listOf(cardMsg), record)
+
                 isRouting = false
                 statusNote = null
-                errorNote = err
+
+                if (shouldAutoRun) {
+                    dispatchToAccessibilityAndClose(
+                        plan = plan,
+                        toolCall = resolvedTool,
+                        history = historyWithUser,
+                        blockSensitive = latestState.safetyRules.blockSensitiveFinancial,
+                        activeProvider = activeProvider,
+                        voiceSettings = latestState.voiceSettings
+                    )
+                } else {
+                    pendingApproval = PendingOverlayApproval(
+                        plan = plan,
+                        toolCall = resolvedTool,
+                        conversationHistory = historyWithUser
+                    )
+                    if (latestState.voiceSettings.speakRepliesAloud) {
+                        AgentSpeechFeedback.speak(
+                            context = context.applicationContext,
+                            text = "Please review and tap Approve to continue.",
+                            voiceSettings = latestState.voiceSettings
+                        )
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val failText = ConfirmationFormatter.formatStrictFailure(
+                    e.localizedMessage ?: "Something went wrong while handling your command"
+                )
+                val errMsg = ChatMessage(
+                    sender = MessageSender.AGENT,
+                    text = failText,
+                    isError = true,
+                    excludeFromContext = true
+                )
+                runCatching { ConversationRepository.appendMessages(storage, listOf(errMsg)) }
+                isRouting = false
+                statusNote = null
+                errorNote = failText
                 AgentSpeechFeedback.announceOutcome(
                     context = context.applicationContext,
-                    message = err,
+                    message = failText,
                     isSuccess = false,
-                    voiceSettings = latestState.voiceSettings,
+                    voiceSettings = activeVoiceSettings,
                     showToastWhenOutsideApp = false
-                )
-                return@launch
-            }
-
-            // LOW and MEDIUM risk actions auto-run immediately without approval;
-            // HIGH risk actions ALWAYS show the compact Approval Card inside this overlay.
-            val shouldAutoRun = resolvedTool.shouldAutoRun(latestState.safetyRules)
-
-            val initialStatus = if (shouldAutoRun) ApprovalStatus.RUNNING else ApprovalStatus.PENDING
-            val cardMsg = ChatMessage(
-                sender = MessageSender.AGENT,
-                text = if (shouldAutoRun) {
-                    "Running on-device…"
-                } else {
-                    "Review the steps below and tap Approve to run on your phone."
-                },
-                actionPlan = plan,
-                approvalStatus = initialStatus,
-                activeStepIndex = if (shouldAutoRun) 0 else -1
-            )
-            val record = ApprovalRecord(
-                actionId = plan.actionId,
-                title = plan.title,
-                riskLevel = plan.riskLevel,
-                steps = plan.steps,
-                status = initialStatus
-            )
-            storage.appendChatAndApproval(listOf(cardMsg), record)
-
-            isRouting = false
-            statusNote = null
-
-            if (shouldAutoRun) {
-                dispatchToAccessibilityAndClose(
-                    plan = plan,
-                    toolCall = resolvedTool,
-                    history = historyWithUser,
-                    blockSensitive = latestState.safetyRules.blockSensitiveFinancial,
-                    activeProvider = activeProvider,
-                    voiceSettings = latestState.voiceSettings
-                )
-            } else {
-                pendingApproval = PendingOverlayApproval(
-                    plan = plan,
-                    toolCall = resolvedTool,
-                    conversationHistory = historyWithUser
                 )
             }
         }
@@ -739,6 +843,9 @@ private fun VoiceOverlaySheetContent(
         }
     }
 
+    val glass = LocalAgentGlassColors.current
+    val sheetShape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -756,15 +863,16 @@ private fun VoiceOverlaySheetContent(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .widthIn(max = 600.dp)
+                .border(1.dp, glass.luminousBorderBrush(), sheetShape)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     onClick = { /* consume clicks inside the sheet */ }
                 ),
-            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-            shadowElevation = 12.dp
+            shape = sheetShape,
+            color = glass.sheetFill,
+            tonalElevation = 0.dp,
+            shadowElevation = 16.dp
         ) {
             Column(
                 modifier = Modifier
@@ -780,7 +888,7 @@ private fun VoiceOverlaySheetContent(
                         .width(36.dp)
                         .height(4.dp)
                         .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.outlineVariant)
+                        .background(glass.borderStart)
                 )
 
                 // Top Row: Sparkle + Status + EN/తెలుగు Switcher + Close
@@ -815,8 +923,7 @@ private fun VoiceOverlaySheetContent(
                     ) {
                         Box(
                             modifier = Modifier
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.secondaryContainer)
+                                .frostedPill(cornerRadius = 18.dp, active = false)
                                 .clickable {
                                     val next = voiceLanguage.next()
                                     scope.launch {
@@ -833,7 +940,7 @@ private fun VoiceOverlaySheetContent(
                             Text(
                                 text = voiceLanguage.shortChipLabel,
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                         }
 
@@ -863,8 +970,9 @@ private fun VoiceOverlaySheetContent(
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(glass.aiBubbleFill)
+                            .border(1.dp, glass.aiBubbleBorder, RoundedCornerShape(18.dp))
                             .padding(horizontal = 14.dp, vertical = 10.dp)
                     )
                 }
@@ -874,7 +982,7 @@ private fun VoiceOverlaySheetContent(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
+                            .clip(RoundedCornerShape(16.dp))
                             .background(MaterialTheme.colorScheme.errorContainer)
                             .padding(horizontal = 12.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -899,8 +1007,9 @@ private fun VoiceOverlaySheetContent(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f))
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(glass.aiBubbleFill)
+                            .border(1.dp, glass.aiBubbleBorder, RoundedCornerShape(18.dp))
                             .padding(horizontal = 14.dp, vertical = 12.dp)
                             .testTag("overlay_reply_card"),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -908,7 +1017,7 @@ private fun VoiceOverlaySheetContent(
                         Text(
                             text = reply,
                             style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     }
                 }
@@ -971,11 +1080,12 @@ private fun VoiceOverlaySheetContent(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(24.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f))
+                            .background(glass.inputFill)
                             .border(
                                 width = 1.dp,
-                                color = if (isListening) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.outlineVariant,
+                                brush = if (isListening) Brush.linearGradient(
+                                    listOf(glass.accentBlue, glass.accentBlue.copy(alpha = 0.45f))
+                                ) else glass.luminousBorderBrush(),
                                 shape = RoundedCornerShape(24.dp)
                             )
                             .padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
@@ -1044,7 +1154,7 @@ private fun VoiceOverlaySheetContent(
                                 enabled = !isRouting,
                                 onClick = {
                                     if (isListening) {
-                                        voiceController.stopListening()
+                                        voiceController.stopListeningAndCommit()
                                     } else {
                                         val hasMic = ContextCompat.checkSelfPermission(
                                             context,
@@ -1083,9 +1193,7 @@ private fun CompactOverlayApprovalCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+            .nestedGlassCard(cornerRadius = 18.dp)
             .padding(14.dp)
             .testTag("overlay_approval_card"),
         verticalArrangement = Arrangement.spacedBy(8.dp)

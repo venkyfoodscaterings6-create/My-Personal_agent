@@ -53,8 +53,10 @@ import com.example.ApprovalRecord
 import com.example.ApprovalStatus
 import com.example.R
 import com.example.RiskLevel
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.LocalAgentSemanticColors
 import com.example.ui.theme.MonoCodeStyle
+import com.example.ui.theme.glassPanel
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -86,53 +88,59 @@ fun ApprovalsScreen(
     }
     val displayed = if (selectedFilter == ApprovalsFilter.PENDING) pendingList else historyList
 
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // Flat Top Bar with Back Arrow
-        Row(
+        // Frosted Glass Top Bar with Back Arrow
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+                .background(glass.topBarFill)
+                .statusBarsPadding()
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier.testTag("approvals_back_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                        contentDescription = "Back to Chat"
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.testTag("approvals_back_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = "Back to Chat"
+                        )
+                    }
+                    Text(
+                        text = "Approvals",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                 }
-                Text(
-                    text = "Approvals",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+
+                if (approvalHistory.isNotEmpty()) {
+                    IconButton(
+                        onClick = { showClearDialog = true },
+                        modifier = Modifier.testTag("clear_history_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = stringResource(R.string.action_clear_history),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
-            if (approvalHistory.isNotEmpty()) {
-                IconButton(
-                    onClick = { showClearDialog = true },
-                    modifier = Modifier.testTag("clear_history_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.DeleteOutline,
-                        contentDescription = stringResource(R.string.action_clear_history),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+            HorizontalDivider(thickness = 0.5.dp, color = glass.hairlineDivider)
         }
-
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
         Row(
             modifier = Modifier
@@ -209,6 +217,8 @@ fun ApprovalsScreen(
     if (showClearDialog) {
         AlertDialog(
             onDismissRequest = { showClearDialog = false },
+            containerColor = glass.dialogFill,
+            shape = RoundedCornerShape(24.dp),
             title = { Text("Clear approval history?") },
             text = { Text("This deletes all pending and past approval records stored on this device.") },
             confirmButton = {
@@ -270,12 +280,11 @@ private fun FlatApprovalRow(
         SimpleDateFormat("MMM d · h:mm a", Locale.getDefault()).format(Date(record.timestampMillis))
     }
 
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+            .glassPanel(cornerRadius = 18.dp)
             .padding(14.dp)
             .testTag("approval_record_${record.actionId}"),
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -388,7 +397,7 @@ private fun FlatApprovalRow(
             ) {
                 Button(
                     onClick = onApprove,
-                    shape = RoundedCornerShape(12.dp),
+                    shape = RoundedCornerShape(14.dp),
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
@@ -397,8 +406,12 @@ private fun FlatApprovalRow(
                 }
                 OutlinedButton(
                     onClick = onCancel,
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = glass.pillFill,
+                        contentColor = MaterialTheme.colorScheme.onSurface
+                    ),
+                    border = BorderStroke(1.dp, glass.nestedCardBorder),
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)

@@ -161,7 +161,74 @@ object NativeToolExecutor {
                 stream = toolCall.stream ?: "media",
                 levelPercent = toolCall.levelPercent ?: 50
             )
+            ToolName.BOOK_RIDE -> openRideApp(context, toolCall.appName ?: "Uber").first
             else -> ActionExecutionResult(false, "Tool \"${toolCall.tool}\" requires multi-step execution.")
+        }
+    }
+
+    data class ResolvedAppLaunch(
+        val displayName: String,
+        val packageName: String
+    )
+
+    fun resolveAppLaunch(context: Context, rawQuery: String): ResolvedAppLaunch? {
+        val query = rawQuery.trim()
+        if (query.isBlank()) return null
+
+        val pm = context.packageManager
+        val normalizedQuery = AppNameFuzzyMatcher.normalize(query)
+
+        for (hintPkg in AppNameFuzzyMatcher.aliasPackageHints(normalizedQuery)) {
+            val directIntent = pm.getLaunchIntentForPackage(hintPkg)
+            if (directIntent != null) {
+                return ResolvedAppLaunch(
+                    displayName = FastPathMatcher.prettifyAppName(query),
+                    packageName = hintPkg
+                )
+            }
+        }
+
+        val matched = InstalledAppCache.findBestMatch(context, query, forceRefresh = false)
+            ?: InstalledAppCache.findBestMatch(context, query, forceRefresh = true)
+            ?: return null
+
+        return if (pm.getLaunchIntentForPackage(matched.packageName) != null) {
+            ResolvedAppLaunch(
+                displayName = matched.displayName,
+                packageName = matched.packageName
+            )
+        } else {
+            null
+        }
+    }
+
+    fun openRideApp(context: Context, rideAppName: String): Pair<ActionExecutionResult, String?> {
+        val prettyApp = HybridToolRouting.normalizeRideAppName(rideAppName)
+        val targetPkg = HybridToolRouting.ridePackageForApp(prettyApp)
+        val pm = context.packageManager
+        val directIntent = pm.getLaunchIntentForPackage(targetPkg)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        }
+        if (directIntent != null) {
+            return runCatching {
+                context.startActivity(directIntent)
+                ActionExecutionResult(true, "Opened $prettyApp") to targetPkg
+            }.getOrElse { err ->
+                ActionExecutionResult(false, "Could not open $prettyApp: ${err.message}") to targetPkg
+            }
+        }
+
+        val resolved = resolveAppLaunch(context, prettyApp)
+            ?: return ActionExecutionResult(false, "$prettyApp is not installed on this device.") to targetPkg
+        val launchIntent = pm.getLaunchIntentForPackage(resolved.packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        } ?: return ActionExecutionResult(false, "$prettyApp cannot be launched.") to resolved.packageName
+
+        return runCatching {
+            context.startActivity(launchIntent)
+            ActionExecutionResult(true, "Opened ${resolved.displayName}") to resolved.packageName
+        }.getOrElse { err ->
+            ActionExecutionResult(false, "Could not open ${resolved.displayName}: ${err.message}") to resolved.packageName
         }
     }
 
@@ -172,38 +239,18 @@ object NativeToolExecutor {
         }
 
         val pm = context.packageManager
-        val normalizedQuery = AppNameFuzzyMatcher.normalize(query)
-
-        // 1. Direct package hint fast launch (<15ms)
-        for (hintPkg in AppNameFuzzyMatcher.aliasPackageHints(normalizedQuery)) {
-            val directIntent = pm.getLaunchIntentForPackage(hintPkg)?.apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-            }
-            if (directIntent != null) {
-                val label = FastPathMatcher.prettifyAppName(query)
-                return runCatching {
-                    context.startActivity(directIntent)
-                    ActionExecutionResult(true, "Opened $label")
-                }.getOrElse { err ->
-                    ActionExecutionResult(false, "Failed to open $label: ${err.message}")
-                }
-            }
-        }
-
-        // 2. Fuzzy search across cached installed launcher apps (re-querying fresh if not in cache)
-        val matched = InstalledAppCache.findBestMatch(context, query, forceRefresh = false)
-            ?: InstalledAppCache.findBestMatch(context, query, forceRefresh = true)
+        val resolved = resolveAppLaunch(context, query)
             ?: return ActionExecutionResult(false, "Could not find installed app matching \"$query\".")
 
-        val launchIntent = pm.getLaunchIntentForPackage(matched.packageName)?.apply {
+        val launchIntent = pm.getLaunchIntentForPackage(resolved.packageName)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-        } ?: return ActionExecutionResult(false, "App \"${matched.displayName}\" cannot be launched.")
+        } ?: return ActionExecutionResult(false, "App \"${resolved.displayName}\" cannot be launched.")
 
         return runCatching {
             context.startActivity(launchIntent)
-            ActionExecutionResult(true, "Opened ${matched.displayName}")
+            ActionExecutionResult(true, "Opened ${resolved.displayName}")
         }.getOrElse { err ->
-            ActionExecutionResult(false, "Failed to open ${matched.displayName}: ${err.message}")
+            ActionExecutionResult(false, "Failed to open ${resolved.displayName}: ${err.message}")
         }
     }
 

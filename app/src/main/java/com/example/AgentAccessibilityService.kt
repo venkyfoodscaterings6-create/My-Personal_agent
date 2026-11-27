@@ -269,7 +269,54 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Zero-clutter passive service: UI trees are captured strictly on demand when executing commands.
+        if (event == null) return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val pkg = event.packageName?.toString()?.trim().orEmpty()
+            if (isTrackableExternalPackage(pkg, packageName)) {
+                lastExternalForegroundPackage = pkg
+            }
+        }
+    }
+
+    private fun isTrackableExternalPackage(pkg: String, ownPkg: String): Boolean {
+        if (pkg.isBlank() || pkg == ownPkg) return false
+        val lower = pkg.lowercase()
+        if (lower == "android" || lower == "com.android.systemui") return false
+        if (lower.contains("inputmethod") || lower.contains("keyboard") || lower.contains("gboard") || lower.contains("swiftkey")) {
+            return false
+        }
+        return true
+    }
+
+    private fun currentVisibleExternalPackage(): String? {
+        val ownPkg = packageName
+        val rootPkg = runCatching { rootInActiveWindow?.packageName?.toString()?.trim() }.getOrNull().orEmpty()
+        if (isTrackableExternalPackage(rootPkg, ownPkg)) {
+            lastExternalForegroundPackage = rootPkg
+            return rootPkg
+        }
+        val windowPkg = runCatching {
+            windows?.firstOrNull { win ->
+                val p = win.root?.packageName?.toString()?.trim().orEmpty()
+                isTrackableExternalPackage(p, ownPkg)
+            }?.root?.packageName?.toString()?.trim()
+        }.getOrNull().orEmpty()
+        if (windowPkg.isNotBlank()) {
+            lastExternalForegroundPackage = windowPkg
+            return windowPkg
+        }
+        return lastExternalForegroundPackage.takeIf { it.isNotBlank() }
+            ?: rootPkg.takeIf { it.isNotBlank() }
+    }
+
+    private fun speakImmediateAck(phrase: String) {
+        if (phrase.isBlank()) return
+        if (!latestVoiceSettings.speakRepliesAloud) return
+        AgentSpeechFeedback.speak(
+            context = applicationContext,
+            text = phrase,
+            voiceSettings = latestVoiceSettings
+        )
     }
 
     override fun onInterrupt() {
@@ -336,9 +383,15 @@ class AgentAccessibilityService : AccessibilityService() {
         val totalPlanSteps = plan.steps.size.coerceAtLeast(3)
 
         activeTaskJob = serviceScope.launch {
+            val appLabel = if (messagingApp.contains("whatsapp", ignoreCase = true) || messagingApp.equals("wa", ignoreCase = true)) {
+                "WhatsApp"
+            } else {
+                "Messages"
+            }
             val openPhase = "Opening chat for $contactOrNumber…"
             publishRunningState(plan.actionId, openPhase, startMillis, completedSteps = 0, activeStep = 0)
             updateOverlayAndNotification(openPhase)
+            speakImmediateAck("On it, opening $appLabel…")
 
             try {
                 val launch = withContext(Dispatchers.Main) {
@@ -351,14 +404,12 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
 
                 if (!launch.success) {
-                    emitCompletion(
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.Failed(launch.summary),
                         completedSteps = 0,
-                        message = launch.summary,
-                        notes = launch.summary,
-                        durationLabel = "Failed · ${formatElapsed(System.currentTimeMillis() - startMillis)}",
-                        isError = true
+                        elapsed = elapsed
                     )
                     return@launch
                 }
@@ -368,6 +419,7 @@ class AgentAccessibilityService : AccessibilityService() {
                 updateOverlayAndNotification(waitPhase)
 
                 var sendNode: ScreenNode? = null
+                var messagingAppOpened = false
                 val ownPkg = packageName
 
                 // Poll every 500ms up to 4 seconds (8 ticks)
@@ -389,7 +441,8 @@ class AgentAccessibilityService : AccessibilityService() {
                         }
                     }
 
-                    if (snap.packageName == ownPkg) continue
+                    if (snap.packageName == ownPkg || snap.packageName == "unknown") continue
+                    messagingAppOpened = true
 
                     val candidate = SendButtonMatcher.findBestSendButton(snap.nodes)
                         ?: withContext(Dispatchers.Main) { findSendButtonInLiveTree() }
@@ -408,17 +461,28 @@ class AgentAccessibilityService : AccessibilityService() {
                     return@launch
                 }
 
+                if (!messagingAppOpened) {
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.Failed("Messaging app did not open on screen"),
+                        completedSteps = 0,
+                        elapsed = elapsed
+                    )
+                    return@launch
+                }
+
                 if (sendNode == null) {
                     val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                    val appLabel = if (launch.isWhatsApp) "WhatsApp" else "SMS"
-                    emitCompletion(
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.PartialSuccess(
+                            whatWorked = "typed the message",
+                            whatFailed = "tap the Send button"
+                        ),
                         completedSteps = 1,
-                        message = "Opened $appLabel for ${launch.displayName} with your text, but could not find the Send button automatically ($elapsed). Tap Send manually if needed.",
-                        notes = "Send button not found in $appLabel",
-                        durationLabel = "Needs manual tap · $elapsed",
-                        isError = true
+                        elapsed = elapsed,
+                        durationTagOverride = "Needs manual tap · $elapsed"
                     )
                     return@launch
                 }
@@ -463,36 +527,35 @@ class AgentAccessibilityService : AccessibilityService() {
 
                 val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
                 if (textCleared) {
-                    val summary = ConfirmationFormatter.formatSuccess(
-                        "Message sent to ${launch.displayName}",
-                        elapsed
-                    )
-                    emitCompletion(
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.COMPLETED,
+                        result = ToolExecutionResult.VerifiedSuccess("Message sent to ${launch.displayName}"),
                         completedSteps = totalPlanSteps,
-                        message = summary,
-                        notes = summary,
-                        durationLabel = "Sent · $elapsed"
+                        elapsed = elapsed,
+                        durationTagOverride = "Sent · $elapsed"
                     )
                 } else {
-                    val appLabel = if (launch.isWhatsApp) "WhatsApp" else "SMS"
-                    val failMsg = ConfirmationFormatter.formatFailure(
-                        "Tapped Send in $appLabel for ${launch.displayName}, but the text box did not clear. Please check the chat.",
-                        elapsed
-                    )
-                    emitCompletion(
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.PartialSuccess(
+                            whatWorked = "typed the message",
+                            whatFailed = "tap the Send button"
+                        ),
                         completedSteps = 2,
-                        message = failMsg,
-                        notes = "Text box did not clear after tapping Send",
-                        durationLabel = "Unverified · $elapsed",
-                        isError = true
+                        elapsed = elapsed,
+                        durationTagOverride = "Unverified · $elapsed"
                     )
                 }
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected error sending message"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
@@ -624,13 +687,13 @@ class AgentAccessibilityService : AccessibilityService() {
                     return@launch
                 }
 
-                val snap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                val beforeSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
                 if (blockSensitive) {
                     val violation = SafetyGuardrail.detectSensitiveViolation(targetText)
                         ?: SafetyGuardrail.detectSensitiveScreen(
-                            packageName = snap.packageName,
+                            packageName = beforeSnap.packageName,
                             ownPackageName = packageName,
-                            nodes = snap.nodes
+                            nodes = beforeSnap.nodes
                         )
                     if (violation != null) {
                         emitBlocked(plan.actionId, violation)
@@ -639,57 +702,59 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
 
                 val match = withContext(Dispatchers.Main) { findNodeMatchingTargetText(targetText) }
-                    ?: snap.nodes.firstOrNull { node ->
+                    ?: beforeSnap.nodes.firstOrNull { node ->
                         node.text.contains(targetText, ignoreCase = true) ||
                             node.contentDescription.contains(targetText, ignoreCase = true) ||
                             node.aggregatedLabel.contains(targetText, ignoreCase = true)
                     }
 
-                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
                 if (match == null) {
-                    val failMsg = ConfirmationFormatter.formatFailure(
-                        "Could not find \"$targetText\" on the current screen.",
-                        elapsed
-                    )
-                    emitCompletion(
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.Failed("Couldn't find or interact with that element on screen"),
                         completedSteps = 0,
-                        message = failMsg,
-                        notes = failMsg,
-                        durationLabel = "Not found · $elapsed",
-                        isError = true
+                        elapsed = elapsed,
+                        durationTagOverride = "Not found · $elapsed"
                     )
                     return@launch
                 }
 
                 val tapRes = performSmartTap(match, match.centerX, match.centerY)
+                delay(450L)
+                val afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                val screenChanged = afterSnap.treeHash != beforeSnap.treeHash ||
+                    afterSnap.packageName != beforeSnap.packageName
                 val finalElapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                val matchedLabel = match.text.ifBlank { match.contentDescription }.ifBlank { match.aggregatedLabel }.ifBlank { targetText }.take(44)
-                if (tapRes.success) {
-                    val successMsg = ConfirmationFormatter.formatSuccess("Tapped \"$matchedLabel\"", finalElapsed)
-                    emitCompletion(
+                val matchedLabel = match.text.ifBlank { match.contentDescription }
+                    .ifBlank { match.aggregatedLabel }.ifBlank { targetText }.take(44)
+
+                if (tapRes.success && screenChanged) {
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.COMPLETED,
+                        result = ToolExecutionResult.VerifiedSuccess("Tapped \"$matchedLabel\""),
                         completedSteps = plan.steps.size.coerceAtLeast(1),
-                        message = successMsg,
-                        notes = successMsg,
-                        durationLabel = "Tapped · $finalElapsed"
+                        elapsed = finalElapsed,
+                        durationTagOverride = "Tapped · $finalElapsed"
                     )
                 } else {
-                    val failMsg = ConfirmationFormatter.formatFailure(tapRes.summary, finalElapsed)
-                    emitCompletion(
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.Failed("Couldn't find or interact with that element on screen"),
                         completedSteps = 0,
-                        message = failMsg,
-                        notes = failMsg,
-                        durationLabel = "Failed · $finalElapsed",
-                        isError = true
+                        elapsed = finalElapsed
                     )
                 }
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Couldn't interact with that element on screen"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
@@ -771,32 +836,105 @@ class AgentAccessibilityService : AccessibilityService() {
                     emitCancelled(plan.actionId, "Stopped by user.")
                     return@launch
                 }
+                val beforeSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
                 val res = performScroll(direction)
+                delay(450L)
+                val afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                val screenChanged = afterSnap.treeHash != beforeSnap.treeHash ||
+                    afterSnap.packageName != beforeSnap.packageName
                 val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                val formatted = if (res.success) {
-                    ConfirmationFormatter.formatSuccess(res.summary, elapsed)
+
+                if (res.success && screenChanged) {
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.VerifiedSuccess(res.summary),
+                        completedSteps = plan.steps.size.coerceAtLeast(1),
+                        elapsed = elapsed,
+                        durationTagOverride = "${res.summary} · $elapsed"
+                    )
                 } else {
-                    ConfirmationFormatter.formatFailure(res.summary, elapsed)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.Failed("Couldn't find or interact with that element on screen"),
+                        completedSteps = 0,
+                        elapsed = elapsed
+                    )
                 }
-                emitCompletion(
-                    actionId = plan.actionId,
-                    status = if (res.success) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED,
-                    completedSteps = if (res.success) plan.steps.size.coerceAtLeast(1) else 0,
-                    message = formatted,
-                    notes = res.summary,
-                    durationLabel = if (res.success) "${res.summary} · $elapsed" else "Failed · $elapsed",
-                    isError = !res.success
-                )
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Scroll failed"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
         }
     }
 
+    private suspend fun waitForForegroundPackage(
+        expectedPackage: String?,
+        appDisplayName: String? = null,
+        timeoutMs: Long = 2500L
+    ): Boolean {
+        val ticks = (timeoutMs / 250L).toInt().coerceAtLeast(1)
+        for (i in 0 until ticks) {
+            if (isStopRequested()) return false
+            val activePkg = withContext(Dispatchers.Main) {
+                rootInActiveWindow?.packageName?.toString()?.trim().orEmpty()
+            }
+            if (activePkg.isNotBlank() && activePkg != packageName) {
+                val exactMatch = !expectedPackage.isNullOrBlank() &&
+                    activePkg.equals(expectedPackage, ignoreCase = true)
+                val nameMatch = !appDisplayName.isNullOrBlank() &&
+                    HybridToolRouting.isPackageMatchingAppName(activePkg, appDisplayName)
+                if (exactMatch || nameMatch) {
+                    lastExternalForegroundPackage = activePkg
+                    return true
+                }
+            }
+            delay(250L)
+        }
+        return false
+    }
+
+    private suspend fun executeVerifiedOpenApp(appName: String): ToolExecutionResult {
+        val resolved = withContext(Dispatchers.Main) {
+            NativeToolExecutor.resolveAppLaunch(this@AgentAccessibilityService, appName)
+        } ?: return ToolExecutionResult.Failed("Could not find installed app matching \"$appName\"")
+
+        val currentPkg = withContext(Dispatchers.Main) {
+            rootInActiveWindow?.packageName?.toString()?.trim().orEmpty()
+        }
+        if (currentPkg.equals(resolved.packageName, ignoreCase = true)) {
+            return ToolExecutionResult.VerifiedSuccess("${resolved.displayName} is already open")
+        }
+
+        val launchRes = withContext(Dispatchers.Main) {
+            NativeToolExecutor.openApp(this@AgentAccessibilityService, appName)
+        }
+        if (!launchRes.success) {
+            return ToolExecutionResult.Failed(launchRes.summary)
+        }
+
+        val switched = waitForForegroundPackage(
+            expectedPackage = resolved.packageName,
+            appDisplayName = resolved.displayName,
+            timeoutMs = 2500L
+        )
+        return if (switched) {
+            ToolExecutionResult.VerifiedSuccess("Opened ${resolved.displayName}")
+        } else {
+            ToolExecutionResult.Failed("App did not open on screen")
+        }
+    }
+
     /**
-     * Background-safe direct native tool runner (used by VoiceOverlayActivity right after dismissing).
+     * Background-safe direct native tool runner with strict 3-state post-action verification.
      */
     fun startDirectAction(plan: ActionPlan, toolCall: RoutedToolCall) {
         activeTaskJob?.cancel()
@@ -812,26 +950,170 @@ class AgentAccessibilityService : AccessibilityService() {
                     emitCancelled(plan.actionId, "Stopped by user.")
                     return@launch
                 }
-                val res = withContext(Dispatchers.Main) {
-                    NativeToolExecutor.executeDirectTool(this@AgentAccessibilityService, toolCall)
-                }
-                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                val formatted = if (res.success) {
-                    ConfirmationFormatter.formatSuccess(res.summary, elapsed)
+
+                val result: ToolExecutionResult = if (toolCall.tool == ToolName.OPEN_APP) {
+                    executeVerifiedOpenApp(toolCall.appName.orEmpty())
                 } else {
-                    ConfirmationFormatter.formatFailure(res.summary, elapsed)
+                    val res = withContext(Dispatchers.Main) {
+                        NativeToolExecutor.executeDirectTool(this@AgentAccessibilityService, toolCall)
+                    }
+                    if (res.success) {
+                        ToolExecutionResult.VerifiedSuccess(res.summary)
+                    } else {
+                        ToolExecutionResult.Failed(res.summary)
+                    }
                 }
-                emitCompletion(
+
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
                     actionId = plan.actionId,
-                    status = if (res.success) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED,
-                    completedSteps = if (res.success) plan.steps.size.coerceAtLeast(1) else 0,
-                    message = formatted,
-                    notes = res.summary,
-                    durationLabel = if (res.success) "${res.summary} · $elapsed" else "Failed · $elapsed",
-                    isError = !res.success
+                    result = result,
+                    completedSteps = if (result.isVerifiedSuccess) plan.steps.size.coerceAtLeast(1) else 0,
+                    elapsed = elapsed
                 )
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected error"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
+            } finally {
+                dismissOverlayAndNotification()
+            }
+        }
+    }
+
+    /**
+     * Ride booking workflow (Uber / Ola / Rapido) with mandatory Safe Final Check:
+     * 1. Launch Uber / Ola / Rapido directly and verify foreground switch.
+     * 2. Hand off to ui_automate to tap "Where to?" / destination box, type destination,
+     *    select matching drop location, and reach ride-selection screen.
+     * 3. STOP strictly before tapping Confirm / Book / Pay and speak aloud the safe handoff prompt.
+     */
+    fun startBookRide(
+        plan: ActionPlan,
+        rideApp: String?,
+        destination: String?,
+        provider: AiProvider?,
+        blockSensitive: Boolean,
+        conversationHistory: List<ChatMessage> = emptyList(),
+        initialDelayMs: Long = 160L
+    ) {
+        activeTaskJob?.cancel()
+        clearStopRequest()
+
+        val startMillis = System.currentTimeMillis()
+        val prettyApp = HybridToolRouting.normalizeRideAppName(rideApp)
+        val targetPkg = HybridToolRouting.ridePackageForApp(prettyApp)
+        val cleanDest = destination?.trim().orEmpty()
+
+        activeTaskJob = serviceScope.launch {
+            val openPhase = "Opening $prettyApp…"
+            publishRunningState(plan.actionId, openPhase, startMillis, completedSteps = 0, activeStep = 0)
+            updateOverlayAndNotification(openPhase)
+            speakImmediateAck("On it, opening $prettyApp…")
+
+            try {
+                if (initialDelayMs > 0L) delay(initialDelayMs)
+                if (isStopRequested()) {
+                    emitCancelled(plan.actionId, "Stopped by user.")
+                    return@launch
+                }
+
+                val alreadyInRideApp = withContext(Dispatchers.Main) {
+                    val cur = rootInActiveWindow?.packageName?.toString()?.trim().orEmpty()
+                    cur.equals(targetPkg, ignoreCase = true) ||
+                        HybridToolRouting.isPackageMatchingAppName(cur, prettyApp)
+                }
+
+                var openedPkg: String? = targetPkg
+                if (!alreadyInRideApp) {
+                    val (launchRes, pkg) = withContext(Dispatchers.Main) {
+                        NativeToolExecutor.openRideApp(this@AgentAccessibilityService, prettyApp)
+                    }
+                    openedPkg = pkg
+                    if (!launchRes.success) {
+                        val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                        emitToolResult(
+                            actionId = plan.actionId,
+                            result = ToolExecutionResult.Failed(launchRes.summary),
+                            completedSteps = 0,
+                            elapsed = elapsed
+                        )
+                        return@launch
+                    }
+
+                    val switched = waitForForegroundPackage(
+                        expectedPackage = openedPkg,
+                        appDisplayName = prettyApp,
+                        timeoutMs = 2500L
+                    )
+                    if (!switched) {
+                        val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                        emitToolResult(
+                            actionId = plan.actionId,
+                            result = ToolExecutionResult.Failed("$prettyApp did not open on screen"),
+                            completedSteps = 0,
+                            elapsed = elapsed
+                        )
+                        return@launch
+                    }
+                }
+
+                if (cleanDest.isBlank()) {
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.PartialSuccess(
+                            whatWorked = "opened $prettyApp",
+                            whatFailed = "set a destination because no drop location was specified"
+                        ),
+                        completedSteps = 1,
+                        elapsed = elapsed,
+                        durationTagOverride = "Destination needed · $elapsed"
+                    )
+                    return@launch
+                }
+
+                // Wait briefly for Uber/Ola/Rapido home screen widgets to render
+                delay(700L)
+                if (isStopRequested()) {
+                    emitCancelled(plan.actionId, "Stopped by user.")
+                    return@launch
+                }
+
+                val automationGoal = "You are inside $prettyApp ($openedPkg). Do NOT relaunch $prettyApp. " +
+                    "Tap the 'Where to?' / destination input box, type \"$cleanDest\", select the matching drop location suggestion, " +
+                    "and navigate to the ride-selection / fare preview screen. " +
+                    "STOP immediately once fares/ride options appear and return done — NEVER tap Confirm, Book, Request, or Pay."
+
+                runAiAutomationLoop(
+                    plan = plan,
+                    goal = automationGoal,
+                    provider = provider,
+                    blockSensitive = blockSensitive,
+                    maxSteps = 12,
+                    loopStartMillis = startMillis,
+                    initialHistory = listOf("Opened $prettyApp on screen"),
+                    conversationHistory = conversationHistory,
+                    stopBeforeConfirmButton = true,
+                    rideBookingAppName = prettyApp,
+                    fallbackPartialOnFail = "opened $prettyApp" to "set your destination to $cleanDest"
+                )
+            } catch (_: CancellationException) {
+                emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected error while opening $prettyApp"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
@@ -862,20 +1144,19 @@ class AgentAccessibilityService : AccessibilityService() {
             val launchPhase = "Opening YouTube for \"$query\"…"
             publishRunningState(plan.actionId, launchPhase, startMillis, completedSteps = 0, activeStep = 0)
             updateOverlayAndNotification(launchPhase)
+            speakImmediateAck("Playing that on YouTube…")
 
             try {
                 val launchRes = withContext(Dispatchers.Main) {
                     NativeToolExecutor.searchYouTube(this@AgentAccessibilityService, query)
                 }
                 if (!launchRes.success) {
-                    emitCompletion(
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.FAILED,
+                        result = ToolExecutionResult.Failed(launchRes.summary),
                         completedSteps = 0,
-                        message = launchRes.summary,
-                        notes = launchRes.summary,
-                        durationLabel = "Failed · ${formatElapsed(System.currentTimeMillis() - startMillis)}",
-                        isError = true
+                        elapsed = elapsed
                     )
                     return@launch
                 }
@@ -887,6 +1168,7 @@ class AgentAccessibilityService : AccessibilityService() {
 
                 var candidateVideo: ScreenNode? = null
                 var latestSnapshot: ScreenSnapshot? = null
+                var youtubeOpened = false
                 val screenH = resources.displayMetrics.heightPixels.coerceAtLeast(1)
 
                 for (poll in 0 until 8) {
@@ -913,14 +1195,28 @@ class AgentAccessibilityService : AccessibilityService() {
                         snap.packageName.contains("chrome", ignoreCase = true) ||
                         snap.packageName.contains("browser", ignoreCase = true)
 
-                    if (isYouTubeOrBrowser && snap.nodes.size >= 4) {
-                        candidateVideo = findFirstPlayableYouTubeVideo(snap, screenH)
-                        if (candidateVideo != null) break
+                    if (isYouTubeOrBrowser) {
+                        youtubeOpened = true
+                        if (snap.nodes.size >= 4) {
+                            candidateVideo = findFirstPlayableYouTubeVideo(snap, screenH)
+                            if (candidateVideo != null) break
+                        }
                     }
                 }
 
                 if (!isActive || isStopRequested()) {
                     emitCancelled(plan.actionId, "Stopped while waiting for YouTube results.")
+                    return@launch
+                }
+
+                if (!youtubeOpened) {
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.Failed("YouTube did not open on screen"),
+                        completedSteps = 0,
+                        elapsed = elapsed
+                    )
                     return@launch
                 }
 
@@ -969,45 +1265,42 @@ class AgentAccessibilityService : AccessibilityService() {
                     } else {
                         "Playing \"$query\" on YouTube"
                     }
-                    val summary = ConfirmationFormatter.formatSuccess(detail, elapsed)
-                    emitCompletion(
+                    emitToolResult(
                         actionId = plan.actionId,
-                        status = ApprovalStatus.COMPLETED,
+                        result = ToolExecutionResult.VerifiedSuccess(detail),
                         completedSteps = totalPlanSteps,
-                        message = summary,
-                        notes = summary,
-                        durationLabel = "Playing · $elapsed"
+                        elapsed = elapsed,
+                        durationTagOverride = "Playing · $elapsed"
                     )
                     return@launch
                 }
 
-                // Fallback into AI UI loop if YouTube layout varied or video player wasn't confirmed yet
-                if (provider != null && isActive && !isStopRequested()) {
+                // Fallback into AI UI loop (supports both custom provider and Built-in Gemini when provider == null)
+                if (isActive && !isStopRequested()) {
                     runAiAutomationLoop(
                         plan = plan,
-                        goal = "Tap the first playable non-ad video for \"$query\" on YouTube and confirm the video player opens.",
+                        goal = "YouTube search results for \"$query\" are open. Do NOT relaunch YouTube. Tap the first playable non-ad video and verify the video player opens.",
                         provider = provider,
                         blockSensitive = blockSensitive,
-                        maxSteps = 6,
+                        maxSteps = 5,
                         loopStartMillis = startMillis,
                         initialHistory = listOf(
                             "Opened YouTube search for \"$query\""
                         ) + if (tappedLabel.isNotBlank()) listOf("Attempted tap on \"$tappedLabel\"") else emptyList(),
-                        conversationHistory = conversationHistory
-                    )
-                } else if (!isStopRequested()) {
-                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
-                    emitCompletion(
-                        actionId = plan.actionId,
-                        status = ApprovalStatus.COMPLETED,
-                        completedSteps = totalPlanSteps,
-                        message = ConfirmationFormatter.formatSuccess("Opened YouTube search for \"$query\"", elapsed),
-                        notes = "Opened YouTube search for \"$query\"",
-                        durationLabel = "Opened · $elapsed"
+                        conversationHistory = conversationHistory,
+                        fallbackPartialOnFail = "opened YouTube search" to "tap the video to play it"
                     )
                 }
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected error playing YouTube video"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
@@ -1050,6 +1343,14 @@ class AgentAccessibilityService : AccessibilityService() {
                 )
             } catch (_: CancellationException) {
                 emitCancelled(plan.actionId, "Stopped by user.")
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - loopStartMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected UI automation error"),
+                    completedSteps = 0,
+                    elapsed = elapsed
+                )
             } finally {
                 dismissOverlayAndNotification()
             }
@@ -1064,16 +1365,23 @@ class AgentAccessibilityService : AccessibilityService() {
         maxSteps: Int,
         loopStartMillis: Long,
         initialHistory: List<String>,
-        conversationHistory: List<ChatMessage> = emptyList()
+        conversationHistory: List<ChatMessage> = emptyList(),
+        stopBeforeConfirmButton: Boolean = false,
+        rideBookingAppName: String? = null,
+        fallbackPartialOnFail: Pair<String, String>? = null
     ) {
         val stepLog = initialHistory.toMutableList()
         val totalPlanSteps = plan.steps.size.coerceAtLeast(1)
         var lastActionFeedback: String? = null
         var finishedSummary: String? = null
+        var rideReadyStoppedSafely = false
         var failedMessage: String? = null
         var blockedReason: String? = null
         var consecutiveStagnantSteps = 0
         var lastAutoScrollDir = "down"
+        var anyRealActionPerformed = false
+        var anyScreenChanged = false
+        var lastActionChangedScreen = false
 
         val firstBanner = "Step 1/$maxSteps · Reading screen…"
         publishRunningState(plan.actionId, firstBanner, loopStartMillis, completedSteps = 0, activeStep = 0)
@@ -1132,28 +1440,34 @@ class AgentAccessibilityService : AccessibilityService() {
             )
             updateOverlayAndNotification(thinkBanner)
 
-            val nextResult = if (provider != null) {
-                networkClient.requestNextOnDeviceAction(
-                    provider = provider,
-                    goal = goal,
-                    plannedSteps = plan.steps,
-                    screenSnapshot = snapshot,
-                    stepHistory = stepLog,
-                    stepNumber = step,
-                    maxSteps = maxSteps,
-                    lastActionFeedback = lastActionFeedback,
-                    conversationHistory = conversationHistory
-                )
-            } else {
-                firebaseAiService.requestNextOnDeviceActionWithGemini(
-                    goal = goal,
-                    screenSnapshot = snapshot,
-                    stepHistory = stepLog,
-                    stepNumber = step,
-                    maxSteps = maxSteps,
-                    lastActionFeedback = lastActionFeedback,
-                    conversationHistory = conversationHistory
-                )
+            val nextResult = try {
+                if (provider != null) {
+                    networkClient.requestNextOnDeviceAction(
+                        provider = provider,
+                        goal = goal,
+                        plannedSteps = plan.steps,
+                        screenSnapshot = snapshot,
+                        stepHistory = stepLog,
+                        stepNumber = step,
+                        maxSteps = maxSteps,
+                        lastActionFeedback = lastActionFeedback,
+                        conversationHistory = conversationHistory
+                    )
+                } else {
+                    firebaseAiService.requestNextOnDeviceActionWithGemini(
+                        goal = goal,
+                        screenSnapshot = snapshot,
+                        stepHistory = stepLog,
+                        stepNumber = step,
+                        maxSteps = maxSteps,
+                        lastActionFeedback = lastActionFeedback,
+                        conversationHistory = conversationHistory
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                NextActionApiResult.Error(e.localizedMessage ?: "AI step request failed")
             }
 
             if (isStopRequested()) break
@@ -1179,11 +1493,63 @@ class AgentAccessibilityService : AccessibilityService() {
                         }
                     }
 
+                    // Safe Final Check for ride booking: NEVER tap Confirm / Book / Request / Pay!
+                    if (stopBeforeConfirmButton && nextAction.action == "tap") {
+                        val candidateNode = nextAction.index?.let { idx ->
+                            snapshot.nodes.firstOrNull { it.index == idx }
+                        }
+                        val candidateLabels = listOfNotNull(
+                            candidateNode?.text,
+                            candidateNode?.contentDescription,
+                            candidateNode?.aggregatedLabel,
+                            nextAction.reason
+                        )
+                        if (candidateLabels.any { HybridToolRouting.isRideConfirmButton(it) }) {
+                            rideReadyStoppedSafely = true
+                            finishedSummary = HybridToolRouting.buildRideReadyMessage(rideBookingAppName ?: "Uber")
+                            break
+                        }
+                    }
+
                     if (nextAction.action == "done") {
-                        finishedSummary = nextAction.summary
-                            ?.takeIf { it.isNotBlank() }
-                            ?: "Completed \"${plan.title}\" in ${step - 1} steps."
-                        break
+                        when (
+                            val validation = UiAutomationVerification.validateDoneAction(
+                                stepNumber = step,
+                                maxSteps = maxSteps,
+                                anyRealActionPerformed = anyRealActionPerformed,
+                                anyScreenChanged = anyScreenChanged,
+                                lastActionChangedScreen = lastActionChangedScreen,
+                                evidence = nextAction.evidence,
+                                visibleScreenText = snapshot.compactSummary
+                            )
+                        ) {
+                            is DoneValidationResult.Accepted -> {
+                                if (rideBookingAppName != null) {
+                                    rideReadyStoppedSafely = true
+                                    finishedSummary = HybridToolRouting.buildRideReadyMessage(rideBookingAppName)
+                                } else {
+                                    finishedSummary = nextAction.summary
+                                        ?.takeIf { it.isNotBlank() }
+                                        ?: "Completed \"${plan.title}\" (${validation.evidence.take(40)})"
+                                }
+                                break
+                            }
+
+                            is DoneValidationResult.Rejected -> {
+                                if (!anyScreenChanged && (step >= 2 || !validation.shouldRetry)) {
+                                    failedMessage = "No action took effect on the screen"
+                                    break
+                                }
+                                if (validation.shouldRetry && step < maxSteps) {
+                                    lastActionFeedback = "REJECTED done: ${validation.reason} Take a real visible action first and include exact visible text in \"evidence\"."
+                                    stepLog.add("Step $step (done rejected): ${validation.reason}")
+                                    continue
+                                } else {
+                                    failedMessage = validation.reason
+                                    break
+                                }
+                            }
+                        }
                     }
 
                     val execBanner = "Step $step/$maxSteps · ${nextAction.reason.take(28)}…"
@@ -1192,21 +1558,34 @@ class AgentAccessibilityService : AccessibilityService() {
                     updateOverlayAndNotification(execBanner)
 
                     val beforeHash = snapshot.treeHash
+                    val beforePkg = snapshot.packageName
                     val execResult = performOnDeviceAction(nextAction)
+                    if (execResult.success) {
+                        anyRealActionPerformed = true
+                    }
                     val outcomeTag = if (execResult.success) "OK" else "FAILED"
                     stepLog.add("Step $step (${nextAction.action}) [$outcomeTag]: ${execResult.summary}")
 
-                    // Fast 400ms interruptible pause (4 x 100ms) for UI to settle + instant Stop response
-                    for (tick in 0 until 4) {
+                    // Fast 450ms interruptible pause for UI to settle + instant Stop response
+                    val settleTicks = if (nextAction.action == "open_app") 10 else 5
+                    for (tick in 0 until settleTicks) {
                         if (isStopRequested()) break
                         delay(100L)
                     }
                     if (isStopRequested()) break
 
-                    // Anti-stuck UI-tree hash comparison + automatic scroll-retry recovery
+                    // Anti-stuck UI-tree hash & package comparison + automatic scroll-retry recovery
                     val afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
-                    val screenUnchanged = afterSnap.treeHash == beforeHash && nextAction.action != "open_app"
-                    if (!execResult.success || screenUnchanged) {
+                    val changed = execResult.success && (
+                        afterSnap.treeHash != beforeHash ||
+                            afterSnap.packageName != beforePkg
+                        )
+                    lastActionChangedScreen = changed
+                    if (changed) {
+                        anyScreenChanged = true
+                    }
+
+                    if (!changed) {
                         consecutiveStagnantSteps++
                         if (consecutiveStagnantSteps >= 2 && !isStopRequested()) {
                             val recoveryDir = if (nextAction.action == "scroll" && nextAction.direction == "down") {
@@ -1250,39 +1629,64 @@ class AgentAccessibilityService : AccessibilityService() {
                 plan.actionId,
                 "Agent stopped by user after ${stepLog.size} step(s)."
             )
-            failedMessage != null -> emitCompletion(
-                actionId = plan.actionId,
-                status = ApprovalStatus.FAILED,
-                completedSteps = 0,
-                message = ConfirmationFormatter.formatFailure(failedMessage, totalElapsed),
-                notes = failedMessage,
-                durationLabel = "Failed · $totalElapsed",
-                isError = true
-            )
-            finishedSummary != null -> {
-                val formatted = ConfirmationFormatter.formatSuccess(finishedSummary, totalElapsed)
-                emitCompletion(
+            rideReadyStoppedSafely && finishedSummary != null -> {
+                emitToolResult(
                     actionId = plan.actionId,
-                    status = ApprovalStatus.COMPLETED,
+                    result = ToolExecutionResult.VerifiedSuccess(
+                        summary = "Set destination in ${rideBookingAppName ?: "Uber"}",
+                        customUserMessage = finishedSummary
+                    ),
                     completedSteps = totalPlanSteps,
-                    message = formatted,
-                    notes = formatted.take(180),
-                    durationLabel = "Completed in $totalElapsed"
+                    elapsed = totalElapsed,
+                    durationTagOverride = "Ready to confirm · $totalElapsed"
+                )
+            }
+            finishedSummary != null && anyScreenChanged -> {
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.VerifiedSuccess(finishedSummary),
+                    completedSteps = totalPlanSteps,
+                    elapsed = totalElapsed,
+                    durationTagOverride = "Completed in $totalElapsed"
+                )
+            }
+            fallbackPartialOnFail != null -> {
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.PartialSuccess(
+                        whatWorked = fallbackPartialOnFail.first,
+                        whatFailed = fallbackPartialOnFail.second
+                    ),
+                    completedSteps = 1,
+                    elapsed = totalElapsed,
+                    durationTagOverride = "Partial · $totalElapsed"
+                )
+            }
+            failedMessage != null -> {
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(failedMessage),
+                    completedSteps = 0,
+                    elapsed = totalElapsed
+                )
+            }
+            !anyScreenChanged -> {
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed("No action took effect on the screen"),
+                    completedSteps = 0,
+                    elapsed = totalElapsed
                 )
             }
             else -> {
-                val limitMsg = ConfirmationFormatter.formatFailure(
-                    "Reached the $maxSteps-step limit before finishing \"${plan.title}\". Last step: ${stepLog.lastOrNull() ?: "none"}",
-                    totalElapsed
-                )
-                emitCompletion(
+                emitToolResult(
                     actionId = plan.actionId,
-                    status = ApprovalStatus.FAILED,
+                    result = ToolExecutionResult.Failed(
+                        "Reached the $maxSteps-step limit before verifying completion of \"${plan.title}\""
+                    ),
                     completedSteps = (totalPlanSteps - 1).coerceAtLeast(0),
-                    message = limitMsg,
-                    notes = limitMsg.take(180),
-                    durationLabel = "Stopped at $maxSteps steps · $totalElapsed",
-                    isError = true
+                    elapsed = totalElapsed,
+                    durationTagOverride = "Stopped at $maxSteps steps · $totalElapsed"
                 )
             }
         }
@@ -1814,6 +2218,36 @@ class AgentAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun emitToolResult(
+        actionId: String,
+        result: ToolExecutionResult,
+        completedSteps: Int,
+        elapsed: String,
+        durationTagOverride: String? = null
+    ) {
+        val message = result.toUserMessage(elapsed)
+        val status = if (result.isVerifiedSuccess) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED
+        val notes = when (result) {
+            is ToolExecutionResult.VerifiedSuccess -> result.customUserMessage ?: result.summary
+            is ToolExecutionResult.PartialSuccess -> "Partial: ${result.whatWorked} / couldn't ${result.whatFailed}"
+            is ToolExecutionResult.Failed -> result.reason
+        }
+        val duration = durationTagOverride ?: when (result) {
+            is ToolExecutionResult.VerifiedSuccess -> "Verified · $elapsed"
+            is ToolExecutionResult.PartialSuccess -> "Partial · $elapsed"
+            is ToolExecutionResult.Failed -> "Failed · $elapsed"
+        }
+        emitCompletion(
+            actionId = actionId,
+            status = status,
+            completedSteps = completedSteps,
+            message = message,
+            notes = notes,
+            durationLabel = duration,
+            isError = !result.isVerifiedSuccess
+        )
+    }
+
     private fun emitCompletion(
         actionId: String,
         status: ApprovalStatus,
@@ -1846,16 +2280,21 @@ class AgentAccessibilityService : AccessibilityService() {
             )
         )
 
-        // Persist outcome directly to DataStore so conversation & approval history stay 100% synced
-        // even when triggered from Quick Settings Tile or Notification while MainActivity is closed!
+        // Persist outcome directly to DataStore AND singleton ConversationRepository so conversation & action logs
+        // stay 100% synced even when triggered from Quick Settings Tile or Notification while MainActivity is closed!
         val chatMsg = ChatMessage(
             sender = MessageSender.AGENT,
             text = message,
             isError = isError,
             isBlockedBySafety = status == ApprovalStatus.BLOCKED,
             blockedReason = blockedReason,
-            excludeFromContext = isError || status != ApprovalStatus.COMPLETED
+            excludeFromContext = status == ApprovalStatus.BLOCKED
         )
+        ConversationRepository.recordActionLog(
+            summary = notes.ifBlank { message },
+            status = status.label
+        )
+        ConversationRepository.appendMessagesInMemory(listOf(chatMsg))
         serviceScope.launch {
             localStorage.updateActionStatusInStorage(
                 actionId = actionId,
@@ -1890,6 +2329,9 @@ class AgentAccessibilityService : AccessibilityService() {
     companion object {
         private var instanceRef: WeakReference<AgentAccessibilityService> = WeakReference(null)
 
+        @Volatile
+        private var lastExternalForegroundPackage: String = ""
+
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
@@ -1902,6 +2344,17 @@ class AgentAccessibilityService : AccessibilityService() {
         private val stopFlag = AtomicBoolean(false)
 
         fun getInstance(): AgentAccessibilityService? = instanceRef.get()
+
+        fun getCurrentForegroundApp(ownPackageName: String? = null): String? {
+            val svc = instanceRef.get()
+            if (svc != null) {
+                val visible = svc.currentVisibleExternalPackage()
+                if (!visible.isNullOrBlank() && visible != ownPackageName) {
+                    return visible
+                }
+            }
+            return lastExternalForegroundPackage.takeIf { it.isNotBlank() && it != ownPackageName }
+        }
 
         fun clearStopRequest() {
             stopFlag.set(false)

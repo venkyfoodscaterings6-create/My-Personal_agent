@@ -63,10 +63,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.Color
 import com.example.AgentSqlLogEntity
 import com.example.MemoryEntity
 import com.example.TaskEntity
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.MonoCodeStyle
+import com.example.ui.theme.glassPanel
+import com.example.ui.theme.nestedGlassCard
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -94,13 +98,14 @@ fun MemoryDatabaseScreen(
     var showAddMemoryDialog by remember { mutableStateOf(false) }
     var showAddTaskDialog by remember { mutableStateOf(false) }
 
+    val glass = LocalAgentGlassColors.current
+
     Scaffold(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding()
             .navigationBarsPadding()
             .imePadding(),
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = Color.Transparent,
         floatingActionButton = {
             if (selectedTab == 0 || selectedTab == 1) {
                 FloatingActionButton(
@@ -108,6 +113,8 @@ fun MemoryDatabaseScreen(
                         if (selectedTab == 0) showAddMemoryDialog = true
                         else showAddTaskDialog = true
                     },
+                    containerColor = glass.accentBlue,
+                    contentColor = Color.White,
                     modifier = Modifier.testTag("sql_fab_add")
                 ) {
                     Icon(
@@ -123,48 +130,55 @@ fun MemoryDatabaseScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Top bar
-            Row(
+            // Frosted Glass Top bar
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                    .background(glass.topBarFill)
+                    .statusBarsPadding()
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(
-                        onClick = onBack,
-                        modifier = Modifier.testTag("memory_db_back_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = "Back to Chat"
-                        )
-                    }
-                    Column {
-                        Text(
-                            text = "Agent Memory & SQL DB",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "On-device SQLite · auto-injected into Gemini & Agent",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-                Icon(
-                    imageVector = Icons.Rounded.Storage,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                Row(
                     modifier = Modifier
-                        .padding(end = 14.dp)
-                        .size(22.dp)
-                )
-            }
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = onBack,
+                            modifier = Modifier.testTag("memory_db_back_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                                contentDescription = "Back to Chat"
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = "Agent Memory & SQL DB",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "On-device SQLite · auto-injected into Gemini & Agent",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Icon(
+                        imageVector = Icons.Rounded.Storage,
+                        contentDescription = null,
+                        tint = glass.accentBlue,
+                        modifier = Modifier
+                            .padding(end = 14.dp)
+                            .size(22.dp)
+                    )
+                }
 
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                HorizontalDivider(thickness = 0.5.dp, color = glass.hairlineDivider)
+            }
 
             // SQL Search bar
             OutlinedTextField(
@@ -173,7 +187,7 @@ fun MemoryDatabaseScreen(
                 leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
                 placeholder = { Text("Search SQL tables (memories, tasks, logs)…") },
                 singleLine = true,
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(18.dp),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 10.dp)
@@ -185,8 +199,7 @@ fun MemoryDatabaseScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                    .glassPanel(cornerRadius = 16.dp)
                     .padding(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
@@ -352,9 +365,7 @@ private fun EmptySqlHintCard(title: String, body: String) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+            .glassPanel(cornerRadius = 18.dp)
             .padding(18.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
@@ -377,19 +388,14 @@ private fun MemoryRowCard(
     onTogglePin: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(
-                if (memory.isPinned) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f)
-                else MaterialTheme.colorScheme.surface
-            )
-            .border(
-                width = 1.dp,
-                color = if (memory.isPinned) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
-                else MaterialTheme.colorScheme.outlineVariant,
-                shape = RoundedCornerShape(16.dp)
+            .glassPanel(
+                cornerRadius = 18.dp,
+                fillColor = if (memory.isPinned) glass.accentBlue.copy(alpha = 0.16f) else glass.panelFill,
+                borderColorOverride = if (memory.isPinned) glass.accentBlue.copy(alpha = 0.55f) else null
             )
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -460,9 +466,7 @@ private fun TaskRowCard(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+            .glassPanel(cornerRadius = 18.dp)
             .clickable(onClick = onToggle)
             .padding(horizontal = 12.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -516,9 +520,7 @@ private fun SqlLogRowCard(log: AgentSqlLogEntity) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp))
+            .glassPanel(cornerRadius = 18.dp)
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
@@ -592,8 +594,11 @@ private fun AddMemoryDialog(
     var content by remember { mutableStateOf("") }
     var pinned by remember { mutableStateOf(true) }
 
+    val glass = LocalAgentGlassColors.current
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = glass.dialogFill,
+        shape = RoundedCornerShape(24.dp),
         title = { Text("Save Agent Memory") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -660,8 +665,11 @@ private fun AddTaskDialog(
     var priority by remember { mutableStateOf("MEDIUM") }
     var dueLabel by remember { mutableStateOf("") }
 
+    val glass = LocalAgentGlassColors.current
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = glass.dialogFill,
+        shape = RoundedCornerShape(24.dp),
         title = { Text("Add Personal Task") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {

@@ -487,10 +487,543 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun `voice language cycles cleanly through Auto, English, and Telugu`() {
-        assertEquals(VoiceLanguage.EN_IN, VoiceLanguage.AUTO.next())
+    fun `voice language defaults to Indian English and toggles cleanly with Telugu`() {
+        assertEquals(VoiceLanguage.EN_IN, VoiceSettings().voiceLanguage)
+        assertEquals("en-IN", VoiceLanguage.EN_IN.bcp47Tag)
         assertEquals(VoiceLanguage.TE_IN, VoiceLanguage.EN_IN.next())
-        assertEquals(VoiceLanguage.AUTO, VoiceLanguage.TE_IN.next())
-        assertEquals(AgentMode.SMART_AUTO, AgentUiState().agentMode)
+        assertEquals(VoiceLanguage.EN_IN, VoiceLanguage.TE_IN.next())
+        assertTrue(BuiltInGeminiSettings().googleSearchEnabled)
+        assertEquals(AgentMode.CHAT_ONLY, AgentUiState().agentMode)
+    }
+
+    @Test
+    fun `unified smart router sends normal questions to direct chat and phone commands to tools without mode switch`() {
+        // Conversational greetings, study help, and explanations -> DIRECT_CHAT (never tap screen)
+        val chatPrompts = listOf(
+            "Hi, how are you?",
+            "What is the capital of Japan?",
+            "Explain photosynthesis for my exam",
+            "Write a short email requesting leave tomorrow",
+            "Why is the sky blue?",
+            "Compare Python and Kotlin in a table"
+        )
+        chatPrompts.forEach { prompt ->
+            assertEquals(
+                "Expected DIRECT_CHAT for: $prompt",
+                UnifiedRouteDecision.DIRECT_CHAT,
+                SmartIntentClassifier.decideUnifiedRoute(prompt)
+            )
+        }
+
+        // Phone control requests -> LOCAL_TOOL or AI_TOOL_ROUTER without needing any mode pill
+        val phoneCommands = listOf(
+            "Open YouTube and play lo-fi beats",
+            "Open Zomato and search biryani",
+            "Set an alarm for 6:30 AM",
+            "Set a timer for 10 minutes",
+            "Send a WhatsApp message to Ravi saying hi",
+            "Scroll down and tap the first result",
+            "Turn on WiFi",
+            "Call Mom"
+        )
+        phoneCommands.forEach { cmd ->
+            val route = SmartIntentClassifier.decideUnifiedRoute(cmd)
+            assertTrue(
+                "Expected tool route (not DIRECT_CHAT) for: $cmd, got $route",
+                route == UnifiedRouteDecision.LOCAL_TOOL || route == UnifiedRouteDecision.AI_TOOL_ROUTER
+            )
+        }
+    }
+
+    @Test
+    fun `gemini markdown parser renders bold headings lists code tables and links without raw markers`() {
+        val sample = """
+            ### Quick Summary
+            Here is **Bold Text** and *Italic Text* plus `inline_code`.
+
+            - First **important** item
+            - Second *helpful* item
+
+            1. Step one
+            2. Step two
+
+            ```kotlin
+            val greeting = "Hello"
+            ```
+
+            | Metric | Value |
+            | --- | --- |
+            | Speed | Fast |
+
+            Read more at [Android Docs](https://developer.android.com).
+        """.trimIndent()
+
+        val blocks = com.example.ui.GeminiMarkdownParser.parse(sample)
+        assertTrue(
+            blocks.any {
+                it is com.example.ui.MarkdownBlock.Heading &&
+                    it.level == 3 &&
+                    com.example.ui.GeminiMarkdownParser.flattenInlines(it.inlines) == "Quick Summary"
+            }
+        )
+        assertEquals(2, blocks.count { it is com.example.ui.MarkdownBlock.BulletItem })
+        assertEquals(2, blocks.count { it is com.example.ui.MarkdownBlock.NumberedItem })
+        assertTrue(
+            blocks.any {
+                it is com.example.ui.MarkdownBlock.CodeBlock &&
+                    it.language == "kotlin" &&
+                    it.code.contains("val greeting")
+            }
+        )
+        assertTrue(
+            blocks.any {
+                it is com.example.ui.MarkdownBlock.Table &&
+                    it.headers.map { cell -> com.example.ui.GeminiMarkdownParser.flattenInlines(cell) } == listOf("Metric", "Value") &&
+                    it.rows.size == 1
+            }
+        )
+
+        val renderedPlain = com.example.ui.GeminiMarkdownParser.extractPlainRenderedText(blocks)
+        assertFalse("Raw bold stars leaked: $renderedPlain", renderedPlain.contains("**"))
+        assertFalse("Raw single stars leaked: $renderedPlain", renderedPlain.contains("*"))
+        assertFalse("Raw heading hashes leaked: $renderedPlain", renderedPlain.contains("###"))
+        assertTrue(renderedPlain.contains("Quick Summary"))
+        assertTrue(renderedPlain.contains("Bold Text"))
+        assertTrue(renderedPlain.contains("Italic Text"))
+        assertTrue(renderedPlain.contains("First important item"))
+        assertTrue(renderedPlain.contains("Android Docs"))
+
+        // Streaming partial markdown with unclosed ** must also never leak raw stars
+        val streamingBlocks = com.example.ui.GeminiMarkdownParser.parse("Working on **important update")
+        val streamingRendered = com.example.ui.GeminiMarkdownParser.extractPlainRenderedText(streamingBlocks)
+        assertFalse(streamingRendered.contains("**"))
+        assertTrue(streamingRendered.contains("important update"))
+
+        // Safe web URL validation
+        assertTrue(com.example.ui.GeminiMarkdownParser.isSafeWebUrl("https://developer.android.com"))
+        assertFalse(com.example.ui.GeminiMarkdownParser.isSafeWebUrl("javascript:alert(1)"))
+    }
+
+    @Test
+    fun `patient speech buffer accumulates paused phrases cleanly without overlap`() {
+        val buffer = PatientSpeechBuffer()
+        assertEquals("open youtube", buffer.updatePartial("open youtube"))
+        assertEquals("open youtube", buffer.commitSegment("open youtube"))
+        assertEquals("open youtube and play", buffer.updatePartial("and play"))
+        assertEquals("open youtube and play lo fi music", buffer.commitSegment("and play lo fi music"))
+        assertEquals("open youtube and play lo fi music", buffer.finalizeAll())
+    }
+
+    @Test
+    fun `system prompt injects live date time factual rule and voice grace rule and gemini native payload enables google search`() {
+        val prompt = SystemPromptBuilder.buildRichAssistantSystemPrompt(
+            personalSqlContext = "Favorite coffee: filter coffee",
+            voiceLanguage = VoiceLanguage.EN_IN,
+            hasLiveWebSearch = true
+        )
+        assertTrue(prompt.contains("Current date:"))
+        assertTrue(prompt.contains("Time:"))
+        assertTrue(prompt.contains("Indian English"))
+        assertTrue(prompt.contains("Never fabricate or guess facts"))
+        assertTrue(prompt.contains("Favorite coffee: filter coffee"))
+
+        val client = NetworkClient()
+        val payloadWithSearch = client.buildGeminiPayloadMap(
+            conversationHistory = listOf(ChatMessage(id = "1", sender = MessageSender.USER, text = "Latest news")),
+            systemPrompt = prompt,
+            enableGoogleSearch = true
+        )
+        assertTrue(payloadWithSearch.containsKey("tools"))
+
+        val fakeGeminiResponse = """
+            {
+              "candidates": [{
+                "content": {"parts": [{"text": "Here is the update."}]},
+                "groundingMetadata": {
+                  "groundingChunks": [
+                    {"web": {"title": "BBC News", "uri": "https://www.bbc.com/news"}}
+                  ]
+                }
+              }]
+            }
+        """.trimIndent()
+        val sources = client.parseGeminiGroundingSources(fakeGeminiResponse)
+        assertEquals(1, sources.size)
+        assertEquals("BBC News", sources[0].title)
+        assertEquals("https://www.bbc.com/news", sources[0].uri)
+    }
+
+    @Test
+    fun `styled xlsx generator creates valid multi-sheet workbook zip with formulas and accounting styles`() {
+        val blueprint = com.example.files.FileBlueprint(
+            fileType = com.example.files.GeneratedFileFormat.XLSX,
+            fileName = "monthly_expense_tracker.xlsx",
+            title = "Monthly Expense Tracker (INR)",
+            subtitle = "Personal Budget & Actual Spend Dashboard",
+            categoryTag = "PERSONAL FINANCE",
+            accentColorHex = "#0F766E",
+            executiveSummary = "Tracks monthly household spend across key categories with dynamic Excel formulas.",
+            sheets = listOf(
+                com.example.files.BlueprintSheet(
+                    name = "Summary",
+                    title = "Monthly Budget Summary",
+                    subtitle = "Linked dynamically to Details tab",
+                    columns = listOf(
+                        com.example.files.BlueprintColumn("Category", "text"),
+                        com.example.files.BlueprintColumn("Budget", "currency"),
+                        com.example.files.BlueprintColumn("Actual", "currency"),
+                        com.example.files.BlueprintColumn("Share", "percent")
+                    ),
+                    rows = listOf(
+                        listOf("Housing & Utilities", "22000", "=SUM(Details!C5:C6)", "=C5/\$C\$7"),
+                        listOf("Food & Groceries", "12000", "=SUM(Details!C7:C8)", "=C6/\$C\$7")
+                    ),
+                    totalRow = listOf("Grand Total", "=SUM(B5:B6)", "=SUM(C5:C6)", "=SUM(D5:D6)")
+                ),
+                com.example.files.BlueprintSheet(
+                    name = "Details",
+                    title = "Expense Line Items",
+                    subtitle = "Itemized monthly transactions",
+                    columns = listOf(
+                        com.example.files.BlueprintColumn("Date", "date"),
+                        com.example.files.BlueprintColumn("Description", "text"),
+                        com.example.files.BlueprintColumn("Amount", "currency")
+                    ),
+                    rows = listOf(
+                        listOf("01-Nov-2026", "Apartment Rent", "18500"),
+                        listOf("03-Nov-2026", "Electricity & Broadband", "3200"),
+                        listOf("05-Nov-2026", "Supermarket Groceries", "6400"),
+                        listOf("10-Nov-2026", "Fresh Vegetables & Dairy", "4100")
+                    ),
+                    totalRow = listOf("Total", "", "=SUM(C5:C8)")
+                )
+            )
+        )
+
+        val zipBytes = com.example.files.StyledXlsxGenerator.generateBytes(blueprint)
+        assertTrue("Generated XLSX must be non-empty", zipBytes.size > 1000)
+
+        val entries = mutableMapOf<String, String>()
+        java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(zipBytes)).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                entries[entry.name] = zis.readBytes().toString(Charsets.UTF_8)
+                entry = zis.nextEntry
+            }
+        }
+
+        assertTrue("Missing [Content_Types].xml", entries.containsKey("[Content_Types].xml"))
+        assertTrue("Missing xl/workbook.xml", entries.containsKey("xl/workbook.xml"))
+        assertTrue("Missing xl/styles.xml", entries.containsKey("xl/styles.xml"))
+        assertTrue("Missing xl/worksheets/sheet1.xml", entries.containsKey("xl/worksheets/sheet1.xml"))
+        assertTrue("Missing xl/worksheets/sheet2.xml", entries.containsKey("xl/worksheets/sheet2.xml"))
+
+        val workbookXml = entries.getValue("xl/workbook.xml")
+        assertTrue(workbookXml.contains("""name="Summary""""))
+        assertTrue(workbookXml.contains("""name="Details""""))
+
+        val stylesXml = entries.getValue("xl/styles.xml")
+        assertTrue("Expected ₹ currency format", stylesXml.contains("₹"))
+        assertTrue("Expected accounting double bottom border", stylesXml.contains("""<bottom style="double">"""))
+        assertTrue("Expected dark slate header fill", stylesXml.contains("FF1E293B"))
+
+        val sheet1Xml = entries.getValue("xl/worksheets/sheet1.xml")
+        assertTrue("Expected frozen header pane", sheet1Xml.contains("""ySplit="4""""))
+        assertTrue("Expected cross-sheet <f> formula", sheet1Xml.contains("<f>SUM(Details!C5:C6)</f>"))
+        assertTrue("Expected total <f> formula", sheet1Xml.contains("<f>SUM(B5:B6)</f>"))
+    }
+
+    @Test
+    fun `styled docx generator creates valid word zip with headings callouts and bordered tables`() {
+        val blueprint = com.example.files.FileBlueprint(
+            fileType = com.example.files.GeneratedFileFormat.DOCX,
+            fileName = "quarterly_project_report.docx",
+            title = "Q4 Engineering Delivery Report",
+            subtitle = "Mobile Platform Modernization & Performance",
+            categoryTag = "PROJECT REPORT",
+            accentColorHex = "#1E3A8A",
+            executiveSummary = "All core reliability targets were achieved ahead of schedule with 38% faster startup.",
+            kpiCards = listOf(
+                com.example.files.BlueprintKpiCard("Crash-Free Rate", "99.94%", "+0.4% QoQ"),
+                com.example.files.BlueprintKpiCard("Cold Start", "420 ms", "38% faster")
+            ),
+            sections = listOf(
+                com.example.files.BlueprintSection(
+                    heading = "Key Milestones Delivered",
+                    paragraphs = listOf("The engineering team completed the migration with zero customer downtime."),
+                    bullets = listOf("**Architecture Upgrade:** Migrated core rendering pipeline to lazy Compose layouts."),
+                    callout = com.example.files.BlueprintCallout(
+                        title = "Executive Takeaway",
+                        text = "Prioritize battery telemetry validation before Q1 expansion.",
+                        tone = "tip"
+                    ),
+                    table = com.example.files.BlueprintTable(
+                        headers = listOf("Milestone", "Owner", "Status"),
+                        columnWeights = listOf(2.4f, 1.2f, 1.0f),
+                        alignments = listOf("left", "left", "center"),
+                        rows = listOf(
+                            listOf("Voice Latency Optimization", "Audio Team", "Completed"),
+                            listOf("Offline Document Export", "Core Team", "Completed")
+                        ),
+                        totalRow = listOf("Total Completed", "2 / 2", "100%")
+                    )
+                )
+            )
+        )
+
+        val zipBytes = com.example.files.StyledDocxGenerator.generateBytes(blueprint)
+        assertTrue("Generated DOCX must be non-empty", zipBytes.size > 1000)
+
+        val entries = mutableMapOf<String, String>()
+        java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(zipBytes)).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                entries[entry.name] = zis.readBytes().toString(Charsets.UTF_8)
+                entry = zis.nextEntry
+            }
+        }
+
+        assertTrue(entries.containsKey("[Content_Types].xml"))
+        assertTrue(entries.containsKey("word/document.xml"))
+        assertTrue(entries.containsKey("word/styles.xml"))
+
+        val docXml = entries.getValue("word/document.xml")
+        assertTrue("Expected Heading1 style", docXml.contains("""w:val="Heading1""""))
+        assertTrue("Expected styled table header", docXml.contains("<w:tblHeader/>"))
+        assertTrue("Expected dark header shading", docXml.contains("""w:fill="1E293B""""))
+        assertTrue("Expected document content", docXml.contains("Q4 Engineering Delivery Report"))
+        assertTrue("Expected callout box content", docXml.contains("Executive Takeaway"))
+    }
+
+    @Test
+    fun `file creation requests route deterministically to generate_file with accurate format`() {
+        val excelRoute = HybridToolRouting.matchDirectLocalTool("create an Excel monthly expense tracker")
+        assertNotNull(excelRoute)
+        assertEquals(ToolName.GENERATE_FILE, excelRoute?.tool)
+        assertEquals("xlsx", excelRoute?.label)
+
+        val pdfRoute = HybridToolRouting.matchDirectLocalTool("make a PDF study plan for GATE CSE")
+        assertNotNull(pdfRoute)
+        assertEquals(ToolName.GENERATE_FILE, pdfRoute?.tool)
+        assertEquals("pdf", pdfRoute?.label)
+
+        val docxRoute = HybridToolRouting.matchDirectLocalTool("generate a Word report on renewable energy in India")
+        assertNotNull(docxRoute)
+        assertEquals(ToolName.GENERATE_FILE, docxRoute?.tool)
+        assertEquals("docx", docxRoute?.label)
+
+        val csvRoute = HybridToolRouting.matchDirectLocalTool("export a CSV of top 10 Indian tech stocks")
+        assertNotNull(csvRoute)
+        assertEquals(ToolName.GENERATE_FILE, csvRoute?.tool)
+        assertEquals("csv", csvRoute?.label)
+
+        // Informational questions about file types must NOT trigger file generation
+        assertNull(com.example.files.FileRequestDetector.detect("What is a PDF file?"))
+        assertNull(com.example.files.FileRequestDetector.detect("How does Excel work?"))
+
+        // CSV RFC-4180 escaping preserves commas and quotes
+        assertEquals("\"Rent, Hyderabad\"", com.example.files.CsvGenerator.escapeRfc4180("Rent, Hyderabad"))
+        assertEquals("\"He said \"\"OK\"\"\"", com.example.files.CsvGenerator.escapeRfc4180("He said \"OK\""))
+    }
+
+    @Test
+    fun `follow-up play the first video when YouTube is foreground keeps active session and never calls open_app YouTube`() {
+        ConversationRepository.clearForTest("session-yt-1")
+        ConversationRepository.appendMessagesInMemory(
+            listOf(
+                ChatMessage(id = "u1", sender = MessageSender.USER, text = "Open YouTube"),
+                ChatMessage(id = "a1", sender = MessageSender.AGENT, text = "Yes, completed! Opened YouTube.")
+            )
+        )
+        ConversationRepository.recordActionLog("Opened YouTube", "Completed")
+
+        val followUp = "play the first video"
+        val fgApp = "com.google.android.youtube"
+
+        // Append follow-up into the exact same singleton session (simulating VoiceOverlayActivity / Quick Settings tile)
+        ConversationRepository.appendMessagesInMemory(
+            listOf(ChatMessage(id = "u2", sender = MessageSender.USER, text = followUp))
+        )
+        assertEquals("session-yt-1", ConversationRepository.activeSessionId.value)
+        assertEquals(3, ConversationRepository.messages.value.size)
+
+        // Direct local routing acts on current screen and NEVER calls open_app("YouTube")
+        val localRoute = HybridToolRouting.matchDirectLocalTool(followUp, fgApp)
+        assertNotNull(localRoute)
+        assertEquals(ToolName.UI_AUTOMATE, localRoute?.tool)
+        assertFalse(localRoute?.tool == ToolName.OPEN_APP)
+        assertTrue(localRoute?.goal?.contains("ALREADY open", ignoreCase = true) == true)
+
+        // Even if an AI router mistakenly returned open_app("YouTube"), the foreground guard overrides it
+        val mistakenOpenApp = RoutedToolCall(tool = ToolName.OPEN_APP, appName = "YouTube")
+        val guarded = HybridToolRouting.applyForegroundContextGuard(mistakenOpenApp, followUp, fgApp)
+        assertEquals(ToolName.UI_AUTOMATE, guarded.tool)
+        assertFalse(guarded.tool == ToolName.OPEN_APP)
+
+        // Router prompts always include live currentForegroundApp, recent conversation, action logs, and anti-relaunch rule
+        val systemPrompt = HybridToolRouting.buildRouterSystemPrompt(
+            installedAppSample = listOf("YouTube", "Uber"),
+            safetyRules = SafetyRules()
+        )
+        assertTrue(systemPrompt.contains("If `currentForegroundApp` is ALREADY the app the user is referring to"))
+        assertTrue(systemPrompt.contains("DO NOT relaunch the app from scratch"))
+
+        val userPrompt = HybridToolRouting.buildRouterUserPrompt(
+            userGoal = followUp,
+            currentForegroundApp = fgApp,
+            conversationHistory = ConversationRepository.messages.value
+        )
+        assertTrue(userPrompt.contains("currentForegroundApp: com.google.android.youtube"))
+        assertTrue(userPrompt.contains("Open YouTube"))
+        assertTrue(userPrompt.contains("Opened YouTube"))
+        assertTrue(userPrompt.contains("CURRENT USER REQUEST: play the first video"))
+    }
+
+    @Test
+    fun `book a ride in Uber to airport is allowed by safety guardrail and routes to book_ride with safe final check`() {
+        // Ride booking prompts must NOT be blocked by financial guardrail
+        assertNull(SafetyGuardrail.detectSensitiveViolation("Book a ride in Uber to airport"))
+        assertNull(SafetyGuardrail.detectSensitiveViolation("Open Uber and book a cab to railway station"))
+        assertNull(SafetyGuardrail.detectSensitiveViolation("Book an Ola auto to Hitech City"))
+        assertNull(SafetyGuardrail.detectSensitiveViolation("Book a Rapido bike to Kondapur"))
+
+        // Real financial/UPI/OTP/password requests MUST remain hard-blocked
+        assertNotNull(SafetyGuardrail.detectSensitiveViolation("Pay 500 via UPI PIN 1234"))
+        assertNotNull(SafetyGuardrail.detectSensitiveViolation("Enter my OTP 482910"))
+        assertNotNull(SafetyGuardrail.detectSensitiveViolation("Transfer money from HDFC bank transfer"))
+        assertNotNull(SafetyGuardrail.detectSensitiveViolation("Type my account password"))
+
+        // Routing checks for Uber, default Uber, Ola, and Rapido
+        val uberRoute = HybridToolRouting.matchDirectLocalTool("Book a ride in Uber to airport")
+        assertNotNull(uberRoute)
+        assertEquals(ToolName.BOOK_RIDE, uberRoute?.tool)
+        assertEquals("Uber", uberRoute?.appName)
+        assertEquals("airport", uberRoute?.destination)
+        assertEquals("com.ubercab", HybridToolRouting.ridePackageForApp(uberRoute?.appName))
+
+        val defaultUberRoute = HybridToolRouting.matchDirectLocalTool("book a cab to airport")
+        assertNotNull(defaultUberRoute)
+        assertEquals(ToolName.BOOK_RIDE, defaultUberRoute?.tool)
+        assertEquals("Uber", defaultUberRoute?.appName)
+        assertEquals("airport", defaultUberRoute?.destination)
+
+        val olaRoute = HybridToolRouting.matchDirectLocalTool("Book an Ola to Gachibowli")
+        assertNotNull(olaRoute)
+        assertEquals(ToolName.BOOK_RIDE, olaRoute?.tool)
+        assertEquals("Ola", olaRoute?.appName)
+        assertEquals("Gachibowli", olaRoute?.destination)
+        assertEquals("com.olacabs.customer", HybridToolRouting.ridePackageForApp(olaRoute?.appName))
+
+        val rapidoRoute = HybridToolRouting.matchDirectLocalTool("open Rapido and book a bike to Madhapur")
+        assertNotNull(rapidoRoute)
+        assertEquals(ToolName.BOOK_RIDE, rapidoRoute?.tool)
+        assertEquals("Rapido", rapidoRoute?.appName)
+        assertEquals("Madhapur", rapidoRoute?.destination)
+        assertEquals("com.rapido.passenger", HybridToolRouting.ridePackageForApp(rapidoRoute?.appName))
+
+        // Unified route decision must send ride booking directly to LOCAL_TOOL (not DIRECT_CHAT)
+        assertEquals(
+            UnifiedRouteDecision.LOCAL_TOOL,
+            SmartIntentClassifier.decideUnifiedRoute("Book a ride in Uber to airport")
+        )
+
+        // Safe final check: Confirm / Book / Pay buttons are detected and blocked from auto-tapping
+        assertTrue(HybridToolRouting.isRideConfirmButton("Confirm Uber Go"))
+        assertTrue(HybridToolRouting.isRideConfirmButton("Book Now"))
+        assertTrue(HybridToolRouting.isRideConfirmButton("Confirm"))
+        assertTrue(HybridToolRouting.isRideConfirmButton("Pay Now"))
+        assertFalse(HybridToolRouting.isRideConfirmButton("Where to?"))
+        assertEquals(
+            "I've set your destination in Uber. Please review the fare and tap Confirm to book.",
+            HybridToolRouting.buildRideReadyMessage("Uber")
+        )
+    }
+
+    @Test
+    fun `strict 3-state verification prevents false Yes completed on PartialSuccess or Failed and validates ui_automate done`() {
+        // Failed never contains "Yes, completed"
+        val failedMsg = ToolExecutionResult.Failed("App did not open on screen").toUserMessage("2.5s")
+        assertTrue(failedMsg.startsWith("I couldn't complete that"))
+        assertFalse(failedMsg.contains("Yes, completed", ignoreCase = true))
+
+        // Even if raw error text accidentally includes "Yes, completed", formatter strips it
+        val sanitizedFail = ToolExecutionResult.Failed("Yes, completed! actually failed").toUserMessage()
+        assertFalse(sanitizedFail.contains("Yes, completed", ignoreCase = true))
+        assertTrue(sanitizedFail.startsWith("I couldn't complete that"))
+
+        // PartialSuccess never contains "Yes, completed"
+        val partialYt = ToolExecutionResult.PartialSuccess(
+            whatWorked = "opened YouTube search",
+            whatFailed = "tap the video to play it"
+        ).toUserMessage("3.1s")
+        assertEquals("I opened YouTube search, but I couldn't tap the video to play it. (3.1s)", partialYt)
+        assertFalse(partialYt.contains("Yes, completed", ignoreCase = true))
+
+        val partialMsg = ToolExecutionResult.PartialSuccess(
+            whatWorked = "typed the message",
+            whatFailed = "tap the Send button"
+        ).toUserMessage()
+        assertFalse(partialMsg.contains("Yes, completed", ignoreCase = true))
+
+        // Accessibility disabled message is preserved verbatim without "Yes, completed"
+        val accOffMsg = ToolExecutionResult.Failed(AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE).toUserMessage()
+        assertEquals(AgentReliabilityConstants.ACCESSIBILITY_OFF_MESSAGE, accOffMsg)
+        assertFalse(accOffMsg.contains("Yes, completed", ignoreCase = true))
+
+        // VerifiedSuccess formats with "Yes, completed!"
+        val verifiedMsg = ToolExecutionResult.VerifiedSuccess("Opened YouTube").toUserMessage("0.8s")
+        assertEquals("Yes, completed! Opened YouTube. (0.8s)", verifiedMsg)
+
+        // ui_automate done validation: reject Step 1 with no real action
+        val step1Reject = UiAutomationVerification.validateDoneAction(
+            stepNumber = 1,
+            maxSteps = 10,
+            anyRealActionPerformed = false,
+            anyScreenChanged = false,
+            lastActionChangedScreen = false,
+            evidence = "Home",
+            visibleScreenText = "Home"
+        )
+        assertTrue(step1Reject is DoneValidationResult.Rejected)
+
+        // Reject done when zero screen changes occurred across the whole run
+        val zeroChangeReject = UiAutomationVerification.validateDoneAction(
+            stepNumber = 3,
+            maxSteps = 10,
+            anyRealActionPerformed = true,
+            anyScreenChanged = false,
+            lastActionChangedScreen = false,
+            evidence = "Play",
+            visibleScreenText = "Play"
+        )
+        assertTrue(zeroChangeReject is DoneValidationResult.Rejected)
+        assertFalse((zeroChangeReject as DoneValidationResult.Rejected).shouldRetry)
+        assertEquals("No action took effect on the screen", zeroChangeReject.reason)
+
+        // Reject done when evidence is missing or not on screen
+        val badEvidenceReject = UiAutomationVerification.validateDoneAction(
+            stepNumber = 3,
+            maxSteps = 10,
+            anyRealActionPerformed = true,
+            anyScreenChanged = true,
+            lastActionChangedScreen = true,
+            evidence = "Confirm Uber Go",
+            visibleScreenText = "YouTube Home Subscriptions Shorts"
+        )
+        assertTrue(badEvidenceReject is DoneValidationResult.Rejected)
+
+        // Accept done when real action occurred, screen changed, and exact visible evidence matches
+        val accepted = UiAutomationVerification.validateDoneAction(
+            stepNumber = 2,
+            maxSteps = 10,
+            anyRealActionPerformed = true,
+            anyScreenChanged = true,
+            lastActionChangedScreen = true,
+            evidence = "Pause video",
+            visibleScreenText = "Now playing Lo-Fi Beats Pause video Subscribe Like Share"
+        )
+        assertTrue(accepted is DoneValidationResult.Accepted)
+        assertEquals("Pause video", (accepted as DoneValidationResult.Accepted).evidence)
     }
 }
+

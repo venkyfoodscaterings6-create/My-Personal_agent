@@ -16,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -70,6 +71,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -87,7 +89,9 @@ import com.example.ui.LiveVoiceScreen
 import com.example.ui.MemoryDatabaseScreen
 import com.example.ui.SettingsScreen
 import com.example.ui.SetupGuideScreen
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.PersonalAgentTheme
+import com.example.ui.theme.spatialBackdrop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -287,20 +291,23 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         }
     }
 
-    // Auto-speak newly arriving plain Chat Mode AI replies via shared AgentSpeechFeedback
-    // (Agent Mode confirmations, greetings, and errors are already spoken by AgentAccessibilityService / AgentViewModel)
+    // Auto-speak newly arriving conversational AI replies via shared AgentSpeechFeedback
+    // (Tool execution confirmations like "Yes, completed!" and SQL memory saves are already spoken at source)
     val sessionMountMillis = remember { System.currentTimeMillis() }
     var lastSpokenMessageId by remember { mutableStateOf<String?>(null) }
     val latestMsg = uiState.chatMessages.lastOrNull()
     LaunchedEffect(latestMsg?.id, uiState.voiceSettings.speakRepliesAloud, uiState.destination) {
         if (
             uiState.voiceSettings.speakRepliesAloud &&
-            uiState.agentMode != AgentMode.AGENT_CONTROL &&
             uiState.destination != AppDestination.LIVE_VOICE &&
             latestMsg != null &&
             latestMsg.sender == MessageSender.AGENT &&
             latestMsg.actionPlan == null &&
+            latestMsg.generatedFile == null &&
             !latestMsg.isError &&
+            !latestMsg.isBlockedBySafety &&
+            latestMsg.modelBadge != "SQL Memory" &&
+            !latestMsg.text.startsWith("Yes, completed!") &&
             latestMsg.timestampMillis >= sessionMountMillis &&
             latestMsg.id != lastSpokenMessageId &&
             latestMsg.text.isNotBlank()
@@ -404,8 +411,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
 
     val onToggleMic: () -> Unit = {
         if (isListening) {
-            voiceController.stopListening()
-            voicePartialText = ""
+            // Patient buffer commit: tapping Mic while active sends any words already captured
+            voiceController.stopListeningAndCommit()
         } else {
             val hasMic = ContextCompat.checkSelfPermission(
                 context,
@@ -480,13 +487,28 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
     }
 
     PersonalAgentTheme(themePreference = uiState.themePreference) {
+        val glass = LocalAgentGlassColors.current
+        val drawerItemColors = NavigationDrawerItemDefaults.colors(
+            selectedContainerColor = glass.accentBlue.copy(alpha = 0.24f),
+            selectedIconColor = glass.accentBlue,
+            selectedTextColor = MaterialTheme.colorScheme.onSurface,
+            selectedBadgeColor = glass.accentBlue,
+            unselectedContainerColor = Color.Transparent,
+            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            unselectedTextColor = MaterialTheme.colorScheme.onSurface,
+            unselectedBadgeColor = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         ModalNavigationDrawer(
             drawerState = drawerState,
             gesturesEnabled = uiState.destination == AppDestination.CHAT,
             drawerContent = {
+                val drawerShape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
                 ModalDrawerSheet(
-                    modifier = Modifier.widthIn(max = 312.dp),
-                    drawerContainerColor = MaterialTheme.colorScheme.surface
+                    modifier = Modifier
+                        .widthIn(max = 312.dp)
+                        .border(1.dp, glass.luminousBorderBrush(), drawerShape),
+                    drawerShape = drawerShape,
+                    drawerContainerColor = glass.sheetFill
                 ) {
                     Column(
                         modifier = Modifier
@@ -512,6 +534,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             label = { Text("New Chat") },
                             icon = { Icon(Icons.Outlined.AddComment, contentDescription = null) },
                             selected = false,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 stopAllSpeaking()
@@ -526,7 +549,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         if (uiState.chatThreads.isNotEmpty() || uiState.threadSearchQuery.isNotBlank()) {
                             HorizontalDivider(
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                                thickness = 0.5.dp,
+                                color = glass.hairlineDivider
                             )
                             Text(
                                 text = stringResource(R.string.drawer_saved_chats),
@@ -565,7 +589,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                         null
                                     },
                                     singleLine = true,
-                                    shape = RoundedCornerShape(14.dp),
+                                    shape = RoundedCornerShape(18.dp),
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(horizontal = 14.dp, vertical = 4.dp)
@@ -579,10 +603,21 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(horizontal = 12.dp, vertical = 2.dp)
-                                        .clip(RoundedCornerShape(14.dp))
+                                        .clip(RoundedCornerShape(16.dp))
                                         .background(
-                                            if (isSelected) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
-                                            else MaterialTheme.colorScheme.surface
+                                            if (isSelected) glass.accentBlue.copy(alpha = 0.22f)
+                                            else Color.Transparent
+                                        )
+                                        .then(
+                                            if (isSelected) {
+                                                Modifier.border(
+                                                    1.dp,
+                                                    glass.accentBlue.copy(alpha = 0.45f),
+                                                    RoundedCornerShape(16.dp)
+                                                )
+                                            } else {
+                                                Modifier
+                                            }
                                         )
                                         .clickable {
                                             scope.launch { drawerState.close() }
@@ -598,15 +633,14 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                         imageVector = Icons.Outlined.ChatBubbleOutline,
                                         contentDescription = null,
                                         modifier = Modifier.size(16.dp),
-                                        tint = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
+                                        tint = if (isSelected) glass.accentBlue
                                         else MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
                                             text = thread.title,
                                             style = MaterialTheme.typography.bodyMedium,
-                                            color = if (isSelected) MaterialTheme.colorScheme.onSecondaryContainer
-                                            else MaterialTheme.colorScheme.onSurface,
+                                            color = MaterialTheme.colorScheme.onSurface,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
@@ -636,7 +670,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
 
                         HorizontalDivider(
                             modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                            thickness = 0.5.dp,
+                            color = glass.hairlineDivider
                         )
 
                         NavigationDrawerItem(
@@ -644,6 +679,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             icon = { Icon(Icons.Outlined.AutoAwesome, contentDescription = null) },
                             badge = { Text("3D") },
                             selected = uiState.destination == AppDestination.LIVE_VOICE,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 openLiveVoiceMode()
@@ -661,6 +697,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                 if (total > 0) Text("$total")
                             },
                             selected = uiState.destination == AppDestination.MEMORY_DB,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 viewModel.navigateTo(AppDestination.MEMORY_DB)
@@ -677,6 +714,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                 Text(if (uiState.voiceSettings.wakeWordEnabled) "ON" else "OFF")
                             },
                             selected = uiState.voiceSettings.wakeWordEnabled,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 onToggleWakeWord(!uiState.voiceSettings.wakeWordEnabled)
@@ -690,6 +728,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             label = { Text("Test Approval Demo") },
                             icon = { Icon(Icons.Outlined.PlayCircle, contentDescription = null) },
                             selected = false,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 viewModel.triggerApprovalDemo()
@@ -701,7 +740,8 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
 
                         HorizontalDivider(
                             modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                            thickness = 0.5.dp,
+                            color = glass.hairlineDivider
                         )
 
                         NavigationDrawerItem(
@@ -713,6 +753,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                 null
                             },
                             selected = uiState.destination == AppDestination.APPROVALS,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 viewModel.navigateTo(AppDestination.APPROVALS)
@@ -727,6 +768,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             icon = { Icon(Icons.Outlined.Build, contentDescription = null) },
                             badge = { Text("${uiState.permissionsStatus.grantedCount}/6") },
                             selected = uiState.destination == AppDestination.SETUP,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 viewModel.refreshPermissionsStatus()
@@ -741,6 +783,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             label = { Text("Settings / API Keys") },
                             icon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
                             selected = uiState.destination == AppDestination.SETTINGS,
+                            colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
                                 viewModel.navigateTo(AppDestination.SETTINGS)
@@ -755,7 +798,11 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                 }
             }
         ) {
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .spatialBackdrop()
+            ) {
                 when (uiState.destination) {
                     AppDestination.CHAT -> ChatScreen(
                         messages = uiState.chatMessages,
@@ -778,6 +825,10 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         voicePartialText = voicePartialText,
                         voiceFinalEvent = voiceFinalEvent,
                         onToggleMic = onToggleMic,
+                        onStopMicSilently = {
+                            voiceController.stopListening()
+                            voicePartialText = ""
+                        },
                         onOpenLiveVoice = openLiveVoiceMode,
                         onToggleGoogleSearch = viewModel::toggleGoogleSearchGrounding,
                         onToggleVoiceLanguage = viewModel::toggleVoiceLanguage,
@@ -800,6 +851,9 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             viewModel.jumpToSettingsSection(SettingsFocusSection.PROVIDERS)
                         },
                         onCopyMessage = viewModel::showMessage,
+                        onOpenGeneratedFile = viewModel::openGeneratedFile,
+                        onSaveGeneratedFile = viewModel::saveGeneratedFileToDownloads,
+                        onShareGeneratedFile = viewModel::shareGeneratedFile,
                         memorySuggestions = uiState.memorySuggestions,
                         onSaveToMemory = viewModel::saveMessageToMemory,
                         onAcceptSuggestion = viewModel::acceptMemorySuggestion,

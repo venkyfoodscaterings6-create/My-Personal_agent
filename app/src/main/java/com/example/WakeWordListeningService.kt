@@ -63,7 +63,7 @@ class WakeWordListeningService : Service() {
     @Volatile
     private var currentWakePhrase: String = VoiceSettings.DEFAULT_WAKE_PHRASE
     @Volatile
-    private var currentLanguage: VoiceLanguage = VoiceLanguage.AUTO
+    private var currentLanguage: VoiceLanguage = VoiceLanguage.EN_IN
     @Volatile
     private var currentWakeSensitivity: WakeSensitivity = WakeSensitivity.BALANCED
 

@@ -6,6 +6,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import com.squareup.moshi.Moshi
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -18,7 +19,12 @@ import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 
 sealed class ChatApiResult {
-    data class Success(val reply: String, val latencyMs: Long, val httpStatus: Int) : ChatApiResult()
+    data class Success(
+        val reply: String,
+        val latencyMs: Long,
+        val httpStatus: Int,
+        val groundingSources: List<GroundingSource> = emptyList()
+    ) : ChatApiResult()
     data class Error(val message: String, val httpStatus: Int? = null, val latencyMs: Long? = null) : ChatApiResult()
 }
 
@@ -58,7 +64,8 @@ class NetworkClient {
         conversationHistory: List<ChatMessage>,
         systemPrompt: String? = null,
         maxTokens: Int? = null,
-        temperature: Double? = null
+        temperature: Double? = null,
+        enableGoogleSearch: Boolean = false
     ): ChatApiResult = withContext(Dispatchers.IO) {
         if (!EndpointResolver.isValidHttpUrl(provider.baseUrl)) {
             return@withContext ChatApiResult.Error(
@@ -86,6 +93,7 @@ class NetworkClient {
 
         val startNanos = System.nanoTime()
         try {
+            val useGeminiSearch = provider.apiFormat == ApiFormat.GEMINI_NATIVE && enableGoogleSearch
             val request = when (provider.apiFormat) {
                 ApiFormat.OPENAI_COMPATIBLE -> buildOpenAiChatRequest(
                     endpoint, provider, recentMessages, effectiveSystemPrompt, maxTokens, temperature
@@ -94,7 +102,7 @@ class NetworkClient {
                     endpoint, provider, recentMessages, effectiveSystemPrompt, maxTokens, temperature
                 )
                 ApiFormat.GEMINI_NATIVE -> buildGeminiChatRequest(
-                    endpoint, provider, recentMessages, effectiveSystemPrompt, maxTokens, temperature
+                    endpoint, provider, recentMessages, effectiveSystemPrompt, maxTokens, temperature, useGeminiSearch
                 )
             }
 
@@ -103,6 +111,17 @@ class NetworkClient {
                 val bodyText = response.body?.string().orEmpty()
 
                 if (!response.isSuccessful) {
+                    // Graceful automatic retry without google_search if a legacy Gemini endpoint rejects it
+                    if (useGeminiSearch && response.code == 400) {
+                        return@withContext sendChatMessage(
+                            provider = provider,
+                            conversationHistory = conversationHistory,
+                            systemPrompt = systemPrompt,
+                            maxTokens = maxTokens,
+                            temperature = temperature,
+                            enableGoogleSearch = false
+                        )
+                    }
                     return@withContext ChatApiResult.Error(
                         message = explainHttpError(response.code, bodyText),
                         httpStatus = response.code,
@@ -115,6 +134,11 @@ class NetworkClient {
                     ApiFormat.ANTHROPIC_NATIVE -> parseAnthropicReply(bodyText)
                     ApiFormat.GEMINI_NATIVE -> parseGeminiReply(bodyText)
                 }
+                val sources = if (provider.apiFormat == ApiFormat.GEMINI_NATIVE) {
+                    parseGeminiGroundingSources(bodyText)
+                } else {
+                    emptyList()
+                }
 
                 if (parsedReply.isNullOrBlank()) {
                     ChatApiResult.Error(
@@ -126,7 +150,8 @@ class NetworkClient {
                     ChatApiResult.Success(
                         reply = parsedReply.trim(),
                         latencyMs = latencyMs,
-                        httpStatus = response.code
+                        httpStatus = response.code,
+                        groundingSources = sources
                     )
                 }
             }
@@ -223,60 +248,18 @@ class NetworkClient {
         userGoal: String,
         installedAppSample: List<String>,
         safetyRules: SafetyRules,
-        conversationHistory: List<ChatMessage> = emptyList()
+        conversationHistory: List<ChatMessage> = emptyList(),
+        currentForegroundApp: String? = null
     ): ToolRouteApiResult = withContext(Dispatchers.IO) {
-        val appsHint = installedAppSample.take(30).joinToString(", ")
-        val recentHistoryText = ConversationMemoryHelper.formatRecentAgentHistory(conversationHistory, maxTurns = 8)
-
-        val systemPrompt = buildString {
-            appendLine("You are an Android Hybrid Tool Router. Output ONLY ONE valid JSON object (no markdown, no explanation).")
-            appendLine("Available tools:")
-            appendLine("""0) {"tool":"reply_to_user","message":"Warm natural reply","reason":"Conversational reply"}""")
-            appendLine("""1) {"tool":"play_youtube_video","query":"song or video name","reason":"Play video on YouTube"}""")
-            appendLine("""2) {"tool":"open_app","appName":"App Name","reason":"Open app ONLY when user asks ONLY to open an app"}""")
-            appendLine("""3) {"tool":"search_youtube","query":"search text","reason":"Search YouTube without playing"}""")
-            appendLine("""4) {"tool":"search_web","query":"search text","reason":"Search the web"}""")
-            appendLine("""5) {"tool":"open_maps","destination":"place","reason":"Navigate in Maps"}""")
-            appendLine("""6) {"tool":"set_alarm","hour":7,"minute":30,"label":"Wake up","reason":"Set alarm"}""")
-            appendLine("""7) {"tool":"set_timer","seconds":300,"label":"Tea","reason":"Set timer"}""")
-            appendLine("""8) {"tool":"open_setting","settingName":"wifi|bluetooth|sound|display|battery|location","reason":"Open setting"}""")
-            appendLine("""9) {"tool":"call_contact","contactOrNumber":"Mom","reason":"Call contact"}""")
-            appendLine("""10) {"tool":"send_message","contactOrNumber":"Ravi","messagingApp":"whatsapp|sms","messageText":"Hi","reason":"Send WhatsApp or SMS message"}""")
-            appendLine("""11) {"tool":"tap_on_screen","targetText":"Skip","reason":"Tap visible button/text on current screen"}""")
-            appendLine("""12) {"tool":"scroll_screen","direction":"down|up|left|right","reason":"Scroll current screen"}""")
-            appendLine("""13) {"tool":"press_back","reason":"Navigate back"}""")
-            appendLine("""14) {"tool":"press_home","reason":"Go to home screen"}""")
-            appendLine("""15) {"tool":"open_recents","reason":"Open recent apps"}""")
-            appendLine("""16) {"tool":"open_notifications","reason":"Open notification shade"}""")
-            appendLine("""17) {"tool":"open_quick_settings","reason":"Open Quick Settings panel"}""")
-            appendLine("""18) {"tool":"set_volume","stream":"media|ring|alarm|notification","levelPercent":60,"reason":"Set volume level 0-100"}""")
-            appendLine("""19) {"tool":"ui_automate","goal":"full multi-step goal","title":"Short title","steps":["Step 1","Step 2"],"riskLevel":"MEDIUM","reason":"Multi-step UI automation on current screen or app"}""")
-            appendLine("CRITICAL RULES:")
-            appendLine("- Greetings, small talk, thanks, or general conversational questions ('Hi', 'Hello', 'Good morning', 'How are you?', 'Thank you', or Telugu equivalents) MUST ALWAYS route to reply_to_user(message) — NEVER open_app or ui_automate!")
-            appendLine("- Use RECENT CONVERSATION HISTORY to resolve follow-ups like 'play the first one', 'send him I am on the way', 'scroll down', or 'pause'.")
-            appendLine("- NEVER pick open_app for compound requests like 'open YouTube and play...' or 'open WhatsApp and send hi to Ravi'.")
-            appendLine("- For playing any video/song on YouTube (even in Telugu or English), ALWAYS pick play_youtube_video.")
-            appendLine("- For sending a WhatsApp or SMS message, ALWAYS pick send_message with resolved contactOrNumber, messagingApp, and messageText.")
-            appendLine("- For tapping a single visible button or text on the current screen (e.g., 'click Skip', 'tap Subscribe', 'press Like'), pick tap_on_screen(targetText).")
-            appendLine("- For volume changes, pick set_volume(stream, levelPercent).")
-            appendLine("- For system actions (back, home, recents, notifications, quick settings), pick the matching native tool.")
-            appendLine("- For multi-step workflows inside any app, pick ui_automate.")
-            if (safetyRules.blockSensitiveFinancial) {
-                appendLine("- NEVER route banking, UPI, OTP, payment, or password actions.")
-            }
-            if (appsHint.isNotBlank()) {
-                appendLine("Installed apps sample: $appsHint")
-            }
-        }
-
-        val userPrompt = buildString {
-            if (recentHistoryText.isNotBlank()) {
-                appendLine("RECENT CONVERSATION HISTORY:")
-                appendLine(recentHistoryText)
-                appendLine()
-            }
-            append("CURRENT USER REQUEST: $userGoal")
-        }
+        val systemPrompt = HybridToolRouting.buildRouterSystemPrompt(
+            installedAppSample = installedAppSample,
+            safetyRules = safetyRules
+        )
+        val userPrompt = HybridToolRouting.buildRouterUserPrompt(
+            userGoal = userGoal,
+            currentForegroundApp = currentForegroundApp,
+            conversationHistory = conversationHistory
+        )
 
         val firstMsg = listOf(ChatMessage(sender = MessageSender.USER, text = userPrompt))
         val startNanos = System.nanoTime()
@@ -286,7 +269,7 @@ class NetworkClient {
                 provider = provider,
                 conversationHistory = firstMsg,
                 systemPrompt = systemPrompt,
-                maxTokens = 200,
+                maxTokens = 220,
                 temperature = 0.0
             )
         ) {
@@ -294,11 +277,12 @@ class NetworkClient {
             is ChatApiResult.Success -> {
                 val parsed = HybridToolRouting.parseRoutedToolJson(firstResult.reply, userGoal)
                 if (parsed != null) {
+                    val guarded = HybridToolRouting.applyForegroundContextGuard(parsed, userGoal, currentForegroundApp)
                     val elapsed = ((System.nanoTime() - startNanos) / 1_000_000L).coerceAtLeast(1L)
-                    return@withContext ToolRouteApiResult.Success(parsed, elapsed)
+                    return@withContext ToolRouteApiResult.Success(guarded, elapsed)
                 }
 
-                // 1 automatic retry if malformed JSON (preserving conversation history context)
+                // 1 automatic retry if malformed JSON (preserving foreground app & conversation history context)
                 val retryMessages = listOf(
                     ChatMessage(sender = MessageSender.USER, text = userPrompt),
                     ChatMessage(sender = MessageSender.AGENT, text = firstResult.reply.take(200)),
@@ -312,7 +296,7 @@ class NetworkClient {
                         provider = provider,
                         conversationHistory = retryMessages,
                         systemPrompt = systemPrompt,
-                        maxTokens = 200,
+                        maxTokens = 220,
                         temperature = 0.0
                     )
                 ) {
@@ -332,7 +316,8 @@ class NetworkClient {
                                 riskLevel = RiskLevel.MEDIUM,
                                 reason = "Multi-step on-device task"
                             )
-                        return@withContext ToolRouteApiResult.Success(retried, elapsed)
+                        val guarded = HybridToolRouting.applyForegroundContextGuard(retried, userGoal, currentForegroundApp)
+                        return@withContext ToolRouteApiResult.Success(guarded, elapsed)
                     }
                 }
             }
@@ -399,20 +384,20 @@ class NetworkClient {
             appendLine("""{"action":"scroll","direction":"down","reason":"Scroll down"}""")
             appendLine("""{"action":"back","reason":"Go back"}""")
             appendLine("""{"action":"home","reason":"Go home"}""")
-            appendLine("""{"action":"done","summary":"Yes, completed! Short clear summary of what was done.","reason":"Done"}""")
+            appendLine("""{"action":"done","summary":"Short factual summary of what changed","evidence":"exact visible text on current screen proving completion","reason":"Done"}""")
             appendLine("CRITICAL RULES:")
-            appendLine("- If the user wants to open an app, ALWAYS return open_app immediately on Step 1 — NEVER press Home or swipe through screens to look for the app icon.")
-            appendLine("- If the user's goal is a follow-up on the currently open app (like 'play the second video', 'pause', 'scroll down'), act directly on the visible screen elements.")
-            appendLine("- NEVER return \"done\" right after opening an app if the goal also asks to play, search, click, or toggle something inside that app. Finish every requested action and verify the screen first.")
-            appendLine("- When returning \"done\", ALWAYS write a clear \"summary\" starting with \"Yes, completed! \" describing what you finished.")
-            appendLine("- Never interact with banking, UPI, OTP, or password fields.")
+            appendLine("- If the current foreground app in SCREEN is ALREADY the app needed for the goal, NEVER return open_app to relaunch it — act directly on visible elements.")
+            appendLine("- NEVER return \"done\" on Step 1 before performing a real action, and NEVER return \"done\" if the last action produced zero screen change.")
+            appendLine("- When returning \"done\", you MUST include \"evidence\": the exact visible text currently on screen that proves the goal succeeded.")
+            appendLine("- For ride booking (Uber/Ola/Rapido): set the destination and reach the ride-selection/fare screen, then return \"done\" with visible fare/ride-option evidence. NEVER tap the final Confirm / Book / Pay button.")
+            appendLine("- Never interact with bank transfers, UPI PINs, OTPs, or password fields.")
         }
 
-        val recentContext = ConversationMemoryHelper.formatRecentAgentHistory(conversationHistory, maxTurns = 8)
+        val recentContext = ConversationRepository.formatRecentConversationBlock(conversationHistory, maxMessages = 10)
         val userPrompt = buildString {
             if (recentContext.isNotBlank()) {
-                appendLine("RECENT CONVERSATION:")
                 appendLine(recentContext)
+                appendLine()
             }
             appendLine("GOAL: $goal")
             appendLine("STEP: $stepNumber/$maxSteps")
@@ -434,7 +419,7 @@ class NetworkClient {
                 provider = provider,
                 conversationHistory = msg,
                 systemPrompt = systemPrompt,
-                maxTokens = 150,
+                maxTokens = 180,
                 temperature = 0.1
             )
         ) {
@@ -460,6 +445,7 @@ class NetworkClient {
                     submit = json.optBoolean("submit", false),
                     direction = json.optString("direction").takeIf { it.isNotBlank() },
                     summary = json.optString("summary").takeIf { it.isNotBlank() },
+                    evidence = json.optString("evidence").takeIf { it.isNotBlank() },
                     reason = json.optString("reason").trim().ifBlank { actionType }
                 )
                 NextActionApiResult.Success(parsed)
@@ -631,7 +617,8 @@ class NetworkClient {
         conversationHistory: List<ChatMessage>,
         systemPrompt: String? = DEFAULT_CHAT_SYSTEM_PROMPT,
         maxTokens: Int? = null,
-        temperature: Double? = null
+        temperature: Double? = null,
+        enableGoogleSearch: Boolean = false
     ): Map<String, Any> {
         val recent = ConversationMemoryHelper.buildRecentChatMessages(conversationHistory, maxTurns = 15)
         // Normalize consecutive same-role turns so Gemini never rejects multi-turn payloads
@@ -661,6 +648,9 @@ class NetworkClient {
                 if (maxTokens != null) genConfig["maxOutputTokens"] = maxTokens
                 if (temperature != null) genConfig["temperature"] = temperature
                 put("generationConfig", genConfig)
+            }
+            if (enableGoogleSearch) {
+                put("tools", listOf(mapOf("google_search" to emptyMap<String, Any>())))
             }
             put("contents", contents)
         }
@@ -729,10 +719,11 @@ class NetworkClient {
         history: List<ChatMessage>,
         systemPrompt: String?,
         maxTokens: Int?,
-        temperature: Double?
+        temperature: Double?,
+        enableGoogleSearch: Boolean
     ): Request {
         val payloadJson = HybridToolRouting.mapToJson(
-            buildGeminiPayloadMap(history, systemPrompt, maxTokens, temperature)
+            buildGeminiPayloadMap(history, systemPrompt, maxTokens, temperature, enableGoogleSearch)
         )
 
         val trimmedKey = provider.apiKey.trim()
@@ -840,6 +831,31 @@ class NetworkClient {
             }
             texts.joinToString("\n").takeIf { it.isNotBlank() }
         }.getOrNull()
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun parseGeminiGroundingSources(body: String): List<GroundingSource> {
+        return runCatching {
+            val adapter = Moshi.Builder().build().adapter(Map::class.java)
+            val root = adapter.fromJson(body) as? Map<String, Any?> ?: return@runCatching emptyList()
+            val candidates = root["candidates"] as? List<*> ?: return@runCatching emptyList()
+            val firstCandidate = candidates.firstOrNull() as? Map<String, Any?> ?: return@runCatching emptyList()
+            val metadata = firstCandidate["groundingMetadata"] as? Map<String, Any?> ?: return@runCatching emptyList()
+            val chunks = metadata["groundingChunks"] as? List<*> ?: return@runCatching emptyList()
+            val seen = linkedSetOf<String>()
+            buildList {
+                for (item in chunks) {
+                    val chunk = item as? Map<String, Any?> ?: continue
+                    val web = chunk["web"] as? Map<String, Any?> ?: continue
+                    val uri = (web["uri"] as? String).orEmpty().trim()
+                    if (uri.isBlank() || !seen.add(uri)) continue
+                    val title = (web["title"] as? String).orEmpty().trim().ifBlank {
+                        uri.substringAfter("://").substringBefore("/").removePrefix("www.")
+                    }
+                    add(GroundingSource(title = title, uri = uri))
+                }
+            }
+        }.getOrElse { emptyList() }
     }
 
     private fun parseModelsList(body: String): List<String> {

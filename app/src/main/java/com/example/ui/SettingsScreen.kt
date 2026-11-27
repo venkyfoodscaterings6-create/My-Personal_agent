@@ -105,7 +105,10 @@ import com.example.ThemePreference
 import com.example.VoiceLanguage
 import com.example.VoiceSettings
 import com.example.WakeSensitivity
+import com.example.ui.theme.LocalAgentGlassColors
 import com.example.ui.theme.MonoCodeStyle
+import com.example.ui.theme.glassPanel
+import com.example.ui.theme.nestedGlassCard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -164,38 +167,44 @@ fun SettingsScreen(
         }
     }
 
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
             .navigationBarsPadding()
             .imePadding()
     ) {
-        // Flat Top Bar with Back Arrow
-        Row(
+        // Frosted Glass Top Bar with Back Arrow
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .background(glass.topBarFill)
+                .statusBarsPadding()
         ) {
-            IconButton(
-                onClick = onBack,
-                modifier = Modifier.testTag("settings_back_button")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                    contentDescription = "Back to Chat"
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier.testTag("settings_back_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                        contentDescription = "Back to Chat"
+                    )
+                }
+                Text(
+                    text = "Settings & API Keys",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
-            Text(
-                text = "Settings & API Keys",
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-        }
 
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            HorizontalDivider(thickness = 0.5.dp, color = glass.hairlineDivider)
+        }
 
         LazyColumn(
             state = listState,
@@ -238,8 +247,8 @@ fun SettingsScreen(
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
 
                         FlatSafetyToggle(
-                            title = "Google Search Grounding (Live Web Facts)",
-                            subtitle = "Grounds Gemini chat and Live Voice answers in real-time Google Search with clickable source citations.",
+                            title = "Web Search (Live Facts)",
+                            subtitle = "Enables live Google Search Grounding for Built-in Gemini and Gemini Native providers with clickable source chips.",
                             checked = uiState.builtInGeminiSettings.googleSearchEnabled,
                             onCheckedChange = { checked ->
                                 onUpdateBuiltInGeminiSettings { it.copy(googleSearchEnabled = checked) }
@@ -387,16 +396,13 @@ fun SettingsScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f))
-                                .border(
-                                    width = 1.dp,
-                                    color = if (uiState.voiceSettings.wakeWordEnabled) {
-                                        MaterialTheme.colorScheme.primary
+                                .nestedGlassCard(
+                                    cornerRadius = 16.dp,
+                                    borderColorOverride = if (uiState.voiceSettings.wakeWordEnabled) {
+                                        glass.accentBlue.copy(alpha = 0.7f)
                                     } else {
-                                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
-                                    },
-                                    shape = RoundedCornerShape(12.dp)
+                                        null
+                                    }
                                 )
                                 .padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -519,13 +525,7 @@ fun SettingsScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f))
-                                .border(
-                                    width = 1.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
+                                .nestedGlassCard(cornerRadius = 16.dp)
                                 .padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
@@ -626,13 +626,7 @@ fun SettingsScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-                                .border(
-                                    width = 1.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
+                                .nestedGlassCard(cornerRadius = 16.dp)
                                 .padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
@@ -724,8 +718,7 @@ fun SettingsScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                                .nestedGlassCard(cornerRadius = 14.dp)
                                 .padding(4.dp),
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
@@ -748,8 +741,7 @@ fun SettingsScreen(
                                 ) {
                                     Text(
                                         text = when (lang) {
-                                            VoiceLanguage.AUTO -> "Auto"
-                                            VoiceLanguage.EN_IN -> "English"
+                                            VoiceLanguage.EN_IN -> "English (India)"
                                             VoiceLanguage.TE_IN -> "తెలుగు"
                                         },
                                         style = MaterialTheme.typography.labelLarge,
@@ -840,13 +832,12 @@ fun SettingsScreen(
             item(key = "section_appearance") {
                 FlatSettingsSection(
                     title = "Appearance",
-                    subtitle = "Dynamic Material You colors on Android 12+."
+                    subtitle = "Spatial dark frosted-glass or matching light frosted-ice theme."
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                            .nestedGlassCard(cornerRadius = 14.dp)
                             .padding(4.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
@@ -915,6 +906,8 @@ fun SettingsScreen(
     providerToDelete?.let { provider ->
         AlertDialog(
             onDismissRequest = { providerToDelete = null },
+            containerColor = glass.dialogFill,
+            shape = RoundedCornerShape(24.dp),
             title = { Text("Delete \"${provider.displayName}\"?") },
             text = { Text("This removes the saved endpoint and API key from this device.") },
             confirmButton = {
@@ -950,9 +943,7 @@ private fun FlatSettingsSection(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+            .glassPanel(cornerRadius = 22.dp)
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -990,19 +981,13 @@ private fun FlatProviderRow(
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val glass = LocalAgentGlassColors.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(
-                if (provider.isDefault) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-            )
-            .border(
-                width = 1.dp,
-                color = if (provider.isDefault) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
-                shape = RoundedCornerShape(12.dp)
+            .nestedGlassCard(
+                cornerRadius = 16.dp,
+                borderColorOverride = if (provider.isDefault) glass.accentBlue.copy(alpha = 0.72f) else null
             )
             .padding(10.dp)
             .testTag("provider_card_${provider.id}"),
@@ -1183,17 +1168,18 @@ private fun ProviderEditorDialog(
 
     val canSave = baseUrlValid && modelName.isNotBlank()
 
+    val glass = LocalAgentGlassColors.current
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Surface(
-            shape = RoundedCornerShape(22.dp),
-            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(24.dp),
+            color = glass.dialogFill,
             modifier = Modifier
                 .fillMaxWidth(0.94f)
                 .heightIn(max = 720.dp)
-                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(22.dp))
+                .border(1.dp, glass.luminousBorderBrush(), RoundedCornerShape(24.dp))
         ) {
             Column(
                 modifier = Modifier
@@ -1522,8 +1508,11 @@ private fun SearchableModelsPickerDialog(
         else models.filter { it.contains(searchQuery.trim(), ignoreCase = true) }
     }
 
+    val glass = LocalAgentGlassColors.current
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = glass.dialogFill,
+        shape = RoundedCornerShape(24.dp),
         title = { Text("Select Model (${models.size})") },
         text = {
             Column(

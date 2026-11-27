@@ -69,13 +69,13 @@
     <string name="voice_overlay_title">Personal Agent</string>
     <string name="voice_overlay_type_hint">Or type a quick command…</string>
     <string name="action_open_live_voice">Open Live Voice 3D Conversation</string>
-    <string name="action_toggle_google_search">Toggle Google Search Grounding</string>
+    <string name="action_toggle_google_search">Toggle Web Search (Live Facts)</string>
     <string name="drawer_live_voice_label">Live Voice &amp; 3D Agent</string>
     <string name="drawer_memory_db_label">Memory &amp; SQL DB</string>
     <string name="drawer_saved_chats">Saved Chats</string>
     <string name="drawer_search_chats_hint">Search chats…</string>
     <string name="mode_smart_auto">Smart</string>
-    <string name="input_placeholder_smart">Ask or tell your agent…</string>
+    <string name="input_placeholder_smart">Ask anything or tell your agent…</string>
     <string name="action_save_to_memory">Save to Memory</string>
     <string name="settings_neural_voice_title">Gemini Neural Voice (Natural Speech)</string>
     <string name="settings_neural_voice_subtitle">Lifelike neural speech with instant on-device fallback if offline or busy.</string>

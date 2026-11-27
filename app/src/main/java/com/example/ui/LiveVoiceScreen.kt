@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CallEnd
+import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.Public
@@ -97,8 +98,7 @@ fun LiveVoiceScreen(
         LiveVoicePhase.IDLE -> "Tap Mic or 3D Agent to talk"
         LiveVoicePhase.LISTENING -> when (voiceLanguage) {
             VoiceLanguage.TE_IN -> "వింటున్నాను… (తెలుగు)"
-            VoiceLanguage.AUTO -> "Listening live (EN + తెలుగు)…"
-            VoiceLanguage.EN_IN -> "Listening live…"
+            VoiceLanguage.EN_IN -> "Listening live (EN-IN)…"
         }
         LiveVoicePhase.THINKING -> if (googleSearchEnabled) "Searching & thinking…" else "Thinking with Gemini…"
         LiveVoicePhase.SPEAKING -> "Speaking ($voicePersonaLabel) · tap to interrupt"
@@ -280,7 +280,7 @@ fun LiveVoiceScreen(
                             horizontalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.Public,
+                                imageVector = Icons.Rounded.Link,
                                 contentDescription = null,
                                 tint = Color(0xFF34D399),
                                 modifier = Modifier.size(13.dp)
