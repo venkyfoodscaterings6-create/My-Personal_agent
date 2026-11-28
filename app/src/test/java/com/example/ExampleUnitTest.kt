@@ -493,7 +493,7 @@ class ExampleUnitTest {
         assertEquals(VoiceLanguage.TE_IN, VoiceLanguage.EN_IN.next())
         assertEquals(VoiceLanguage.EN_IN, VoiceLanguage.TE_IN.next())
         assertTrue(BuiltInGeminiSettings().googleSearchEnabled)
-        assertEquals(AgentMode.CHAT_ONLY, AgentUiState().agentMode)
+        assertEquals(AgentMode.SMART_AUTO, AgentUiState().agentMode)
     }
 
     @Test
@@ -1024,6 +1024,281 @@ class ExampleUnitTest {
         )
         assertTrue(accepted is DoneValidationResult.Accepted)
         assertEquals("Pause video", (accepted as DoneValidationResult.Accepted).evidence)
+    }
+
+    @Test
+    fun `open Google Chrome strictly resolves to com android chrome even when Google app is listed first`() {
+        val installed = listOf(
+            InstalledAppInfo("Google", "com.google.android.googlequicksearchbox", "google"),
+            InstalledAppInfo("Google Play Store", "com.android.vending", "googleplaystore"),
+            InstalledAppInfo("Chrome", "com.android.chrome", "chrome"),
+            InstalledAppInfo("Google Maps", "com.google.android.apps.maps", "googlemaps"),
+            InstalledAppInfo("Claude", "com.anthropic.claude", "claude"),
+            InstalledAppInfo("Uber", "com.ubercab", "uber"),
+            InstalledAppInfo("YouTube", "com.google.android.youtube", "youtube"),
+            InstalledAppInfo("WhatsApp", "com.whatsapp", "whatsapp"),
+            InstalledAppInfo("Settings", "com.android.settings", "settings")
+        )
+
+        // English & Telugu Chrome queries MUST resolve to com.android.chrome (NEVER Google app!)
+        assertEquals("com.android.chrome", AppNameFuzzyMatcher.findBestMatch("Google Chrome", installed)?.packageName)
+        assertEquals("com.android.chrome", AppNameFuzzyMatcher.findBestMatch("Chrome", installed)?.packageName)
+        assertEquals("com.android.chrome", AppNameFuzzyMatcher.findBestMatch("గూగుల్ క్రోమ్", installed)?.packageName)
+        assertEquals("com.android.chrome", AppNameFuzzyMatcher.findBestMatch("క్రోమ్", installed)?.packageName)
+
+        // Explicit "Google" / "గూగుల్" still resolves to Google app
+        assertEquals("com.google.android.googlequicksearchbox", AppNameFuzzyMatcher.findBestMatch("Google", installed)?.packageName)
+        assertEquals("com.google.android.googlequicksearchbox", AppNameFuzzyMatcher.findBestMatch("గూగుల్", installed)?.packageName)
+
+        // Other Telugu script aliases resolve cleanly
+        assertEquals("com.google.android.youtube", AppNameFuzzyMatcher.findBestMatch("యూట్యూబ్", installed)?.packageName)
+        assertEquals("com.google.android.apps.maps", AppNameFuzzyMatcher.findBestMatch("మ్యాప్స్", installed)?.packageName)
+        assertEquals("com.whatsapp", AppNameFuzzyMatcher.findBestMatch("వాట్సాప్", installed)?.packageName)
+        assertEquals("com.ubercab", AppNameFuzzyMatcher.findBestMatch("ఉబర్", installed)?.packageName)
+        assertEquals("com.anthropic.claude", AppNameFuzzyMatcher.findBestMatch("క్లాడ్", installed)?.packageName)
+        assertEquals("com.android.settings", AppNameFuzzyMatcher.findBestMatch("సెట్టింగ్స్", installed)?.packageName)
+    }
+
+    @Test
+    fun `compound requests on any app route to open_app_and_do and never open_app`() {
+        val claudePrompt = "open claude and research for new agents"
+        val amazonPrompt = "open Amazon and search wireless mouse"
+        val swiggyTenglish = "Swiggy open chesi biryani search chey"
+        val claudeTelugu = "క్లాడ్ ఓపెన్ చేసి న్యూ ఏజెంట్స్ గురించి రీసెర్చ్ చేయి"
+
+        // 1. Simple open_app fast-path MUST reject compound prompts
+        assertNull(FastPathMatcher.match(claudePrompt))
+        assertNull(FastPathMatcher.match(amazonPrompt))
+        assertTrue(HybridToolRouting.hasCompoundSecondTask(claudePrompt))
+        assertTrue(HybridToolRouting.hasCompoundSecondTask(amazonPrompt))
+        assertTrue(HybridToolRouting.hasCompoundSecondTask(swiggyTenglish))
+        assertTrue(HybridToolRouting.hasCompoundSecondTask(claudeTelugu))
+
+        // 2. Unified Smart Agent MUST route clear compound actions to LOCAL_TOOL (never DIRECT_CHAT)
+        listOf(claudePrompt, amazonPrompt, swiggyTenglish, claudeTelugu).forEach { cmd ->
+            assertTrue("Expected clear device action for: $cmd", SmartIntentClassifier.isClearDeviceAction(cmd))
+            assertEquals("Expected LOCAL_TOOL for: $cmd", UnifiedRouteDecision.LOCAL_TOOL, SmartIntentClassifier.decideUnifiedRoute(cmd))
+        }
+
+        // 3. Direct local router maps directly to open_app_and_do(appName, goal) for ALL apps
+        val routedClaude = HybridToolRouting.matchDirectLocalTool(claudePrompt)
+        assertNotNull(routedClaude)
+        assertEquals(ToolName.OPEN_APP_AND_DO, routedClaude?.tool)
+        assertEquals("Claude", routedClaude?.appName)
+        assertEquals("research for new agents", routedClaude?.goal)
+        assertFalse(routedClaude?.tool == ToolName.OPEN_APP)
+
+        val routedAmazon = HybridToolRouting.matchDirectLocalTool(amazonPrompt)
+        assertNotNull(routedAmazon)
+        assertEquals(ToolName.OPEN_APP_AND_DO, routedAmazon?.tool)
+        assertEquals("Amazon", routedAmazon?.appName)
+        assertEquals("search wireless mouse", routedAmazon?.goal)
+        assertFalse(routedAmazon?.tool == ToolName.OPEN_APP)
+
+        val routedSwiggy = HybridToolRouting.matchDirectLocalTool(swiggyTenglish)
+        assertNotNull(routedSwiggy)
+        assertEquals(ToolName.OPEN_APP_AND_DO, routedSwiggy?.tool)
+        assertEquals("Swiggy", routedSwiggy?.appName)
+        assertTrue(routedSwiggy?.goal?.contains("biryani", ignoreCase = true) == true)
+
+        val routedClaudeTe = HybridToolRouting.matchDirectLocalTool(claudeTelugu)
+        assertNotNull(routedClaudeTe)
+        assertEquals(ToolName.OPEN_APP_AND_DO, routedClaudeTe?.tool)
+        assertEquals("Claude", routedClaudeTe?.appName)
+        assertTrue(routedClaudeTe?.goal?.contains("రీసెర్చ్") == true)
+
+        // 4. Even if an AI router mistakenly returns open_app or reply_to_user, the guard enforces open_app_and_do
+        val mistakenOpenApp = RoutedToolCall(tool = ToolName.OPEN_APP, appName = "Claude")
+        val guardedFromOpen = HybridToolRouting.applyForegroundContextGuard(mistakenOpenApp, claudePrompt, null)
+        assertEquals(ToolName.OPEN_APP_AND_DO, guardedFromOpen.tool)
+        assertEquals("Claude", guardedFromOpen.appName)
+
+        val mistakenChat = RoutedToolCall(tool = ToolName.REPLY_TO_USER, replyMessage = "Here are some new AI agents...")
+        val guardedFromChat = HybridToolRouting.applyForegroundContextGuard(mistakenChat, claudePrompt, null)
+        assertEquals(ToolName.OPEN_APP_AND_DO, guardedFromChat.tool)
+        assertEquals("Claude", guardedFromChat.appName)
+
+        // 5. Safe Final Stop blocks final Pay / Place Order / Confirm Booking buttons on shopping/food/ride apps
+        assertTrue(HybridToolRouting.isFinalCheckoutOrBookingButton("Place Order"))
+        assertTrue(HybridToolRouting.isFinalCheckoutOrBookingButton("Proceed to Pay"))
+        assertTrue(HybridToolRouting.isFinalCheckoutOrBookingButton("Confirm Booking"))
+        assertTrue(HybridToolRouting.isCommerceOrRideApp("Swiggy", "in.swiggy.android", "biryani search chey"))
+
+        // 6. Serialization round-trip preserves open_app_and_do & goal
+        val json = routedAmazon!!.toJsonString()
+        val reparsed = HybridToolRouting.parseRoutedToolJson(json, fallbackGoal = amazonPrompt)
+        assertNotNull(reparsed)
+        assertEquals(ToolName.OPEN_APP_AND_DO, reparsed?.tool)
+        assertEquals("Amazon", reparsed?.appName)
+        assertEquals("search wireless mouse", reparsed?.goal)
+    }
+
+    @Test
+    fun `telugu and tenglish action commands route to Android tools and never fall back to chat`() {
+        // 1. "గూగుల్ క్రోమ్ ఓపెన్ చేయి" -> OPEN_APP
+        val openChromeTe = HybridToolRouting.matchDirectLocalTool("గూగుల్ క్రోమ్ ఓపెన్ చేయి")
+        assertNotNull(openChromeTe)
+        assertEquals(ToolName.OPEN_APP, openChromeTe?.tool)
+        assertEquals(UnifiedRouteDecision.LOCAL_TOOL, SmartIntentClassifier.decideUnifiedRoute("గూగుల్ క్రోమ్ ఓపెన్ చేయి"))
+
+        // 2. "ravi ki call chey" and "రవికి కాల్ చేయి" -> CALL_CONTACT
+        val callTenglish = HybridToolRouting.matchDirectLocalTool("ravi ki call chey")
+        assertNotNull(callTenglish)
+        assertEquals(ToolName.CALL_CONTACT, callTenglish?.tool)
+        assertEquals("ravi", callTenglish?.contactOrNumber)
+        assertEquals(UnifiedRouteDecision.LOCAL_TOOL, SmartIntentClassifier.decideUnifiedRoute("ravi ki call chey"))
+
+        val callTelugu = HybridToolRouting.matchDirectLocalTool("రవికి కాల్ చేయి")
+        assertNotNull(callTelugu)
+        assertEquals(ToolName.CALL_CONTACT, callTelugu?.tool)
+        assertEquals("రవి", callTelugu?.contactOrNumber)
+        assertEquals(UnifiedRouteDecision.LOCAL_TOOL, SmartIntentClassifier.decideUnifiedRoute("రవికి కాల్ చేయి"))
+
+        // 3. "youtube lo songs play chey" and "యూట్యూబ్ లో తెలుగు పాటలు ప్లే చేయి" -> PLAY_YOUTUBE_VIDEO
+        val ytTenglish = HybridToolRouting.matchDirectLocalTool("youtube lo songs play chey")
+        assertNotNull(ytTenglish)
+        assertEquals(ToolName.PLAY_YOUTUBE_VIDEO, ytTenglish?.tool)
+        assertEquals("songs", ytTenglish?.query)
+        assertEquals(UnifiedRouteDecision.LOCAL_TOOL, SmartIntentClassifier.decideUnifiedRoute("youtube lo songs play chey"))
+
+        val ytTelugu = HybridToolRouting.matchDirectLocalTool("యూట్యూబ్ లో తెలుగు పాటలు ప్లే చేయి")
+        assertNotNull(ytTelugu)
+        assertEquals(ToolName.PLAY_YOUTUBE_VIDEO, ytTelugu?.tool)
+        assertEquals("తెలుగు పాటలు", ytTelugu?.query)
+
+        // 4. Telugu/Tenglish WhatsApp & ride booking also route cleanly to tools
+        val waTenglish = HybridToolRouting.matchDirectLocalTool("ravi ki whatsapp lo hi pampu")
+        assertNotNull(waTenglish)
+        assertEquals(ToolName.SEND_MESSAGE, waTenglish?.tool)
+        assertEquals("ravi", waTenglish?.contactOrNumber)
+        assertEquals("hi", waTenglish?.messageText)
+
+        val rideTenglish = HybridToolRouting.matchDirectLocalTool("uber lo airport ki ride book chey")
+        assertNotNull(rideTenglish)
+        assertEquals(ToolName.BOOK_RIDE, rideTenglish?.tool)
+        assertEquals("Uber", rideTenglish?.appName)
+        assertEquals("airport", rideTenglish?.destination)
+    }
+
+    @Test
+    fun `audio silence guard blocks TTS during calls media silent vibrate DND and mic and caps spoken confirmations`() {
+        // Normal idle state -> speech allowed (null)
+        assertNull(
+            AudioSilenceGuard.evaluatePolicy(
+                AudioEnvironmentState(
+                    audioMode = android.media.AudioManager.MODE_NORMAL,
+                    isMusicActive = false,
+                    ringerMode = android.media.AudioManager.RINGER_MODE_NORMAL,
+                    isDndActive = false,
+                    isMicListening = false,
+                    isOtherAppRecording = false
+                )
+            )
+        )
+
+        // Active phone / VoIP / ringtone calls -> MUST block TTS
+        assertEquals(
+            SilenceReason.ACTIVE_CALL,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(audioMode = android.media.AudioManager.MODE_IN_CALL))
+        )
+        assertEquals(
+            SilenceReason.ACTIVE_CALL,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(audioMode = android.media.AudioManager.MODE_IN_COMMUNICATION))
+        )
+        assertEquals(
+            SilenceReason.ACTIVE_CALL,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(audioMode = android.media.AudioManager.MODE_RINGTONE))
+        )
+        assertEquals(
+            SilenceReason.CALL_STARTING,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isCallStarting = true))
+        )
+
+        // Active media playback / video just started -> MUST block TTS
+        assertEquals(
+            SilenceReason.MEDIA_PLAYING,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isMusicActive = true))
+        )
+        assertEquals(
+            SilenceReason.MEDIA_JUST_STARTED,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isMediaCooldownActive = true))
+        )
+
+        // Silent, Vibrate, and Do Not Disturb -> MUST block TTS
+        assertEquals(
+            SilenceReason.RINGER_SILENT_OR_VIBRATE,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(ringerMode = android.media.AudioManager.RINGER_MODE_SILENT))
+        )
+        assertEquals(
+            SilenceReason.RINGER_SILENT_OR_VIBRATE,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(ringerMode = android.media.AudioManager.RINGER_MODE_VIBRATE))
+        )
+        assertEquals(
+            SilenceReason.DND_ACTIVE,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isDndActive = true))
+        )
+
+        // Active mic listening or another app recording -> MUST block TTS
+        assertEquals(
+            SilenceReason.MIC_ACTIVE,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isMicListening = true))
+        )
+        assertEquals(
+            SilenceReason.OTHER_APP_RECORDING,
+            AudioSilenceGuard.evaluatePolicy(AudioEnvironmentState(isOtherAppRecording = true))
+        )
+
+        // Short spoken confirmation caps strictly to <= 6 words and strips phone numbers & timings
+        val shortChrome = ConfirmationFormatter.formatShortSpokenConfirmation("Yes, completed! Opened Chrome. (0.4s)")
+        assertEquals("Done, opened Chrome.", shortChrome)
+        assertTrue(shortChrome.split(" ").size <= 6)
+
+        val strippedPhone = ConfirmationFormatter.formatShortSpokenConfirmation("Yes, completed! Calling Ravi (+91 9876543210) now on mobile. (0.3s)")
+        assertFalse("Spoken confirmation must never read phone numbers aloud: $strippedPhone", strippedPhone.contains("9876543210"))
+        assertTrue(strippedPhone.split(" ").size <= 6)
+
+        val shortTelugu = ConfirmationFormatter.formatShortSpokenConfirmation("Yes, completed! Opened Chrome.", isSuccess = true, preferTelugu = true)
+        assertTrue(shortTelugu.contains("Chrome") && shortTelugu.contains("ఓపెన్"))
+    }
+
+    @Test
+    fun `switching to a new chat strictly isolates sessionId so responses from session A never appear in session B`() {
+        // Start in Session A with an active conversation
+        ConversationRepository.clearForTest("session-A")
+        val msgA1 = ChatMessage(id = "a-user-1", sender = MessageSender.USER, text = "Explain quantum gravity")
+        ConversationRepository.appendToSessionInMemory("session-A", listOf(msgA1))
+        assertEquals("session-A", ConversationRepository.activeSessionId.value)
+        assertEquals(1, ConversationRepository.messages.value.size)
+
+        // User taps New Chat -> switches immediately to blank Session B
+        ConversationRepository.resetSessionExplicitly("session-B")
+        assertEquals("session-B", ConversationRepository.activeSessionId.value)
+        assertTrue("New Chat Session B must start 100% blank", ConversationRepository.messages.value.isEmpty())
+
+        // Late background response or Accessibility completion from Session A finishes AFTER switch
+        val lateReplyFromA = ChatMessage(
+            id = "a-agent-late",
+            sender = MessageSender.AGENT,
+            text = "Late reply belonging strictly to Session A"
+        )
+        val appearedInActiveUi = ConversationRepository.appendToSessionInMemory("session-A", listOf(lateReplyFromA))
+
+        // Session B MUST remain completely untouched (zero bleeding!)
+        assertFalse("Late response from Session A must NEVER update active UI of Session B", appearedInActiveUi)
+        assertTrue("Session B active messages must remain 100% empty", ConversationRepository.messages.value.isEmpty())
+
+        // Meanwhile Session A's own bucket preserves its late reply cleanly
+        val sessionAMessages = ConversationRepository.getMessagesForSession("session-A")
+        assertEquals(2, sessionAMessages.size)
+        assertTrue(sessionAMessages.any { it.id == "a-agent-late" })
+
+        // New message in Session B appears ONLY in Session B
+        val msgB1 = ChatMessage(id = "b-user-1", sender = MessageSender.USER, text = "Open YouTube")
+        val appearedInB = ConversationRepository.appendToSessionInMemory("session-B", listOf(msgB1))
+        assertTrue(appearedInB)
+        assertEquals(1, ConversationRepository.messages.value.size)
+        assertEquals("b-user-1", ConversationRepository.messages.value.first().id)
+        assertFalse(ConversationRepository.getMessagesForSession("session-A").any { it.id == "b-user-1" })
     }
 }
 

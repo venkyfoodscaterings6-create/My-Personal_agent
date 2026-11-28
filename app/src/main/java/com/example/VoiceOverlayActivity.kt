@@ -133,7 +133,7 @@ class VoiceOverlayActivity : ComponentActivity() {
                     voiceSettings = VoiceSettings(),
                     quickActionChips = DefaultQuickChips.items,
                     themePreference = ThemePreference.SYSTEM,
-                    agentMode = AgentMode.AGENT_CONTROL,
+                    agentMode = AgentMode.SMART_AUTO,
                     connectionTestPassed = false
                 )
             }
@@ -223,6 +223,9 @@ private fun VoiceOverlaySheetContent(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val networkClient = remember { NetworkClient() }
+    val sqlRepo = remember(context) {
+        AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
+    }
 
     var inputText by remember { mutableStateOf("") }
     var partialText by remember { mutableStateOf("") }
@@ -257,13 +260,28 @@ private fun VoiceOverlaySheetContent(
                     isError = true,
                     excludeFromContext = true
                 )
-                ConversationRepository.appendMessages(storage, listOf(chatErr))
+                ConversationRepository.appendMessages(
+                    storage = storage,
+                    newMessages = listOf(chatErr),
+                    targetSessionId = plan.sessionId
+                )
+                if (plan.sessionId.isNotBlank()) {
+                    sqlRepo.updateActionInSession(
+                        sessionId = plan.sessionId,
+                        actionId = plan.actionId,
+                        status = ApprovalStatus.FAILED,
+                        completedSteps = 0,
+                        activeStep = -1,
+                        appendChatMessage = chatErr
+                    )
+                }
                 storage.updateActionStatusInStorage(
                     actionId = plan.actionId,
                     status = ApprovalStatus.FAILED,
                     completedSteps = 0,
                     activeStep = -1,
-                    notes = errMsg
+                    notes = errMsg,
+                    targetSessionId = plan.sessionId
                 )
             }
             AgentSpeechFeedback.announceOutcome(
@@ -276,20 +294,47 @@ private fun VoiceOverlaySheetContent(
             return
         }
 
-        // Speak immediate short acknowledgment for actions that don't speak their own inside AgentAccessibilityService
+        // Speak immediate short acknowledgment for actions that don't speak their own (never before calls or media)
         if (voiceSettings.speakRepliesAloud &&
-            toolCall.tool !in setOf(ToolName.BOOK_RIDE, ToolName.PLAY_YOUTUBE_VIDEO, ToolName.SEND_MESSAGE)
-        ) {
-            AgentSpeechFeedback.speak(
-                context = context.applicationContext,
-                text = HybridToolRouting.buildImmediateAckPhrase(toolCall),
-                voiceSettings = voiceSettings
+            toolCall.tool !in setOf(
+                ToolName.BOOK_RIDE,
+                ToolName.PLAY_YOUTUBE_VIDEO,
+                ToolName.SEND_MESSAGE,
+                ToolName.OPEN_APP_AND_DO,
+                ToolName.OPEN_APP_AND_PROMPT,
+                ToolName.CALL_CONTACT
             )
+        ) {
+            val ack = HybridToolRouting.buildImmediateAckPhrase(toolCall)
+            if (ack.isNotBlank()) {
+                AgentSpeechFeedback.speak(
+                    context = context.applicationContext,
+                    text = ack,
+                    voiceSettings = voiceSettings
+                )
+            }
         }
 
         onCloseOverlay()
 
         when (toolCall.tool) {
+            ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT -> {
+                val app = toolCall.appName?.takeIf { it.isNotBlank() } ?: "App"
+                val goal = toolCall.goal?.takeIf { it.isNotBlank() }
+                    ?: toolCall.promptText?.takeIf { it.isNotBlank() }
+                    ?: toolCall.query?.takeIf { it.isNotBlank() }
+                    ?: plan.title
+                service.startOpenAppAndDo(
+                    plan = plan,
+                    appName = app,
+                    goal = goal,
+                    provider = activeProvider,
+                    blockSensitive = blockSensitive,
+                    conversationHistory = history,
+                    initialDelayMs = 220L
+                )
+            }
+
             ToolName.BOOK_RIDE -> {
                 service.startBookRide(
                     plan = plan,
@@ -381,9 +426,11 @@ private fun VoiceOverlaySheetContent(
 
         scope.launch {
             var activeVoiceSettings = latestVoiceSettings
+            var activeSessionId = ""
             try {
                 val latestState = storage.readLatestState()
                 activeVoiceSettings = latestState.voiceSettings
+                activeSessionId = latestState.sessionId
                 val useBuiltIn = latestState.builtInGeminiSettings.useBuiltInGemini || latestState.providers.isEmpty()
                 val activeProvider = if (useBuiltIn) {
                     null
@@ -397,10 +444,15 @@ private fun VoiceOverlaySheetContent(
                     ?.takeIf { it.isNotBlank() && it != context.packageName }
                     ?: AgentAccessibilityService.getCurrentForegroundApp(context.packageName)
 
-                // Always merge and append to the SINGLETON ConversationRepository (NEVER creating a new session!)
-                ConversationRepository.mergeWithPersisted(latestState.chatMessages)
+                // Always merge and append to the SINGLETON ConversationRepository under the active sessionId
+                ConversationRepository.mergeWithPersisted(latestState.chatMessages, activeSessionId)
                 val userMsg = ChatMessage(sender = MessageSender.USER, text = command)
-                val historyWithUser = ConversationRepository.appendMessages(storage, listOf(userMsg))
+                val historyWithUser = ConversationRepository.appendMessages(
+                    storage = storage,
+                    newMessages = listOf(userMsg),
+                    targetSessionId = activeSessionId
+                )
+                sqlRepo.saveMessagesToSession(activeSessionId, listOf(userMsg))
 
                 // 1. On-device financial/UPI/OTP/password hard-block check
                 if (latestState.safetyRules.blockSensitiveFinancial) {
@@ -426,7 +478,8 @@ private fun VoiceOverlaySheetContent(
                             status = ApprovalStatus.BLOCKED,
                             notes = "Blocked by on-device financial/credential guardrail."
                         )
-                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec)
+                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec, activeSessionId)
+                        sqlRepo.saveMessagesToSession(activeSessionId, listOf(blockedMsg))
                         isRouting = false
                         statusNote = null
                         blockedReason = violation
@@ -444,7 +497,6 @@ private fun VoiceOverlaySheetContent(
                 // 1b. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
                 val sqlIntent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(command) }
                 if (sqlIntent != null) {
-                    val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
                     val reply = when (sqlIntent) {
                         is SqlDirectIntent.SaveMemory -> {
                             sqlRepo.addMemory(sqlIntent.category, sqlIntent.title, sqlIntent.content, isPinned = true)
@@ -455,19 +507,20 @@ private fun VoiceOverlaySheetContent(
                             "Added to your tasks: ${sqlIntent.title}"
                         }
                         SqlDirectIntent.ListTasks -> {
-                            val pending = PersonalAgentDatabase.getInstance(context.applicationContext).taskDao().getPendingTasks(6)
+                            val pending = sqlRepo.getPendingTasks(6)
                             if (pending.isEmpty()) "You have no open tasks right now."
                             else "Your open tasks are: " + pending.joinToString("; ") { it.title }
                         }
                         SqlDirectIntent.ListMemories -> {
-                            val mems = PersonalAgentDatabase.getInstance(context.applicationContext).memoryDao().getTopMemories(5)
+                            val mems = sqlRepo.getTopMemories(5)
                             if (mems.isEmpty()) "No memories saved yet. Say 'Remember that...' to save one."
                             else "Here is what I remember: " + mems.joinToString("; ") { it.content }
                         }
                     }
                     val replyMsg = ChatMessage(sender = MessageSender.AGENT, text = reply, modelBadge = "SQL Memory")
-                    ConversationRepository.appendMessages(storage, listOf(replyMsg))
-                    sqlRepo.recordInteractionLog(latestState.sessionId, "VOICE_OVERLAY", command, reply, toolUsed = "sql_memory")
+                    ConversationRepository.appendMessages(storage, listOf(replyMsg), targetSessionId = activeSessionId)
+                    sqlRepo.saveMessagesToSession(activeSessionId, listOf(replyMsg))
+                    sqlRepo.recordInteractionLog(activeSessionId, "VOICE_OVERLAY", command, reply, toolUsed = "sql_memory")
                     isRouting = false
                     statusNote = null
                     replyText = reply
@@ -503,7 +556,6 @@ private fun VoiceOverlaySheetContent(
                             currentForegroundApp = currentForegroundApp
                         )
                     } else {
-                        val sqlRepo = AgentSqlRepository(PersonalAgentDatabase.getInstance(context.applicationContext))
                         val sqlCtx = if (latestState.builtInGeminiSettings.injectSqlMemory) {
                             sqlRepo.buildPersonalContextBlock()
                         } else {
@@ -528,7 +580,8 @@ private fun VoiceOverlaySheetContent(
                                 isError = true,
                                 excludeFromContext = true
                             )
-                            ConversationRepository.appendMessages(storage, listOf(errMsg))
+                            ConversationRepository.appendMessages(storage, listOf(errMsg), targetSessionId = activeSessionId)
+                            sqlRepo.saveMessagesToSession(activeSessionId, listOf(errMsg))
                             isRouting = false
                             statusNote = null
                             errorNote = failText
@@ -553,7 +606,8 @@ private fun VoiceOverlaySheetContent(
                         isError = true,
                         excludeFromContext = true
                     )
-                    ConversationRepository.appendMessages(storage, listOf(errMsg))
+                    ConversationRepository.appendMessages(storage, listOf(errMsg), targetSessionId = activeSessionId)
+                    sqlRepo.saveMessagesToSession(activeSessionId, listOf(errMsg))
                     isRouting = false
                     statusNote = null
                     errorNote = failText
@@ -576,7 +630,8 @@ private fun VoiceOverlaySheetContent(
                         sender = MessageSender.AGENT,
                         text = warmReply
                     )
-                    ConversationRepository.appendMessages(storage, listOf(replyMsg))
+                    ConversationRepository.appendMessages(storage, listOf(replyMsg), targetSessionId = activeSessionId)
+                    sqlRepo.saveMessagesToSession(activeSessionId, listOf(replyMsg))
                     isRouting = false
                     statusNote = null
                     replyText = warmReply
@@ -597,6 +652,7 @@ private fun VoiceOverlaySheetContent(
                             resolvedTool.title,
                             resolvedTool.appName,
                             resolvedTool.query,
+                            resolvedTool.promptText,
                             resolvedTool.messageText,
                             resolvedTool.targetText,
                             resolvedTool.goal,
@@ -621,7 +677,8 @@ private fun VoiceOverlaySheetContent(
                             status = ApprovalStatus.BLOCKED,
                             notes = "Blocked by on-device financial/credential guardrail."
                         )
-                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec)
+                        ConversationRepository.appendMessages(storage, listOf(blockedMsg), blockedRec, activeSessionId)
+                        sqlRepo.saveMessagesToSession(activeSessionId, listOf(blockedMsg))
                         isRouting = false
                         statusNote = null
                         blockedReason = violation
@@ -642,7 +699,8 @@ private fun VoiceOverlaySheetContent(
                     riskLevel = resolvedTool.riskLevel,
                     steps = resolvedTool.steps.ifEmpty { listOf(resolvedTool.reason.ifBlank { command.take(80) }) },
                     isDemo = false,
-                    routedToolJson = resolvedTool.toJsonString()
+                    routedToolJson = resolvedTool.toJsonString(),
+                    sessionId = activeSessionId
                 )
 
                 // Mandatory Accessibility Service check for all phone-control tools
@@ -654,7 +712,8 @@ private fun VoiceOverlaySheetContent(
                         isError = true,
                         excludeFromContext = true
                     )
-                    ConversationRepository.appendMessages(storage, listOf(errMsg))
+                    ConversationRepository.appendMessages(storage, listOf(errMsg), targetSessionId = activeSessionId)
+                    sqlRepo.saveMessagesToSession(activeSessionId, listOf(errMsg))
                     isRouting = false
                     statusNote = null
                     errorNote = err
@@ -691,7 +750,8 @@ private fun VoiceOverlaySheetContent(
                     steps = plan.steps,
                     status = initialStatus
                 )
-                ConversationRepository.appendMessages(storage, listOf(cardMsg), record)
+                ConversationRepository.appendMessages(storage, listOf(cardMsg), record, activeSessionId)
+                sqlRepo.saveMessagesToSession(activeSessionId, listOf(cardMsg))
 
                 isRouting = false
                 statusNote = null
@@ -731,7 +791,12 @@ private fun VoiceOverlaySheetContent(
                     isError = true,
                     excludeFromContext = true
                 )
-                runCatching { ConversationRepository.appendMessages(storage, listOf(errMsg)) }
+                runCatching {
+                    ConversationRepository.appendMessages(storage, listOf(errMsg), targetSessionId = activeSessionId.ifBlank { null })
+                    if (activeSessionId.isNotBlank()) {
+                        sqlRepo.saveMessagesToSession(activeSessionId, listOf(errMsg))
+                    }
+                }
                 isRouting = false
                 statusNote = null
                 errorNote = failText
@@ -1045,8 +1110,18 @@ private fun VoiceOverlaySheetContent(
                                     actionId = approval.plan.actionId,
                                     status = ApprovalStatus.RUNNING,
                                     completedSteps = 0,
-                                    activeStep = 0
+                                    activeStep = 0,
+                                    targetSessionId = approval.plan.sessionId
                                 )
+                                if (approval.plan.sessionId.isNotBlank()) {
+                                    sqlRepo.updateActionInSession(
+                                        sessionId = approval.plan.sessionId,
+                                        actionId = approval.plan.actionId,
+                                        status = ApprovalStatus.RUNNING,
+                                        completedSteps = 0,
+                                        activeStep = 0
+                                    )
+                                }
                                 pendingApproval = null
                                 dispatchToAccessibilityAndClose(
                                     plan = approval.plan,
@@ -1065,8 +1140,18 @@ private fun VoiceOverlaySheetContent(
                                     status = ApprovalStatus.CANCELLED,
                                     completedSteps = 0,
                                     activeStep = -1,
-                                    notes = "Cancelled from quick overlay."
+                                    notes = "Cancelled from quick overlay.",
+                                    targetSessionId = approval.plan.sessionId
                                 )
+                                if (approval.plan.sessionId.isNotBlank()) {
+                                    sqlRepo.updateActionInSession(
+                                        sessionId = approval.plan.sessionId,
+                                        actionId = approval.plan.actionId,
+                                        status = ApprovalStatus.CANCELLED,
+                                        completedSteps = 0,
+                                        activeStep = -1
+                                    )
+                                }
                                 pendingApproval = null
                                 onCloseOverlay()
                             }

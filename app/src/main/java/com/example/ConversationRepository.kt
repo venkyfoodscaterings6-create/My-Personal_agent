@@ -3,7 +3,6 @@ package com.example
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -15,17 +14,21 @@ data class ActionLogEntry(
 )
 
 /**
- * Process-wide singleton repository for the active conversation session and completed action logs.
+ * Process-wide singleton repository for per-session conversation history and action logs.
  *
- * Shared by MainActivity / AgentViewModel, VoiceOverlayActivity (Quick Settings tile, notification,
- * wake word), and AgentAccessibilityService so follow-up commands ALWAYS append to and read from
- * the exact same active chat session without ever resetting or losing context.
+ * Enforces strict sessionId isolation:
+ * - Follow-ups from VoiceOverlayActivity / Quick Settings / notification attach to the active sessionId.
+ * - Background tasks or late completions tagged with an old sessionId are stored ONLY in their
+ *   original session bucket and NEVER bleed into a newly opened New Chat or another switched session.
  */
 object ConversationRepository {
 
     private const val MAX_ACTION_LOGS = 20
 
     private val lock = Any()
+
+    private val sessionMessages = LinkedHashMap<String, List<ChatMessage>>()
+    private val sessionActionLogs = LinkedHashMap<String, List<ActionLogEntry>>()
 
     private val _activeSessionId = MutableStateFlow("")
     val activeSessionId: StateFlow<String> = _activeSessionId.asStateFlow()
@@ -37,57 +40,126 @@ object ConversationRepository {
     val actionLogs: StateFlow<List<ActionLogEntry>> = _actionLogs.asStateFlow()
 
     fun syncFromPersisted(sessionId: String, persistedMessages: List<ChatMessage>) {
+        if (sessionId.isBlank()) return
         synchronized(lock) {
-            if (sessionId.isNotBlank()) {
-                _activeSessionId.value = sessionId
+            val currentActive = _activeSessionId.value
+            // Never allow a stale persisted emission from an old session to overwrite an active switched session.
+            if (currentActive.isNotBlank() && currentActive != sessionId) {
+                sessionMessages[sessionId] = persistedMessages
+                return
             }
+            _activeSessionId.value = sessionId
+            sessionMessages[sessionId] = persistedMessages
             _messages.value = persistedMessages
+            _actionLogs.value = sessionActionLogs[sessionId].orEmpty()
         }
     }
 
     /**
-     * Appends one or more messages into the active session (in-memory + persisted DataStore).
-     * Never resets sessionId.
+     * Appends one or more messages into the specified [targetSessionId] (or active session if null).
+     * If [targetSessionId] differs from [activeSessionId], updates ONLY that session's isolated bucket
+     * and never mutates the active UI's [messages] flow.
      */
     suspend fun appendMessages(
         storage: LocalStorage,
         newMessages: List<ChatMessage>,
-        newApproval: ApprovalRecord? = null
+        newApproval: ApprovalRecord? = null,
+        targetSessionId: String? = null
     ): List<ChatMessage> {
         if (newMessages.isEmpty() && newApproval == null) return _messages.value
-        val updated = synchronized(lock) {
-            val base = _messages.value
-            val existingIds = base.mapTo(HashSet()) { it.id }
-            val toAdd = newMessages.filter { it.id !in existingIds }
-            val merged = base + toAdd
-            _messages.value = merged
-            merged
+        val effectiveSessionId = targetSessionId?.takeIf { it.isNotBlank() } ?: _activeSessionId.value
+        val updated = if (effectiveSessionId.isNotBlank()) {
+            appendToSessionInternal(effectiveSessionId, newMessages).first
+        } else {
+            appendMessagesInMemory(newMessages)
         }
-        storage.appendChatAndApproval(newMessages, newApproval)
+        storage.appendChatAndApproval(
+            newMessages = newMessages,
+            newApproval = newApproval,
+            targetSessionId = effectiveSessionId.takeIf { it.isNotBlank() }
+        )
         return updated
     }
 
     /**
-     * In-memory append for deterministic unit testing or synchronous state alignment
-     * without resetting the active session.
+     * Strictly session-isolated in-memory append.
+     * Returns true if [targetSessionId] is the currently active session (and UI state updated),
+     * or false if the message was isolated to an inactive/background session without touching active chat.
+     */
+    fun appendToSessionInMemory(
+        targetSessionId: String,
+        newMessages: List<ChatMessage>
+    ): Boolean {
+        if (targetSessionId.isBlank() || newMessages.isEmpty()) return false
+        return appendToSessionInternal(targetSessionId, newMessages).second
+    }
+
+    private fun appendToSessionInternal(
+        targetSessionId: String,
+        newMessages: List<ChatMessage>
+    ): Pair<List<ChatMessage>, Boolean> {
+        return synchronized(lock) {
+            val base = sessionMessages[targetSessionId].orEmpty()
+            val existingIds = base.mapTo(HashSet()) { it.id }
+            val merged = base + newMessages.filter { it.id !in existingIds }
+            sessionMessages[targetSessionId] = merged
+            val isActive = _activeSessionId.value.isBlank() || _activeSessionId.value == targetSessionId
+            if (isActive) {
+                if (_activeSessionId.value.isBlank()) {
+                    _activeSessionId.value = targetSessionId
+                }
+                _messages.value = merged
+            }
+            merged to isActive
+        }
+    }
+
+    /**
+     * In-memory append into the currently active session.
      */
     fun appendMessagesInMemory(newMessages: List<ChatMessage>): List<ChatMessage> {
         return synchronized(lock) {
-            val base = _messages.value
+            val activeId = _activeSessionId.value
+            val base = if (activeId.isNotBlank()) sessionMessages[activeId] ?: _messages.value else _messages.value
             val existingIds = base.mapTo(HashSet()) { it.id }
             val merged = base + newMessages.filter { it.id !in existingIds }
+            if (activeId.isNotBlank()) {
+                sessionMessages[activeId] = merged
+            }
             _messages.value = merged
             merged
         }
     }
 
-    fun recordActionLog(summary: String, status: String) {
+    fun getMessagesForSession(sessionId: String): List<ChatMessage> {
+        if (sessionId.isBlank()) return emptyList()
+        return synchronized(lock) {
+            sessionMessages[sessionId].orEmpty()
+        }
+    }
+
+    fun recordActionLog(
+        summary: String,
+        status: String,
+        targetSessionId: String? = null
+    ) {
         val cleaned = summary.trim()
         if (cleaned.isBlank()) return
         synchronized(lock) {
-            val next = (_actionLogs.value + ActionLogEntry(summary = cleaned, status = status))
+            val effectiveSession = targetSessionId?.takeIf { it.isNotBlank() } ?: _activeSessionId.value
+            val currentLogs = if (effectiveSession.isNotBlank()) {
+                sessionActionLogs[effectiveSession].orEmpty()
+            } else {
+                _actionLogs.value
+            }
+            val next = (currentLogs + ActionLogEntry(summary = cleaned, status = status))
                 .takeLast(MAX_ACTION_LOGS)
-            _actionLogs.value = next
+            if (effectiveSession.isNotBlank()) {
+                sessionActionLogs[effectiveSession] = next
+            }
+            if (effectiveSession.isBlank() || effectiveSession == _activeSessionId.value) {
+                _actionLogs.value = next
+            }
         }
     }
 
@@ -101,11 +173,19 @@ object ConversationRepository {
     }
 
     /**
-     * Combines the latest persisted/in-memory messages so callers (including VoiceOverlayActivity)
-     * never drop messages written milliseconds earlier by AgentAccessibilityService.
+     * Combines the latest persisted/in-memory messages for the active session so callers
+     * (including VoiceOverlayActivity) never drop messages written milliseconds earlier
+     * by AgentAccessibilityService in the same session.
      */
-    fun mergeWithPersisted(persistedMessages: List<ChatMessage>): List<ChatMessage> {
+    fun mergeWithPersisted(
+        persistedMessages: List<ChatMessage>,
+        sessionId: String? = null
+    ): List<ChatMessage> {
         return synchronized(lock) {
+            val activeId = _activeSessionId.value
+            if (!sessionId.isNullOrBlank() && activeId.isNotBlank() && sessionId != activeId) {
+                return@synchronized _messages.value
+            }
             if (persistedMessages.isEmpty()) return@synchronized _messages.value
             val byId = LinkedHashMap<String, ChatMessage>()
             persistedMessages.forEach { byId[it.id] = it }
@@ -115,6 +195,9 @@ object ConversationRepository {
                 }
             }
             val merged = byId.values.toList()
+            if (activeId.isNotBlank()) {
+                sessionMessages[activeId] = merged
+            }
             _messages.value = merged
             merged
         }
@@ -156,19 +239,23 @@ object ConversationRepository {
 
     /**
      * Only called when the user explicitly clicks "New Chat" or switches saved chat threads.
-     * NEVER called from VoiceOverlayActivity, Quick Settings tile, or notifications.
+     * Cleanly isolates active messages and action logs to ONLY [newSessionId].
      */
     fun resetSessionExplicitly(newSessionId: String, initialMessages: List<ChatMessage> = emptyList()) {
         synchronized(lock) {
             _activeSessionId.value = newSessionId
+            sessionMessages[newSessionId] = initialMessages
             _messages.value = initialMessages
-            _actionLogs.value = emptyList()
+            _actionLogs.value = sessionActionLogs[newSessionId].orEmpty()
         }
     }
 
     fun clearForTest(sessionId: String = "test-session") {
         synchronized(lock) {
+            sessionMessages.clear()
+            sessionActionLogs.clear()
             _activeSessionId.value = sessionId
+            sessionMessages[sessionId] = emptyList()
             _messages.value = emptyList()
             _actionLogs.value = emptyList()
         }

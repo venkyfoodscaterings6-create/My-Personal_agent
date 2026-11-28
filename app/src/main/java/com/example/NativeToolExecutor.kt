@@ -176,9 +176,9 @@ object NativeToolExecutor {
         if (query.isBlank()) return null
 
         val pm = context.packageManager
-        val normalizedQuery = AppNameFuzzyMatcher.normalize(query)
 
-        for (hintPkg in AppNameFuzzyMatcher.aliasPackageHints(normalizedQuery)) {
+        // Priority 1: Exact built-in package aliases (supports both English & Telugu script)
+        for (hintPkg in AppNameFuzzyMatcher.aliasPackageHints(query)) {
             val directIntent = pm.getLaunchIntentForPackage(hintPkg)
             if (directIntent != null) {
                 return ResolvedAppLaunch(
@@ -464,12 +464,16 @@ object NativeToolExecutor {
             Uri.parse("tel:" + Uri.encode(cleanNumber))
         ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
+        // Immediately stop & block all TTS right before dialing/calling so agent never talks over calls
+        AudioSilenceGuard.markCallStarting()
+        AgentSpeechFeedback.stopSpeaking()
+
         return runCatching {
             context.startActivity(intent)
             if (hasCallPerm) {
-                ActionExecutionResult(true, "Calling $displayName ($rawNumber)")
+                ActionExecutionResult(true, "Calling $displayName")
             } else {
-                ActionExecutionResult(true, "Opened dialer for $displayName ($rawNumber) — grant Phone Calls permission in Setup & Test for direct dialing.")
+                ActionExecutionResult(true, "Opened dialer for $displayName — grant Phone Calls permission in Setup & Test for direct dialing.")
             }
         }.getOrElse { err ->
             ActionExecutionResult(false, "Could not start call to $displayName: ${err.message}")

@@ -123,17 +123,29 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
     var enableWakeWordAfterPermission by remember { mutableStateOf(false) }
     var voicePartialText by remember { mutableStateOf("") }
     var voiceFinalEvent by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var voiceBoundSessionId by remember { mutableStateOf("") }
 
     val latestVoiceSettings by rememberUpdatedState(uiState.voiceSettings)
     val latestDestination by rememberUpdatedState(uiState.destination)
     val latestLiveContinuous by rememberUpdatedState(uiState.liveContinuousMode)
+    val latestSessionId by rememberUpdatedState(uiState.sessionId)
 
     val startLiveListeningRef = remember { arrayOf<(() -> Unit)?>(null) }
 
     val speechFallbackLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        val boundSession = voiceBoundSessionId
+        voiceBoundSessionId = ""
         if (result.resultCode == Activity.RESULT_OK) {
+            // Strict session isolation: ignore late voice fallback results if user switched/started a New Chat
+            if (latestDestination != AppDestination.LIVE_VOICE &&
+                boundSession.isNotBlank() &&
+                boundSession != latestSessionId
+            ) {
+                voicePartialText = ""
+                return@rememberLauncherForActivityResult
+            }
             val spoken = result.data
                 ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                 ?.firstOrNull()
@@ -158,14 +170,19 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             onPartialText = { partial ->
                 if (latestDestination == AppDestination.LIVE_VOICE) {
                     viewModel.setLiveUserTranscript(partial)
-                } else {
+                } else if (voiceBoundSessionId.isBlank() || voiceBoundSessionId == latestSessionId) {
                     voicePartialText = partial
                 }
             },
             onFinalText = { finalText ->
+                val boundSession = voiceBoundSessionId
+                voiceBoundSessionId = ""
                 voicePartialText = ""
                 if (latestDestination == AppDestination.LIVE_VOICE) {
                     viewModel.handleLiveVoiceUtterance(finalText) { startLiveListeningRef[0]?.invoke() }
+                } else if (boundSession.isNotBlank() && boundSession != latestSessionId) {
+                    // Discard stale speech from a previous chat session
+                    return@VoiceController
                 } else if (latestVoiceSettings.autoSendVoiceCommands) {
                     viewModel.sendUserMessage(finalText)
                 } else {
@@ -175,10 +192,12 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             onRequestFallbackIntent = { intent ->
                 runCatching { speechFallbackLauncher.launch(intent) }
                     .onFailure {
+                        voiceBoundSessionId = ""
                         viewModel.showMessage("No voice recognition service available on this device.")
                     }
             },
             onVoiceError = { errMsg ->
+                voiceBoundSessionId = ""
                 voicePartialText = ""
                 if (latestDestination == AppDestination.LIVE_VOICE) {
                     viewModel.setLiveVoicePhase(LiveVoicePhase.IDLE)
@@ -186,6 +205,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                 viewModel.showMessage(errMsg)
             },
             onSilenceTimeout = {
+                voiceBoundSessionId = ""
                 voicePartialText = ""
                 if (latestDestination == AppDestination.LIVE_VOICE && latestLiveContinuous) {
                     scope.launch {
@@ -230,6 +250,14 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
         AgentSpeechFeedback.stopSpeaking()
     }
 
+    val cancelVoiceAndClearDrafts: () -> Unit = {
+        voiceController.stopListening()
+        stopAllSpeaking()
+        voiceBoundSessionId = ""
+        voicePartialText = ""
+        voiceFinalEvent = null
+    }
+
     DisposableEffect(voiceController) {
         onDispose { voiceController.destroy() }
     }
@@ -256,6 +284,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             startLiveListeningNow()
         } else if (granted && startMicAfterPermission) {
             startMicAfterPermission = false
+            voiceBoundSessionId = latestSessionId
             voicePartialText = ""
             voiceController.startListening(latestVoiceSettings.voiceLanguage)
         } else {
@@ -419,6 +448,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                 Manifest.permission.RECORD_AUDIO
             ) == PackageManager.PERMISSION_GRANTED
             if (hasMic) {
+                voiceBoundSessionId = latestSessionId
                 voicePartialText = ""
                 voiceController.startListening(uiState.voiceSettings.voiceLanguage)
             } else {
@@ -537,7 +567,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                             colors = drawerItemColors,
                             onClick = {
                                 scope.launch { drawerState.close() }
-                                stopAllSpeaking()
+                                cancelVoiceAndClearDrafts()
                                 viewModel.startNewChat()
                             },
                             modifier = Modifier
@@ -621,7 +651,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                                         )
                                         .clickable {
                                             scope.launch { drawerState.close() }
-                                            stopAllSpeaking()
+                                            cancelVoiceAndClearDrafts()
                                             viewModel.selectChatThread(thread.id)
                                         }
                                         .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp)
@@ -805,14 +835,17 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
             ) {
                 when (uiState.destination) {
                     AppDestination.CHAT -> ChatScreen(
+                        sessionId = uiState.sessionId,
                         messages = uiState.chatMessages,
+                        hasMoreOlderMessages = uiState.hasMoreOlderMessages,
+                        isLoadingOlderMessages = uiState.isLoadingOlderMessages,
+                        onLoadOlderMessages = viewModel::loadOlderMessages,
                         providers = uiState.providers,
                         activeProvider = uiState.activeProvider,
                         activeHeaderLabel = uiState.activeHeaderLabel,
                         isUsingBuiltInGemini = uiState.isUsingBuiltInGemini,
                         builtInGeminiSettings = uiState.builtInGeminiSettings,
                         streamingAssistantText = uiState.streamingAssistantText,
-                        agentMode = uiState.agentMode,
                         quickActionChips = uiState.quickActionChips,
                         showStepPlan = uiState.safetyRules.showStepPlan,
                         isSending = uiState.isSending,
@@ -827,6 +860,7 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         onToggleMic = onToggleMic,
                         onStopMicSilently = {
                             voiceController.stopListening()
+                            voiceBoundSessionId = ""
                             voicePartialText = ""
                         },
                         onOpenLiveVoice = openLiveVoiceMode,
@@ -837,12 +871,11 @@ fun PersonalAgentApp(viewModel: AgentViewModel) {
                         onStopAgent = viewModel::stopRunningAgent,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
                         onNewChat = {
-                            stopAllSpeaking()
+                            cancelVoiceAndClearDrafts()
                             viewModel.startNewChat()
                         },
                         onSelectBuiltInGemini = viewModel::selectBuiltInGeminiModel,
                         onSelectProvider = viewModel::selectDefaultProvider,
-                        onToggleMode = viewModel::setAgentMode,
                         onSendMessage = viewModel::sendUserMessage,
                         onApproveAction = approveWithNotificationCheck,
                         onEditActionInstruction = viewModel::editActionInstruction,

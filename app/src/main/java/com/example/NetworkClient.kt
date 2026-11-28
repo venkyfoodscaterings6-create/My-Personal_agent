@@ -375,21 +375,22 @@ class NetworkClient {
         conversationHistory: List<ChatMessage> = emptyList()
     ): NextActionApiResult = withContext(Dispatchers.IO) {
         val systemPrompt = buildString {
-            appendLine("You control an Android phone via AccessibilityService. You receive up to 45 visible screen elements formatted as [id] text | desc | clickable | editable, the current app, and the last 5 actions.")
+            appendLine("You control an Android phone via AccessibilityService. You receive up to 50 visible screen elements formatted as [id] text | desc | resourceId | clickable,editable,scrollable @(x,y), the current app, and the last 5 actions.")
             appendLine("Reply with ONE compact JSON object only (no markdown, no explanation).")
             appendLine("Actions:")
             appendLine("""{"action":"open_app","appName":"YouTube","reason":"Open YouTube"}""")
-            appendLine("""{"action":"tap","index":3,"reason":"Tap first video"}""")
-            appendLine("""{"action":"type_text","index":2,"text":"hello","submit":true,"reason":"Type and submit search"}""")
-            appendLine("""{"action":"scroll","direction":"down","reason":"Scroll down"}""")
-            appendLine("""{"action":"back","reason":"Go back"}""")
-            appendLine("""{"action":"home","reason":"Go home"}""")
+            appendLine("""{"action":"tap","index":3,"reason":"Tap element 3"}""")
+            appendLine("""{"action":"tap","x":540,"y":1200,"reason":"Tap coordinates"}""")
+            appendLine("""{"action":"type_text","index":2,"text":"hello","submit":true,"reason":"Type and submit"}""")
+            appendLine("""{"action":"scroll","direction":"down|up|left|right","reason":"Scroll screen"}""")
+            appendLine("""{"action":"press_back","reason":"Go back"}""")
+            appendLine("""{"action":"wait","reason":"Wait for loading content"}""")
             appendLine("""{"action":"done","summary":"Short factual summary of what changed","evidence":"exact visible text on current screen proving completion","reason":"Done"}""")
             appendLine("CRITICAL RULES:")
             appendLine("- If the current foreground app in SCREEN is ALREADY the app needed for the goal, NEVER return open_app to relaunch it — act directly on visible elements.")
             appendLine("- NEVER return \"done\" on Step 1 before performing a real action, and NEVER return \"done\" if the last action produced zero screen change.")
             appendLine("- When returning \"done\", you MUST include \"evidence\": the exact visible text currently on screen that proves the goal succeeded.")
-            appendLine("- For ride booking (Uber/Ola/Rapido): set the destination and reach the ride-selection/fare screen, then return \"done\" with visible fare/ride-option evidence. NEVER tap the final Confirm / Book / Pay button.")
+            appendLine("- SAFE FINAL STOP: For shopping, food delivery, or ride apps (Amazon, Flipkart, Swiggy, Zomato, Uber, Ola, Rapido), navigate up to checkout/fare screen and return \"done\" — NEVER tap final Pay, Place Order, or Confirm Booking buttons.")
             appendLine("- Never interact with bank transfers, UPI PINs, OTPs, or password fields.")
         }
 
@@ -435,10 +436,17 @@ class NetworkClient {
                     return@withContext NextActionApiResult.Error("AI response did not specify an action.")
                 }
 
+                val parsedIndex = when {
+                    json.has("index") && !json.isNull("index") -> json.optInt("index")
+                    json.has("nodeId") && !json.isNull("nodeId") -> json.optInt("nodeId")
+                    json.has("node_id") && !json.isNull("node_id") -> json.optInt("node_id")
+                    else -> null
+                }
+
                 val parsed = OnDeviceAgentAction(
                     action = actionType,
                     appName = json.optString("appName").takeIf { it.isNotBlank() },
-                    index = if (json.has("index") && !json.isNull("index")) json.optInt("index") else null,
+                    index = parsedIndex,
                     x = if (json.has("x") && !json.isNull("x")) json.optInt("x") else null,
                     y = if (json.has("y") && !json.isNull("y")) json.optInt("y") else null,
                     text = json.optString("text").takeIf { it.isNotBlank() },

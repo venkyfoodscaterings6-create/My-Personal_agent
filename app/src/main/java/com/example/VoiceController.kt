@@ -56,6 +56,7 @@ class VoiceController(
     ) {
         currentLanguage = language
         continuousSoftRetryMode = continuousSoftRetry
+        AudioSilenceGuard.setMicListening(true)
         AgentSpeechFeedback.stopSpeaking()
 
         mainHandler.post {
@@ -68,6 +69,7 @@ class VoiceController(
             if (!SpeechRecognizer.isRecognitionAvailable(context)) {
                 isSessionActive = false
                 _isListening.value = false
+                AudioSilenceGuard.setMicListening(false)
                 _micRmsEnergy.value = 0f
                 onRequestFallbackIntent(buildFallbackSpeechIntent(language))
                 return@post
@@ -156,6 +158,7 @@ class VoiceController(
                         SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                             isSessionActive = false
                             _isListening.value = false
+                            AudioSilenceGuard.setMicListening(false)
                             _micRmsEnergy.value = 0f
                             cancelTimers()
                             onVoiceError("Microphone permission is required for voice commands.")
@@ -169,6 +172,7 @@ class VoiceController(
                             } else {
                                 isSessionActive = false
                                 _isListening.value = false
+                                AudioSilenceGuard.setMicListening(false)
                                 _micRmsEnergy.value = 0f
                                 cancelTimers()
                                 onRequestFallbackIntent(buildFallbackSpeechIntent(language))
@@ -202,6 +206,7 @@ class VoiceController(
                     } else {
                         isSessionActive = false
                         _isListening.value = false
+                        AudioSilenceGuard.setMicListening(false)
                         _micRmsEnergy.value = 0f
                         cancelTimers()
                         if (continuousSoftRetryMode && onSilenceTimeout != null) {
@@ -241,6 +246,7 @@ class VoiceController(
             } else {
                 isSessionActive = false
                 _isListening.value = false
+                AudioSilenceGuard.setMicListening(false)
                 _micRmsEnergy.value = 0f
                 cancelTimers()
                 destroySpeechRecognizerOnly()
@@ -275,6 +281,7 @@ class VoiceController(
         sessionToken++
         cancelTimers()
         _isListening.value = false
+        AudioSilenceGuard.setMicListening(false)
         _micRmsEnergy.value = 0f
         destroySpeechRecognizerOnly()
 
@@ -294,6 +301,7 @@ class VoiceController(
         sessionToken++
         cancelTimers()
         _isListening.value = false
+        AudioSilenceGuard.setMicListening(false)
         _micRmsEnergy.value = 0f
         destroySpeechRecognizerOnly()
         speechBuffer.clear()
@@ -335,6 +343,7 @@ class VoiceController(
         cancelTimers()
         speechBuffer.clear()
         _isListening.value = false
+        AudioSilenceGuard.setMicListening(false)
         _micRmsEnergy.value = 0f
         runCatching { speechRecognizer?.stopListening() }
         destroySpeechRecognizerOnly()

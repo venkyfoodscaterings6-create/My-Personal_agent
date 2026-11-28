@@ -357,12 +357,12 @@ class FirebaseAiService {
         conversationHistory: List<ChatMessage> = emptyList()
     ): NextActionApiResult = withContext(Dispatchers.IO) {
         val systemPrompt = buildString {
-            appendLine("You control an Android phone via AccessibilityService. Reply with ONE compact JSON object only.")
-            appendLine("""Actions: {"action":"open_app","appName":"..."} | {"action":"tap","index":3} | {"action":"type_text","index":2,"text":"...","submit":true} | {"action":"scroll","direction":"down"} | {"action":"back"} | {"action":"home"} | {"action":"done","summary":"...","evidence":"exact visible screen text proving completion"}""")
+            appendLine("You control an Android phone via AccessibilityService (up to 50 elements: [id] text | desc | resourceId | flags @(x,y)). Reply with ONE compact JSON object only.")
+            appendLine("""Actions: {"action":"open_app","appName":"..."} | {"action":"tap","index":3} | {"action":"tap","x":540,"y":1200} | {"action":"type_text","index":2,"text":"...","submit":true} | {"action":"scroll","direction":"down|up|left|right"} | {"action":"press_back"} | {"action":"wait"} | {"action":"done","summary":"...","evidence":"exact visible screen text proving completion"}""")
             appendLine("- If the current foreground app in SCREEN is ALREADY the needed app, NEVER return open_app — act directly on visible elements.")
             appendLine("- NEVER return done on Step 1 before performing a real action, and NEVER return done when the last action produced zero screen change.")
             appendLine("- Always include \"evidence\" inside \"done\" quoting exact visible text on the current screen.")
-            appendLine("- For ride booking (Uber/Ola/Rapido): set destination and reach the ride-selection screen, then return done. NEVER tap the final Confirm / Book / Pay button.")
+            appendLine("- SAFE FINAL STOP: For shopping, food delivery, or ride apps (Amazon, Flipkart, Swiggy, Zomato, Uber, Ola, Rapido), stop before final Pay / Place Order / Confirm Booking buttons and return done.")
             appendLine("- Never interact with bank transfers, UPI PINs, OTPs, or password fields.")
         }
 
@@ -418,11 +418,18 @@ class FirebaseAiService {
                     return@withContext NextActionApiResult.Error("Gemini step response missing action field.")
                 }
 
+                val parsedIndex = when {
+                    json.has("index") && !json.isNull("index") -> json.optInt("index")
+                    json.has("nodeId") && !json.isNull("nodeId") -> json.optInt("nodeId")
+                    json.has("node_id") && !json.isNull("node_id") -> json.optInt("node_id")
+                    else -> null
+                }
+
                 return@withContext NextActionApiResult.Success(
                     OnDeviceAgentAction(
                         action = actionType,
                         appName = json.optString("appName").takeIf { it.isNotBlank() },
-                        index = if (json.has("index") && !json.isNull("index")) json.optInt("index") else null,
+                        index = parsedIndex,
                         x = if (json.has("x") && !json.isNull("x")) json.optInt("x") else null,
                         y = if (json.has("y") && !json.isNull("y")) json.optInt("y") else null,
                         text = json.optString("text").takeIf { it.isNotBlank() },

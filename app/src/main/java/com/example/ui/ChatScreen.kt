@@ -129,7 +129,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import com.example.ActionPlan
-import com.example.AgentMode
 import com.example.AiProvider
 import com.example.ApiFormat
 import com.example.ApprovalStatus
@@ -171,14 +170,17 @@ private fun Modifier.pressScale(interactionSource: MutableInteractionSource): Mo
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
+    sessionId: String,
     messages: List<ChatMessage>,
+    hasMoreOlderMessages: Boolean = false,
+    isLoadingOlderMessages: Boolean = false,
+    onLoadOlderMessages: () -> Unit = {},
     providers: List<AiProvider>,
     activeProvider: AiProvider?,
     activeHeaderLabel: String,
     isUsingBuiltInGemini: Boolean,
     builtInGeminiSettings: BuiltInGeminiSettings,
     streamingAssistantText: String,
-    agentMode: AgentMode,
     quickActionChips: List<String>,
     showStepPlan: Boolean,
     isSending: Boolean,
@@ -202,7 +204,6 @@ fun ChatScreen(
     onNewChat: () -> Unit,
     onSelectBuiltInGemini: (GeminiBuiltInModel) -> Unit,
     onSelectProvider: (String) -> Unit,
-    onToggleMode: (AgentMode) -> Unit,
     onSendMessage: (String) -> Unit,
     onApproveAction: (String) -> Unit,
     onEditActionInstruction: (String, String) -> Unit,
@@ -254,7 +255,11 @@ fun ChatScreen(
                     )
                 } else {
                     ChatMessageFeed(
+                        sessionId = sessionId,
                         messages = messages,
+                        hasMoreOlderMessages = hasMoreOlderMessages,
+                        isLoadingOlderMessages = isLoadingOlderMessages,
+                        onLoadOlderMessages = onLoadOlderMessages,
                         memorySuggestions = memorySuggestions,
                         showStepPlan = showStepPlan,
                         isSending = isSending,
@@ -285,7 +290,7 @@ fun ChatScreen(
 
             // Strictly isolated bottom input bar with unified navBars.union(ime) inset handling
             BottomPillInputBar(
-                agentMode = agentMode,
+                sessionId = sessionId,
                 canUseWebSearch = isUsingBuiltInGemini || activeProvider?.apiFormat == ApiFormat.GEMINI_NATIVE,
                 googleSearchEnabled = builtInGeminiSettings.googleSearchEnabled,
                 isSending = isSending || isAgentLoopRunning,
@@ -299,7 +304,6 @@ fun ChatScreen(
                 onToggleGoogleSearch = onToggleGoogleSearch,
                 onToggleVoiceLanguage = onToggleVoiceLanguage,
                 onConsumeVoiceFinal = onConsumeVoiceFinal,
-                onToggleMode = onToggleMode,
                 onSend = onSendMessage
             )
         }
@@ -519,7 +523,11 @@ private fun MinimalEmptyGreeting(
 
 @Composable
 private fun ChatMessageFeed(
+    sessionId: String,
     messages: List<ChatMessage>,
+    hasMoreOlderMessages: Boolean,
+    isLoadingOlderMessages: Boolean,
+    onLoadOlderMessages: () -> Unit,
     memorySuggestions: Map<String, MemorySuggestion>,
     showStepPlan: Boolean,
     isSending: Boolean,
@@ -539,15 +547,40 @@ private fun ChatMessageFeed(
 ) {
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
+    val glass = LocalAgentGlassColors.current
 
     // Track session mount time & already-animated message IDs so history rows never animate when scrolling.
-    val sessionMountMillis = remember { System.currentTimeMillis() }
-    val animatedMessageIds = remember { hashSetOf<String>() }
+    val sessionMountMillis = remember(sessionId) { System.currentTimeMillis() }
+    val animatedMessageIds = remember(sessionId) { hashSetOf<String>() }
+    var initialScrollDone by remember(sessionId) { mutableStateOf(false) }
+    val lastMessageId = messages.lastOrNull()?.id
 
-    LaunchedEffect(messages.size, isSending, streamingAssistantText.length / 40) {
-        val target = messages.size + if (isSending) 1 else 0
+    // Scroll to bottom when opening a session or when a new message / streaming token arrives at the end.
+    // Prepending older paginated messages keeps lastMessageId unchanged so scroll doesn't jump to bottom.
+    LaunchedEffect(sessionId, lastMessageId, isSending, streamingAssistantText.length / 40) {
+        val headerOffset = if (hasMoreOlderMessages) 1 else 0
+        val target = headerOffset + messages.size + if (isSending) 1 else 0
         if (target > 0) {
             listState.scrollToItem((target - 1).coerceAtLeast(0))
+            initialScrollDone = true
+        }
+    }
+
+    // Lazy load older messages from Room when user scrolls up to the top item
+    LaunchedEffect(
+        listState.firstVisibleItemIndex,
+        listState.isScrollInProgress,
+        hasMoreOlderMessages,
+        isLoadingOlderMessages,
+        initialScrollDone
+    ) {
+        if (initialScrollDone &&
+            listState.isScrollInProgress &&
+            listState.firstVisibleItemIndex == 0 &&
+            hasMoreOlderMessages &&
+            !isLoadingOlderMessages
+        ) {
+            onLoadOlderMessages()
         }
     }
 
@@ -557,6 +590,46 @@ private fun ChatMessageFeed(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        if (hasMoreOlderMessages) {
+            item(key = "load_older_messages_header", contentType = "load_more") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .frostedPill(cornerRadius = 18.dp, active = false)
+                            .clickable(enabled = !isLoadingOlderMessages, onClick = onLoadOlderMessages)
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                            .testTag("load_older_messages_button"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (isLoadingOlderMessages) {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(14.dp),
+                                color = glass.accentBlue
+                            )
+                            Text(
+                                text = "Loading older messages…",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            Text(
+                                text = "Load older messages",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         items(
             items = messages,
             key = { it.id },
@@ -1477,7 +1550,7 @@ private fun StopAgentFloatingBar(
 
 @Composable
 private fun BottomPillInputBar(
-    agentMode: AgentMode,
+    sessionId: String,
     canUseWebSearch: Boolean,
     googleSearchEnabled: Boolean,
     isSending: Boolean,
@@ -1491,7 +1564,6 @@ private fun BottomPillInputBar(
     onToggleGoogleSearch: () -> Unit,
     onToggleVoiceLanguage: () -> Unit,
     onConsumeVoiceFinal: () -> Unit,
-    onToggleMode: (AgentMode) -> Unit,
     onSend: (String) -> Unit
 ) {
     // STRICTLY ISOLATED TYPING & FOCUS STATE: typing never recomposes chat list or top bar.
@@ -1500,6 +1572,12 @@ private fun BottomPillInputBar(
     var isFocused by remember { mutableStateOf(false) }
     val sendInteraction = remember { MutableInteractionSource() }
     val micInteraction = remember { MutableInteractionSource() }
+
+    // Strict Chat Session Isolation: immediately clear text input on New Chat or chat switch
+    LaunchedEffect(sessionId) {
+        draft = ""
+        draftPopulatedByVoice = false
+    }
 
     // Stream patient accumulated voice transcript directly into the live input box
     LaunchedEffect(isListening, voicePartialText) {
@@ -1579,13 +1657,13 @@ private fun BottomPillInputBar(
                 ) {
                     if (draft.isEmpty()) {
                         Text(
-                            text = when {
-                                isListening -> when (voiceLanguage) {
+                            text = if (isListening) {
+                                when (voiceLanguage) {
                                     VoiceLanguage.TE_IN -> "వింటున్నాను (తెలుగు)…"
                                     VoiceLanguage.EN_IN -> "Listening (EN-IN)…"
                                 }
-                                agentMode == AgentMode.AGENT_CONTROL -> "Message agent…"
-                                else -> "Message…"
+                            } else {
+                                "Ask anything or command your phone…"
                             },
                             style = MaterialTheme.typography.bodyLarge,
                             color = if (isListening) {
@@ -1613,37 +1691,40 @@ private fun BottomPillInputBar(
                     )
                 }
 
-                // Separate Chat | Agent toggle on left; Web Search, EN/తెలుగు, Live Voice, Mic, Send on right
+                // Unified Smart Agent controls: Web Search & EN/తెలుగు on left; Live Voice, Mic, Send on right
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    SlidingModeTogglePill(
-                        agentMode = agentMode,
-                        onToggleMode = onToggleMode
-                    )
-
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        // Web Search (Live Facts) toggle in Chat mode for Built-in Gemini & Gemini Native
-                        if (canUseWebSearch && agentMode != AgentMode.AGENT_CONTROL) {
-                            Box(
+                        // Web Search (Live Facts) toggle for Built-in Gemini & Gemini Native
+                        if (canUseWebSearch) {
+                            Row(
                                 modifier = Modifier
-                                    .size(34.dp)
+                                    .height(34.dp)
                                     .frostedPill(cornerRadius = 17.dp, active = googleSearchEnabled)
                                     .clickable(onClick = onToggleGoogleSearch)
+                                    .padding(horizontal = 10.dp)
                                     .testTag("google_search_toggle"),
-                                contentAlignment = Alignment.Center
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Public,
                                     contentDescription = stringResource(R.string.action_toggle_google_search),
                                     tint = if (googleSearchEnabled) accentBlue
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(17.dp)
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "Web",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                    color = if (googleSearchEnabled) accentBlue
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -1654,7 +1735,7 @@ private fun BottomPillInputBar(
                                 .height(34.dp)
                                 .frostedPill(cornerRadius = 17.dp, active = false)
                                 .clickable(onClick = onToggleVoiceLanguage)
-                                .padding(horizontal = 8.dp)
+                                .padding(horizontal = 10.dp)
                                 .testTag("voice_language_toggle"),
                             contentAlignment = Alignment.Center
                         ) {
@@ -1664,7 +1745,12 @@ private fun BottomPillInputBar(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                         }
+                    }
 
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
                         // 1-tap Live Voice + 3D Agent conversation launcher
                         Box(
                             modifier = Modifier
@@ -1726,92 +1812,6 @@ private fun BottomPillInputBar(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun SlidingModeTogglePill(
-    agentMode: AgentMode,
-    onToggleMode: (AgentMode) -> Unit
-) {
-    val glass = LocalAgentGlassColors.current
-    val isAgentSelected = agentMode == AgentMode.AGENT_CONTROL
-    val slideIndex = animateFloatAsState(
-        targetValue = if (isAgentSelected) 1f else 0f,
-        animationSpec = tween(durationMillis = 190, easing = FastOutSlowInEasing),
-        label = "mode_pill_slide"
-    )
-
-    val trackBg = glass.nestedCardFill
-    val activeThumbColor = glass.accentBlue.copy(alpha = 0.88f)
-
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(18.dp))
-            .border(1.dp, glass.luminousBorderBrush(), RoundedCornerShape(18.dp))
-            .drawBehind {
-                val radius = CornerRadius(18.dp.toPx(), 18.dp.toPx())
-                drawRoundRect(color = trackBg, cornerRadius = radius)
-
-                val pad = 3.dp.toPx()
-                val thumbWidth = (size.width - pad * 2f) / 2f
-                val thumbHeight = size.height - pad * 2f
-                val left = pad + slideIndex.value * thumbWidth
-                drawRoundRect(
-                    color = activeThumbColor,
-                    topLeft = Offset(left, pad),
-                    size = Size(thumbWidth, thumbHeight),
-                    cornerRadius = CornerRadius(15.dp.toPx(), 15.dp.toPx())
-                )
-            }
-            .padding(3.dp)
-            .testTag("mode_toggle_pill"),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        ModeSegmentChip(
-            label = "Chat",
-            selected = !isAgentSelected,
-            onClick = { onToggleMode(AgentMode.CHAT_ONLY) },
-            modifier = Modifier.testTag("mode_chat_option")
-        )
-        ModeSegmentChip(
-            label = "Agent",
-            selected = isAgentSelected,
-            onClick = { onToggleMode(AgentMode.AGENT_CONTROL) },
-            modifier = Modifier.testTag("mode_agent_option")
-        )
-    }
-}
-
-@Composable
-private fun ModeSegmentChip(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val contentColor = if (selected) {
-        Color.White
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    Box(
-        modifier = modifier
-            .width(48.dp)
-            .clip(RoundedCornerShape(15.dp))
-            .clickable(onClick = onClick)
-            .padding(vertical = 6.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall.copy(
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
-            ),
-            color = contentColor,
-            maxLines = 1
-        )
     }
 }
 

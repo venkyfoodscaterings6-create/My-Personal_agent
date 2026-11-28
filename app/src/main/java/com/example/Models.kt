@@ -308,7 +308,8 @@ data class ActionPlan(
     val isDemo: Boolean = false,
     val fastPathType: String? = null,
     val fastPathArg: String? = null,
-    val routedToolJson: String? = null
+    val routedToolJson: String? = null,
+    val sessionId: String = ""
 )
 
 @Immutable
@@ -358,6 +359,8 @@ object ToolName {
     const val REPLY_TO_USER = "reply_to_user"
     const val PLAY_YOUTUBE_VIDEO = "play_youtube_video"
     const val OPEN_APP = "open_app"
+    const val OPEN_APP_AND_DO = "open_app_and_do"
+    const val OPEN_APP_AND_PROMPT = "open_app_and_prompt"
     const val SEARCH_YOUTUBE = "search_youtube"
     const val SEARCH_WEB = "search_web"
     const val OPEN_MAPS = "open_maps"
@@ -394,6 +397,7 @@ object ToolName {
 data class RoutedToolCall(
     val tool: String,
     val appName: String? = null,
+    val promptText: String? = null,
     val query: String? = null,
     val destination: String? = null,
     val hour: Int? = null,
@@ -418,6 +422,8 @@ data class RoutedToolCall(
     val isLowRiskAutoRunnableMediaOrAlarm: Boolean
         get() = tool in setOf(
             ToolName.PLAY_YOUTUBE_VIDEO,
+            ToolName.OPEN_APP_AND_DO,
+            ToolName.OPEN_APP_AND_PROMPT,
             ToolName.SEARCH_YOUTUBE,
             ToolName.SEARCH_WEB,
             ToolName.OPEN_MAPS,
@@ -448,6 +454,7 @@ data class RoutedToolCall(
         val map = LinkedHashMap<String, Any>()
         map["tool"] = tool
         appName?.let { map["appName"] = it }
+        promptText?.let { map["promptText"] = it }
         query?.let { map["query"] = it }
         destination?.let { map["destination"] = it }
         hour?.let { map["hour"] = it }
@@ -808,15 +815,90 @@ object SafetyGuardrail {
 
 object AppNameFuzzyMatcher {
 
+    private val fillerTokens = setOf("app", "application", "the", "my", "open", "launch", "యాప్")
+
     fun normalize(raw: String): String {
         return raw.lowercase().replace(Regex("[^a-z0-9]"), "")
     }
 
-    fun aliasPackageHints(normalizedQuery: String): List<String> {
+    fun normalizeUnicodeKey(raw: String): String {
+        return raw.trim()
+            .lowercase()
+            .replace("\u200C", "")
+            .replace("\u200D", "")
+            .replace(Regex("\\s+"), " ")
+            .trimEnd('.', '!', '?', ',')
+            .removeSuffix(" app")
+            .removeSuffix(" యాప్")
+            .trim()
+    }
+
+    private fun tokenizeMeaningful(raw: String): List<String> {
+        return raw.lowercase()
+            .replace(Regex("[^a-z0-9\\u0C00-\\u0C7F]+"), " ")
+            .trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() && it !in fillerTokens }
+    }
+
+    /**
+     * Priority 1: Exact built-in package aliases (English + Telugu script).
+     * Always checked BEFORE generic token or substring matching so "Google Chrome" / "గూగుల్ క్రోమ్"
+     * strictly maps to com.android.chrome and NEVER to com.google.android.googlequicksearchbox ("Google").
+     */
+    fun aliasPackageHints(rawOrNormalizedQuery: String): List<String> {
+        val unicodeKey = normalizeUnicodeKey(rawOrNormalizedQuery)
+        val exactUnicode = when (unicodeKey) {
+            "chrome", "google chrome", "క్రోమ్", "గూగుల్ క్రోమ్" ->
+                listOf("com.android.chrome")
+            "google", "google app", "గూగుల్", "గూగుల్ యాప్" ->
+                listOf("com.google.android.googlequicksearchbox")
+            "youtube", "you tube", "yt", "యూట్యూబ్", "యుట్యూబ్" ->
+                listOf("com.google.android.youtube")
+            "maps", "google maps", "మ్యాప్స్", "గూగుల్ మ్యాప్స్" ->
+                listOf("com.google.android.apps.maps")
+            "whatsapp", "whats app", "wa", "వాట్సాప్", "వాట్సప్" ->
+                listOf("com.whatsapp", "com.whatsapp.w4b")
+            "uber", "ఉబర్", "ఊబర్" ->
+                listOf("com.ubercab")
+            "ola", "ఓలా" ->
+                listOf("com.olacabs.customer")
+            "rapido", "రాపిడో" ->
+                listOf("com.rapido.passenger")
+            "claude", "claude ai", "anthropic claude", "క్లాడ్" ->
+                listOf("com.anthropic.claude")
+            "chatgpt", "chat gpt", "openai", "gpt", "చాట్ జిపిటి", "చాట్జిపిటి" ->
+                listOf("com.openai.chatgpt")
+            "settings", "సెట్టింగ్స్" ->
+                listOf("com.android.settings")
+            "swiggy", "swigy", "స్విగ్గీ", "స్విగ్గి" ->
+                listOf("in.swiggy.android")
+            "zomato", "zomoto", "zomatto", "జొమాటో", "జోమాటో" ->
+                listOf("com.application.zomato")
+            "amazon", "అమెజాన్" ->
+                listOf("in.amazon.mShop.android.shopping", "com.amazon.mShop.android.shopping")
+            "flipkart", "ఫ్లిప్కార్ట్", "ఫ్లిప్ కార్ట్" ->
+                listOf("com.flipkart.android")
+            "spotify", "స్పాటిఫై" ->
+                listOf("com.spotify.music")
+            "instagram", "ig", "insta", "ఇన్స్టాగ్రామ్", "ఇన్‌స్టాగ్రామ్" ->
+                listOf("com.instagram.android")
+            "gmail", "mail", "జీమెయిల్", "జిమెయిల్" ->
+                listOf("com.google.android.gm")
+            "telegram", "tg", "టెలిగ్రామ్" ->
+                listOf("org.telegram.messenger")
+            "play store", "playstore", "google play", "ప్లే స్టోర్" ->
+                listOf("com.android.vending")
+            else -> emptyList()
+        }
+        if (exactUnicode.isNotEmpty()) return exactUnicode
+
+        val normalizedQuery = normalize(rawOrNormalizedQuery)
         return when (normalizedQuery) {
             "youtube", "yt" -> listOf("com.google.android.youtube")
             "whatsapp", "wa" -> listOf("com.whatsapp", "com.whatsapp.w4b")
             "chrome", "googlechrome" -> listOf("com.android.chrome")
+            "google", "googleapp" -> listOf("com.google.android.googlequicksearchbox")
             "gmail", "mail" -> listOf("com.google.android.gm")
             "maps", "googlemaps" -> listOf("com.google.android.apps.maps")
             "playstore", "googleplay" -> listOf("com.android.vending")
@@ -835,6 +917,14 @@ object AppNameFuzzyMatcher {
             "netflix" -> listOf("com.netflix.mediaclient")
             "hotstar", "jiohotstar" -> listOf("in.startv.hotstar")
             "primevideo", "amazonprime" -> listOf("com.amazon.avod.thirdpartyclient")
+            "claude", "claudeai", "anthropicclaude" -> listOf("com.anthropic.claude")
+            "chatgpt", "openai", "gpt" -> listOf("com.openai.chatgpt")
+            "perplexity", "perplexityai" -> listOf("ai.perplexity.app.android")
+            "copilot", "microsoftcopilot" -> listOf("com.microsoft.copilot")
+            "deepseek", "deepseekai" -> listOf("com.deepseek.chat")
+            "grok", "grokai" -> listOf("ai.x.grok")
+            "gemini", "googlegemini" -> listOf("com.google.android.apps.bard")
+            "poe" -> listOf("com.poe.android")
             "settings" -> listOf("com.android.settings")
             "clock", "alarm" -> listOf("com.google.android.deskclock", "com.android.deskclock")
             "calendar" -> listOf("com.google.android.calendar", "com.android.calendar")
@@ -850,46 +940,93 @@ object AppNameFuzzyMatcher {
     fun findBestMatch(query: String, installedApps: List<InstalledAppInfo>): InstalledAppInfo? {
         val cleaned = query.trim()
         if (cleaned.isBlank() || installedApps.isEmpty()) return null
-        val normQuery = normalize(cleaned)
-        if (normQuery.isBlank()) return null
 
-        // 1. Exact display name match
-        installedApps.firstOrNull { it.displayName.equals(cleaned, ignoreCase = true) }?.let { return it }
-
-        // 2. Exact normalized match ("you tube" -> "youtube" matches "YouTube")
-        installedApps.firstOrNull { it.normalizedName == normQuery }?.let { return it }
-
-        // 3. Alias package match ("yt" -> com.google.android.youtube)
-        val hints = aliasPackageHints(normQuery)
+        // Priority 1: Exact Built-in Package Aliases FIRST (supports English + Telugu script)
+        val hints = aliasPackageHints(cleaned)
         if (hints.isNotEmpty()) {
-            installedApps.firstOrNull { it.packageName in hints }?.let { return it }
+            for (hintPkg in hints) {
+                installedApps.firstOrNull { it.packageName.equals(hintPkg, ignoreCase = true) }?.let { return it }
+            }
         }
 
-        // 4. Prefix or substring match
-        installedApps.firstOrNull {
-            it.normalizedName.startsWith(normQuery) || normQuery.startsWith(it.normalizedName)
-        }?.let { return it }
+        val normQuery = normalize(cleaned)
 
-        if (normQuery.length >= 3) {
-            installedApps.firstOrNull {
-                it.normalizedName.contains(normQuery) || normalize(it.packageName).contains(normQuery)
-            }?.let { return it }
+        // Priority 2: Exact Full-Name Match (case-insensitive)
+        installedApps.firstOrNull { it.displayName.equals(cleaned, ignoreCase = true) }?.let { return it }
+        if (normQuery.isNotBlank()) {
+            installedApps.firstOrNull { it.normalizedName == normQuery }?.let { return it }
         }
 
-        // 5. Typo-tolerant Levenshtein distance match (e.g., "youtbe" -> "YouTube")
-        if (normQuery.length >= 4) {
-            val maxDist = if (normQuery.length >= 7) 2 else 1
-            var bestApp: InstalledAppInfo? = null
-            var bestDist = Int.MAX_VALUE
+        // Priority 3: Full-Token Scoring — match ALL meaningful query words so a 1-word app
+        // like "Google" NEVER beats "Chrome" when the user says "Google Chrome".
+        val queryTokens = tokenizeMeaningful(cleaned)
+        if (queryTokens.isNotEmpty()) {
+            var bestTokenApp: InstalledAppInfo? = null
+            var bestTokenScore = 0
             for (app in installedApps) {
-                if (kotlin.math.abs(app.normalizedName.length - normQuery.length) > maxDist) continue
-                val d = levenshtein(normQuery, app.normalizedName)
-                if (d <= maxDist && d < bestDist) {
-                    bestDist = d
-                    bestApp = app
+                val nameTokens = tokenizeMeaningful(app.displayName).toSet()
+                val pkgTokens = app.packageName.lowercase()
+                    .split('.', '_', '-')
+                    .filter { it.length >= 2 }
+                    .toSet()
+                val allAppTokens = nameTokens + pkgTokens
+                if (allAppTokens.isEmpty()) continue
+
+                val exactNameMatches = queryTokens.count { it in nameTokens }
+                val exactAnyMatches = queryTokens.count { it in allAppTokens }
+
+                if (exactAnyMatches == queryTokens.size) {
+                    // All meaningful words matched! Prefer exact display name coverage & closer token count
+                    val score = 1000 + exactNameMatches * 100 - kotlin.math.abs(nameTokens.size - queryTokens.size) * 15
+                    if (score > bestTokenScore) {
+                        bestTokenScore = score
+                        bestTokenApp = app
+                    }
+                } else if (queryTokens.size >= 2) {
+                    // For multi-word queries like "Google Chrome", prefer the specific distinguishing token
+                    // ("chrome" > brand prefix "google") and heavily penalize brand-only 1-word matches.
+                    val brandTokens = setOf("google", "microsoft", "samsung", "mi", "jio", "android")
+                    val specificQueryTokens = queryTokens.filter { it !in brandTokens }
+                    if (specificQueryTokens.isNotEmpty() && specificQueryTokens.all { it in allAppTokens }) {
+                        val score = 700 + exactNameMatches * 80 - kotlin.math.abs(nameTokens.size - specificQueryTokens.size) * 10
+                        if (score > bestTokenScore) {
+                            bestTokenScore = score
+                            bestTokenApp = app
+                        }
+                    }
                 }
             }
-            if (bestApp != null) return bestApp
+            if (bestTokenApp != null) return bestTokenApp
+        }
+
+        if (normQuery.isBlank()) return null
+
+        // Priority 4: Single-token prefix / substring / typo-tolerant Levenshtein fallback
+        if (queryTokens.size <= 1) {
+            installedApps.firstOrNull {
+                it.normalizedName.startsWith(normQuery) || (it.normalizedName.length >= 4 && normQuery.startsWith(it.normalizedName))
+            }?.let { return it }
+
+            if (normQuery.length >= 3) {
+                installedApps.firstOrNull {
+                    it.normalizedName.contains(normQuery) || normalize(it.packageName).contains(normQuery)
+                }?.let { return it }
+            }
+
+            if (normQuery.length >= 4) {
+                val maxDist = if (normQuery.length >= 7) 2 else 1
+                var bestApp: InstalledAppInfo? = null
+                var bestDist = Int.MAX_VALUE
+                for (app in installedApps) {
+                    if (kotlin.math.abs(app.normalizedName.length - normQuery.length) > maxDist) continue
+                    val d = levenshtein(normQuery, app.normalizedName)
+                    if (d <= maxDist && d < bestDist) {
+                        bestDist = d
+                        bestApp = app
+                    }
+                }
+                if (bestApp != null) return bestApp
+            }
         }
 
         return null
@@ -955,7 +1092,7 @@ object FastPathMatcher {
         RegexOption.IGNORE_CASE
     )
     private val multiStepConnectorRegex = Regex(
-        """(\band\b|\bthen\b|\bto\b|\bfor\b|\bon\b|\bsearch\b|\bsend\b|\bplay\b|\btype\b|\bmessage\b|\bcall\b|\bturn\b|\bclick\b|\btap\b|\bwatch\b|,|;)""",
+        """(\band\b|\bthen\b|\bto\b|\bfor\b|\bon\b|\bsearch\b|\bsend\b|\bplay\b|\btype\b|\bmessage\b|\bcall\b|\bturn\b|\bclick\b|\btap\b|\bwatch\b|\bresearch\b|\bask\b|\bfind\b|\bwrite\b|\bprompt\b|\bexplain\b|\bsummarize\b|\bcheck\b|\btell\b|\border\b|\bbook\b|\bchesi\b|\blo\b|చేసి|లో|గురించి|,|;)""",
         RegexOption.IGNORE_CASE
     )
 
@@ -1020,6 +1157,29 @@ object FastPathMatcher {
     }
 
     fun prettifyAppName(raw: String): String {
+        val unicodeKey = AppNameFuzzyMatcher.normalizeUnicodeKey(raw)
+        when (unicodeKey) {
+            "chrome", "google chrome", "క్రోమ్", "గూగుల్ క్రోమ్" -> return "Chrome"
+            "google", "google app", "గూగుల్", "గూగుల్ యాప్" -> return "Google"
+            "youtube", "you tube", "yt", "యూట్యూబ్", "యుట్యూబ్" -> return "YouTube"
+            "maps", "google maps", "మ్యాప్స్", "గూగుల్ మ్యాప్స్" -> return "Maps"
+            "whatsapp", "whats app", "wa", "వాట్సాప్", "వాట్సప్" -> return "WhatsApp"
+            "uber", "ఉబర్", "ఊబర్" -> return "Uber"
+            "ola", "ఓలా" -> return "Ola"
+            "rapido", "రాపిడో" -> return "Rapido"
+            "claude", "claude ai", "క్లాడ్" -> return "Claude"
+            "chatgpt", "chat gpt", "చాట్ జిపిటి", "చాట్జిపిటి" -> return "ChatGPT"
+            "settings", "సెట్టింగ్స్" -> return "Settings"
+            "swiggy", "స్విగ్గీ", "స్విగ్గి" -> return "Swiggy"
+            "zomato", "జొమాటో", "జోమాటో" -> return "Zomato"
+            "amazon", "అమెజాన్" -> return "Amazon"
+            "flipkart", "ఫ్లిప్కార్ట్", "ఫ్లిప్ కార్ట్" -> return "Flipkart"
+            "spotify", "స్పాటిఫై" -> return "Spotify"
+            "instagram", "ఇన్స్టాగ్రామ్", "ఇన్‌స్టాగ్రామ్" -> return "Instagram"
+            "gmail", "జీమెయిల్", "జిమెయిల్" -> return "Gmail"
+            "telegram", "టెలిగ్రామ్" -> return "Telegram"
+        }
+
         val compact = AppNameFuzzyMatcher.normalize(raw)
         return when (compact) {
             "youtube", "yt" -> "YouTube"
@@ -1027,10 +1187,25 @@ object FastPathMatcher {
             "gmail" -> "Gmail"
             "instagram", "ig" -> "Instagram"
             "spotify" -> "Spotify"
-            "chrome" -> "Chrome"
+            "chrome", "googlechrome" -> "Chrome"
+            "claude", "claudeai" -> "Claude"
+            "chatgpt", "gpt" -> "ChatGPT"
+            "perplexity", "perplexityai" -> "Perplexity"
+            "copilot" -> "Copilot"
+            "deepseek" -> "DeepSeek"
+            "grok" -> "Grok"
+            "gemini" -> "Gemini"
             "playstore", "googleplay" -> "Play Store"
             "maps", "googlemaps" -> "Maps"
             "settings" -> "Settings"
+            "swiggy" -> "Swiggy"
+            "zomato" -> "Zomato"
+            "amazon" -> "Amazon"
+            "flipkart" -> "Flipkart"
+            "uber" -> "Uber"
+            "ola" -> "Ola"
+            "rapido" -> "Rapido"
+            "telegram" -> "Telegram"
             else -> raw.split(" ")
                 .filter { it.isNotBlank() }
                 .joinToString(" ") { part ->
@@ -1116,6 +1291,10 @@ object HybridToolRouting {
         """\b(confirm\s+(?:uber|ola|rapido|ride|cab|auto|bike|pickup|booking|drop|trip|order|and\s+request|location)?|book\s+(?:now|ride|cab|auto|bike|uber|ola|rapido)|request\s+(?:uber|ola|rapido|ride|cab)|choose\s+(?:uber|ola|rapido)\s*\w*\s*confirm|pay\s+now|place\s+booking|confirm\s*&\s*book)\b""",
         RegexOption.IGNORE_CASE
     )
+    private val commerceCheckoutConfirmRegex = Regex(
+        """\b(place\s+(?:your\s+)?order|confirm\s+order|proceed\s+to\s+pay|complete\s+payment|pay\s+now|pay\s+₹|buy\s+now|order\s+now|swipe\s+to\s+pay|confirm\s*&\s*pay|checkout\s*&\s*pay|make\s+payment)\b""",
+        RegexOption.IGNORE_CASE
+    )
 
     fun isRideConfirmButton(label: String): Boolean {
         val cleaned = label.trim().lowercase()
@@ -1126,11 +1305,37 @@ object HybridToolRouting {
         return rideConfirmButtonRegex.containsMatchIn(cleaned)
     }
 
+    /**
+     * Universal Safe Final Stop guard across shopping, food delivery, and ride apps:
+     * NEVER auto-taps final Pay / Place Order / Confirm Booking buttons.
+     */
+    fun isFinalCheckoutOrBookingButton(label: String): Boolean {
+        if (isRideConfirmButton(label)) return true
+        val cleaned = label.trim().lowercase()
+        if (cleaned.isBlank()) return false
+        return commerceCheckoutConfirmRegex.containsMatchIn(cleaned)
+    }
+
+    fun isCommerceOrRideApp(appName: String?, packageName: String?, goal: String?): Boolean {
+        val combined = listOfNotNull(appName, packageName, goal).joinToString(" ").lowercase()
+        val commerceMarkers = listOf(
+            "amazon", "flipkart", "swiggy", "zomato", "blinkit", "zepto", "myntra", "meesho", "nykaa",
+            "uber", "ola", "rapido", "bigbasket", "instamart", "order", "buy", "checkout", "book", "cart"
+        )
+        return commerceMarkers.any { combined.contains(it) }
+    }
+
+    fun buildSafeCheckoutStopMessage(appName: String): String {
+        val pretty = FastPathMatcher.prettifyAppName(appName.ifBlank { "the app" })
+        return "I've navigated up to the checkout/confirmation screen in $pretty. Please review the details and tap Confirm or Pay yourself."
+    }
+
     fun normalizeRideAppName(raw: String?): String {
         val compact = AppNameFuzzyMatcher.normalize(raw.orEmpty())
+        val uni = AppNameFuzzyMatcher.normalizeUnicodeKey(raw.orEmpty())
         return when {
-            compact.contains("ola") -> "Ola"
-            compact.contains("rapido") -> "Rapido"
+            compact.contains("ola") || uni.contains("ఓలా") -> "Ola"
+            compact.contains("rapido") || uni.contains("రాపిడో") -> "Rapido"
             else -> "Uber"
         }
     }
@@ -1148,25 +1353,202 @@ object HybridToolRouting {
         return "I've set your destination in $pretty. Please review the fare and tap Confirm to book."
     }
 
+    private val compoundSecondTaskRegex = Regex(
+        """(\b(?:and|then|research|ask|search|type|find|write|play|send|prompt|tell|order|book|chesi)\b|చేసి|గురించి)""",
+        RegexOption.IGNORE_CASE
+    )
+    private val openAppAndDoEnglishRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?(?:open|launch|start|go\s+to)\s+(?:the\s+)?([a-zA-Z0-9\u0C00-\u0C7F][a-zA-Z0-9\u0C00-\u0C7F .+\-]{1,32}?)(?:\s+app)?\s+(?:and|then)\s+(?:please\s+)?(.{3,})$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val askAiAppRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?ask\s+(claude|chatgpt|perplexity|copilot|deepseek|grok|gemini|poe)\s+(?:to\s+)?(.{3,})$""",
+        RegexOption.IGNORE_CASE
+    )
+    // Tenglish compound: "Swiggy open chesi biryani search chey", "Claude open chesi new agents research chey"
+    private val tenglishOpenAndDoRegex = Regex(
+        """^([a-zA-Z0-9\u0C00-\u0C7F][a-zA-Z0-9\u0C00-\u0C7F .+\-]{1,32}?)\s+(?:open\s+chesi|open\s+chey\s+and|open\s+cheyi\s+and|terichi)\s+(.{3,})$""",
+        RegexOption.IGNORE_CASE
+    )
+    // Telugu script compound: "క్లాడ్ ఓపెన్ చేసి న్యూ ఏజెంట్స్ గురించి రీసెర్చ్ చేయి", "స్విగ్గీ ఓపెన్ చేసి బిర్యానీ సెర్చ్ చేయి"
+    private val teluguOpenAndDoRegex = Regex(
+        """^([\u0C00-\u0C7Fa-zA-Z0-9][^\s,]{0,24}(?:\s+[\u0C00-\u0C7Fa-zA-Z0-9]+){0,2}?)\s+(?:ఓపెన్\s+చేసి|తెరిచి)\s+(.{2,})$""",
+        RegexOption.IGNORE_CASE
+    )
+
+    // Bilingual Telugu & Tenglish direct tool regexes
+    private val tenglishYouTubePlayRegex = Regex(
+        """^(?:please\s+)?(?:you\s*tube|yt)\s+lo\s+(.+?)\s+(?:play|pettu|veyyi|chupinchu)(?:\s+(?:chey|cheyi|cheyyi|cheyandi))?[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguYouTubePlayRegex = Regex(
+        """^(?:యూట్యూబ్|యుట్యూబ్|you\s*tube)\s*లో\s+(.+?)\s+(?:ప్లే\s*(?:చేయి|చెయ్|చేయండి)|పెట్టు|చూపించు)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val tenglishCallRegex = Regex(
+        """^(.{2,32}?)\s+(?:ki|ku)\s+(?:call|phone)\s+(?:chey|cheyi|cheyyi|cheyandi|kottu)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguCallRegex = Regex(
+        """^(.{2,36}?)\s*(?:కి|కు)\s+(?:కాల్|ఫోన్)\s+(?:చేయి|చెయ్|చేయండి|కొట్టు)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val englishDirectCallRegex = Regex(
+        """^(?:please\s+|can\s+you\s+)?(?:call|dial|ring)\s+([a-zA-Z0-9 +\-]{2,32})[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val tenglishWhatsAppRegex = Regex(
+        """^(.{2,28}?)\s+(?:ki|ku)\s+whats\s*app\s+lo\s+(.+?)\s+(?:pampu|send\s*chey|send\s*cheyi|message\s*chey|pettu)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguWhatsAppRegex = Regex(
+        """^(.{2,32}?)\s*(?:కి|కు)\s+వాట్సాప్\s*లో\s+(.+?)\s+(?:పంపు|పంపించు|మెసేజ్\s*చేయి|సెండ్\s*చేయి)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val tenglishRideRegex = Regex(
+        """^(uber|ola|rapido)\s+lo\s+(.+?)\s+(?:ki|ku)\s+(?:ride|cab|auto|bike)?\s*(?:book\s*chey|book\s*cheyi|book\s*cheyyi|book)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguRideRegex = Regex(
+        """^(ఉబర్|ఊబర్|ఓలా|రాపిడో|uber|ola|rapido)\s*లో\s+(.+?)\s*(?:కి|కు)\s+(?:రైడ్|క్యాబ్|ఆటో|బైక్)?\s*(?:బుక్\s*చేయి|బుక్\s*చెయ్)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguOpenAppRegex = Regex(
+        """^(.{2,36}?)\s+(?:ఓపెన్\s*(?:చేయి|చెయ్|చేయండి)|తెరువు|తెరవండి)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val tenglishOpenAppRegex = Regex(
+        """^([a-zA-Z0-9\u0C00-\u0C7F][a-zA-Z0-9\u0C00-\u0C7F .+\-]{1,32}?)\s+(?:open\s+(?:chey|cheyi|cheyyi|cheyandi)|teruvu)[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguScrollRegex = Regex(
+        """^(?:(కిందకు|కిందికి|క్రిందకు|పైకి|ఎడమకు|కుడికి)\s*స్క్రోల్\s*(?:చేయి|చెయ్|చేయండి)|scroll\s+(down|up|left|right)\s+(?:chey|cheyi|cheyyi))[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguBackRegex = Regex(
+        """^(?:బ్యాక్\s*(?:వెళ్ళు|వెళ్లు|నొక్కు|చేయి)|వెనక్కి\s*(?:వెళ్ళు|వెళ్లు)|back\s+(?:vellu|po|chey|cheyi))[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val teluguHomeRegex = Regex(
+        """^(?:హోమ్\s*(?:కి\s*వెళ్ళు|స్క్రీన్\s*కి\s*వెళ్ళు|వెళ్ళు)|home\s+(?:ki\s+vellu|vellu))[.!?]*$""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun hasCompoundSecondTask(rawCommand: String): Boolean {
+        val cleaned = rawCommand.trim()
+        if (cleaned.isBlank()) return false
+        return compoundSecondTaskRegex.containsMatchIn(cleaned)
+    }
+
+    /**
+     * Universal Any-App compound command extractor:
+     * Matches English, Telugu, and Tenglish multi-step app requests such as:
+     * - "open Claude and research for new agents"
+     * - "open Amazon and search wireless mouse"
+     * - "Swiggy open chesi biryani search chey"
+     * - "క్లాడ్ ఓపెన్ చేసి న్యూ ఏజెంట్స్ గురించి రీసెర్చ్ చేయి"
+     */
+    fun extractCompoundAppAndGoal(rawCommand: String): Pair<String, String>? {
+        val text = rawCommand.trim().replace(Regex("\\s+"), " ")
+        if (text.isBlank()) return null
+
+        val askMatch = askAiAppRegex.matchEntire(text)
+        if (askMatch != null) {
+            val app = FastPathMatcher.prettifyAppName(askMatch.groupValues[1].trim())
+            val goal = askMatch.groupValues[2].trim().trimEnd('.', '!', '?').trim()
+            if (app.isNotBlank() && goal.isNotBlank()) return app to goal
+        }
+
+        val teluguMatch = teluguOpenAndDoRegex.matchEntire(text)
+        if (teluguMatch != null) {
+            val rawApp = teluguMatch.groupValues[1].trim()
+            val rawGoal = teluguMatch.groupValues[2].trim().trimEnd('.', '!', '?').trim()
+            if (rawApp.isNotBlank() && rawGoal.isNotBlank()) {
+                return FastPathMatcher.prettifyAppName(rawApp) to rawGoal
+            }
+        }
+
+        val tenglishMatch = tenglishOpenAndDoRegex.matchEntire(text)
+        if (tenglishMatch != null) {
+            val rawApp = tenglishMatch.groupValues[1].trim()
+            val rawGoal = tenglishMatch.groupValues[2].trim().trimEnd('.', '!', '?').trim()
+            val normApp = AppNameFuzzyMatcher.normalize(rawApp)
+            if (rawApp.isNotBlank() && rawGoal.isNotBlank() && normApp !in setOf("youtube", "yt", "whatsapp", "wa", "uber", "ola", "rapido")) {
+                return FastPathMatcher.prettifyAppName(rawApp) to rawGoal
+            }
+        }
+
+        val openMatch = openAppAndDoEnglishRegex.matchEntire(text) ?: return null
+        val rawApp = openMatch.groupValues[1].trim()
+        val rawGoal = openMatch.groupValues[2].trim().trimEnd('.', '!', '?').trim()
+        if (rawApp.isBlank() || rawGoal.isBlank()) return null
+
+        val normApp = AppNameFuzzyMatcher.normalize(rawApp)
+        // Dedicated fast-tool apps handled by specialized matchers / AI router
+        if (normApp in setOf("youtube", "yt", "whatsapp", "wa", "uber", "ola", "rapido", "settings")) {
+            return null
+        }
+
+        val cleanedGoal = rawGoal
+            .replace(Regex("""^(?:type|enter|write\s+in\s+the\s+box)\s+""", RegexOption.IGNORE_CASE), "")
+            .trim()
+            .ifBlank { rawGoal }
+        return FastPathMatcher.prettifyAppName(rawApp) to cleanedGoal
+    }
+
+    /** Backwards-compatible alias delegating to [extractCompoundAppAndGoal]. */
+    fun extractCompoundAppAndPrompt(rawCommand: String): Pair<String, String>? =
+        extractCompoundAppAndGoal(rawCommand)
+
+    fun buildOpenAppAndDoToolCall(
+        appName: String,
+        goal: String
+    ): RoutedToolCall {
+        val prettyApp = FastPathMatcher.prettifyAppName(appName)
+        val cleanGoal = goal.trim()
+        return RoutedToolCall(
+            tool = ToolName.OPEN_APP_AND_DO,
+            appName = prettyApp,
+            promptText = cleanGoal,
+            query = cleanGoal,
+            goal = cleanGoal,
+            title = "Open $prettyApp & ${cleanGoal.take(36)}",
+            steps = listOf(
+                "Launch $prettyApp and wait for it to load",
+                "Perform inside $prettyApp: \"$cleanGoal\"",
+                "Verify final screen state before completing"
+            ),
+            riskLevel = RiskLevel.LOW,
+            reason = "Opening $prettyApp and completing task"
+        )
+    }
+
+    fun buildOpenAppAndPromptToolCall(
+        appName: String,
+        promptText: String
+    ): RoutedToolCall = buildOpenAppAndDoToolCall(appName, promptText)
+
     fun buildImmediateAckPhrase(toolCall: RoutedToolCall): String {
         return when (toolCall.tool) {
-            ToolName.BOOK_RIDE -> "On it, opening ${normalizeRideAppName(toolCall.appName)}…"
-            ToolName.PLAY_YOUTUBE_VIDEO -> "Playing that on YouTube…"
-            ToolName.SEARCH_YOUTUBE -> "Searching YouTube…"
-            ToolName.OPEN_APP -> "On it, opening ${FastPathMatcher.prettifyAppName(toolCall.appName ?: "the app")}…"
+            ToolName.BOOK_RIDE -> "Opening ${normalizeRideAppName(toolCall.appName)}."
+            ToolName.PLAY_YOUTUBE_VIDEO -> "Opening YouTube."
+            ToolName.SEARCH_YOUTUBE -> "Searching YouTube."
+            ToolName.OPEN_APP -> "Opening ${FastPathMatcher.prettifyAppName(toolCall.appName ?: "app")}."
+            ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT ->
+                "Opening ${FastPathMatcher.prettifyAppName(toolCall.appName ?: "app")}."
             ToolName.SEND_MESSAGE -> {
                 val appLabel = if (toolCall.messagingApp?.contains("whatsapp", ignoreCase = true) == true) "WhatsApp" else "Messages"
-                "On it, opening $appLabel…"
+                "Opening $appLabel."
             }
-            ToolName.OPEN_MAPS -> "Opening Maps…"
-            ToolName.CALL_CONTACT -> "Calling ${toolCall.contactOrNumber ?: "contact"}…"
-            ToolName.SET_ALARM -> "Setting your alarm…"
-            ToolName.SET_TIMER -> "Starting your timer…"
-            ToolName.OPEN_SETTING -> "Opening Settings…"
-            ToolName.TAP_ON_SCREEN -> "Tapping ${toolCall.targetText ?: "that"}…"
-            ToolName.SCROLL_SCREEN -> "Scrolling ${toolCall.direction ?: "down"}…"
-            ToolName.UI_AUTOMATE -> "On it, working on your screen…"
-            else -> "On it…"
+            ToolName.OPEN_MAPS -> "Opening Maps."
+            ToolName.CALL_CONTACT -> ""
+            ToolName.SET_ALARM -> "Setting alarm."
+            ToolName.SET_TIMER -> "Starting timer."
+            ToolName.OPEN_SETTING -> "Opening Settings."
+            ToolName.TAP_ON_SCREEN -> "Tapping ${toolCall.targetText?.take(20) ?: "button"}."
+            ToolName.SCROLL_SCREEN -> "Scrolling ${toolCall.direction ?: "down"}."
+            ToolName.UI_AUTOMATE -> "Working on screen."
+            else -> "On it."
         }
     }
 
@@ -1174,27 +1556,34 @@ object HybridToolRouting {
         val pkg = currentPackage?.trim()?.lowercase().orEmpty()
         val app = appName?.trim().orEmpty()
         if (pkg.isBlank() || app.isBlank()) return false
+        val hints = AppNameFuzzyMatcher.aliasPackageHints(app)
+        if (hints.any { it.equals(pkg, ignoreCase = true) }) return true
         val norm = AppNameFuzzyMatcher.normalize(app)
         if (norm.isBlank()) return false
-        val hints = AppNameFuzzyMatcher.aliasPackageHints(norm)
-        if (hints.any { it.equals(pkg, ignoreCase = true) }) return true
         return pkg.contains(norm)
     }
 
     /**
-     * Post-router context guard: if currentForegroundApp is ALREADY the app the user is referring to
-     * and the command asks to act inside it (not merely switch back to it), NEVER relaunch with open_app.
+     * Post-router guard:
+     * 1. Strictly forbids `open_app` whenever the prompt contains a second task (upgrades to `open_app_and_do`).
+     * 2. Prevents `reply_to_user` from answering clear device/app actions with plain chat text.
+     * 3. If `currentForegroundApp` is ALREADY the app the user is referring to, acts directly on screen instead of relaunching.
      */
     fun applyForegroundContextGuard(
         toolCall: RoutedToolCall,
         userGoal: String,
         currentForegroundApp: String?
     ): RoutedToolCall {
+        val trimmedGoal = userGoal.trim()
         val fg = currentForegroundApp?.trim().orEmpty()
-        if (fg.isBlank()) return toolCall
 
-        if (toolCall.tool == ToolName.OPEN_APP && isPackageMatchingAppName(fg, toolCall.appName)) {
-            val lowerGoal = userGoal.trim().lowercase()
+        // Guard 0: If the target app is ALREADY open in the foreground and user asks to act inside it,
+        // act directly on screen via UI_AUTOMATE WITHOUT relaunching it.
+        if (fg.isNotBlank() &&
+            toolCall.tool == ToolName.OPEN_APP &&
+            isPackageMatchingAppName(fg, toolCall.appName)
+        ) {
+            val lowerGoal = trimmedGoal.lowercase()
             val isActionInsideApp = lowerGoal.contains("play") ||
                 lowerGoal.contains("video") ||
                 lowerGoal.contains("search") ||
@@ -1204,15 +1593,17 @@ object HybridToolRouting {
                 lowerGoal.contains("first") ||
                 lowerGoal.contains("second") ||
                 lowerGoal.contains("book") ||
-                lowerGoal.contains("ride")
+                lowerGoal.contains("ride") ||
+                lowerGoal.contains("research") ||
+                lowerGoal.contains("ask")
             if (isActionInsideApp) {
                 return RoutedToolCall(
                     tool = ToolName.UI_AUTOMATE,
-                    goal = "Act directly on the currently open app ($fg) WITHOUT relaunching it: $userGoal",
-                    title = userGoal.take(56),
+                    goal = "Act directly on the currently open app ($fg) WITHOUT relaunching it: $trimmedGoal",
+                    title = trimmedGoal.take(56),
                     steps = listOf(
                         "Inspect current screen in $fg",
-                        "Execute directly on screen: ${userGoal.take(80)}",
+                        "Execute directly on screen: ${trimmedGoal.take(80)}",
                         "Verify screen changed before completing"
                     ),
                     riskLevel = RiskLevel.LOW,
@@ -1220,6 +1611,41 @@ object HybridToolRouting {
                 )
             }
         }
+
+        // Guard 1: open_app is STRICTLY FORBIDDEN whenever the prompt contains a second task
+        if (toolCall.tool == ToolName.OPEN_APP && hasCompoundSecondTask(trimmedGoal)) {
+            val compound = extractCompoundAppAndGoal(trimmedGoal)
+            if (compound != null) {
+                return buildOpenAppAndDoToolCall(compound.first, compound.second)
+            }
+            val targetApp = FastPathMatcher.prettifyAppName(toolCall.appName ?: "App")
+            return buildOpenAppAndDoToolCall(targetApp, trimmedGoal)
+        }
+
+        // Guard 2: Clear device/app action requests must NEVER be answered with plain chat text
+        if (toolCall.tool == ToolName.REPLY_TO_USER && SmartIntentClassifier.isClearDeviceAction(trimmedGoal)) {
+            val direct = matchDirectLocalTool(trimmedGoal, currentForegroundApp)
+            if (direct != null && direct.tool != ToolName.REPLY_TO_USER) {
+                return direct
+            }
+            val compound = extractCompoundAppAndGoal(trimmedGoal)
+            if (compound != null) {
+                return buildOpenAppAndDoToolCall(compound.first, compound.second)
+            }
+            return RoutedToolCall(
+                tool = ToolName.UI_AUTOMATE,
+                goal = trimmedGoal,
+                title = trimmedGoal.take(56),
+                steps = listOf(
+                    "Inspect current screen",
+                    "Perform requested action: ${trimmedGoal.take(80)}",
+                    "Verify screen changed before completing"
+                ),
+                riskLevel = RiskLevel.LOW,
+                reason = "Device action override (never answer action with plain chat)"
+            )
+        }
+
         return toolCall
     }
 
@@ -1230,11 +1656,11 @@ object HybridToolRouting {
     ): String {
         val appsHint = installedAppSample.take(30).joinToString(", ")
         return buildString {
-            appendLine("You are an Android Hybrid Tool Router. Output ONLY ONE valid JSON object (no markdown, no explanation).")
+            appendLine("You are a bilingual (English, Telugu తెలుగు, and Tenglish) Android Hybrid Tool Router. Output ONLY ONE valid JSON object (no markdown, no explanation).")
             appendLine("Available tools:")
             appendLine("""0) {"tool":"reply_to_user","message":"Warm natural reply","reason":"Conversational reply or knowledge question"}""")
             appendLine("""1) {"tool":"play_youtube_video","query":"song or video name","reason":"Play video on YouTube"}""")
-            appendLine("""2) {"tool":"open_app","appName":"App Name","reason":"Open app ONLY when user asks ONLY to open an app and it is not already in foreground"}""")
+            appendLine("""2) {"tool":"open_app","appName":"App Name","reason":"Open app ONLY when user asks ONLY to open an app with NO second task"}""")
             appendLine("""3) {"tool":"search_youtube","query":"search text","reason":"Search YouTube without playing"}""")
             appendLine("""4) {"tool":"search_web","query":"search text","reason":"Search the web"}""")
             appendLine("""5) {"tool":"open_maps","destination":"place","reason":"Navigate in Maps"}""")
@@ -1252,19 +1678,15 @@ object HybridToolRouting {
             appendLine("""17) {"tool":"open_quick_settings","reason":"Open Quick Settings panel"}""")
             appendLine("""18) {"tool":"set_volume","stream":"media|ring|alarm|notification","levelPercent":60,"reason":"Set volume level 0-100"}""")
             appendLine("""19) {"tool":"book_ride","appName":"Uber|Ola|Rapido","destination":"Airport","reason":"Open ride app and set destination, stopping before final Confirm/Book"}""")
-            appendLine("""20) {"tool":"ui_automate","goal":"full multi-step goal","title":"Short title","steps":["Step 1","Step 2"],"riskLevel":"MEDIUM","reason":"Multi-step UI automation on current screen or app"}""")
+            appendLine("""20) {"tool":"ui_automate","goal":"full multi-step goal","title":"Short title","steps":["Step 1","Step 2"],"riskLevel":"MEDIUM","reason":"Multi-step UI automation on current screen"}""")
+            appendLine("""21) {"tool":"open_app_and_do","appName":"Claude|Amazon|Swiggy|Flipkart|Chrome|Spotify|Settings|...","goal":"exact goal to complete inside that app","reason":"Open ANY installed app and autonomously complete the user's goal inside it"}""")
             appendLine("CRITICAL RULES:")
+            appendLine("- ALWAYS evaluate the CURRENT USER REQUEST's intent FIRST. Never let older conversational messages override a clear device or app action request.")
+            appendLine("- FULL TELUGU & TENGLISH SUPPORT: Understand English, Telugu script (తెలుగు), and Tenglish (e.g., 'గూగుల్ క్రోమ్ ఓపెన్ చేయి' -> open_app('Google Chrome'), 'YouTube lo Telugu songs play chey' -> play_youtube_video('Telugu songs'), 'Swiggy open chesi biryani search chey' -> open_app_and_do('Swiggy','search biryani'), 'రవికి కాల్ చేయి' / 'ravi ki call chey' -> call_contact('Ravi')). NEVER drop Telugu/Tenglish action commands into reply_to_user.")
+            appendLine("- `open_app` is STRICTLY FORBIDDEN whenever the prompt contains a second task ('and', 'then', 'research', 'ask', 'search', 'type', 'find', 'play', 'send', 'order', 'book', 'చేసి', 'chesi', 'లో', 'lo'). ALWAYS route compound any-app requests to `open_app_and_do(appName, goal)` (or dedicated fast tools `play_youtube_video`, `send_message`, `book_ride`).")
             appendLine("- If `currentForegroundApp` is ALREADY the app the user is referring to (e.g., YouTube is already open and the user says 'play a video', 'play the first one', 'search lofi', or 'scroll down'), DO NOT relaunch the app from scratch. Act directly on the current screen using `tap_on_screen`, `scroll_screen`, `play_youtube_video`, or `ui_automate`.")
-            appendLine("- Greetings, small talk, thanks, or general conversational questions ('Hi', 'Hello', 'Good morning', 'How are you?', 'Thank you', or Telugu equivalents) MUST ALWAYS route to reply_to_user(message) — NEVER open_app or ui_automate!")
-            appendLine("- Use RECENT CONVERSATION and COMPLETED ACTION LOGS to resolve follow-ups like 'play the first one', 'send him I am on the way', 'scroll down', or 'pause'.")
-            appendLine("- NEVER pick open_app for compound requests like 'open YouTube and play...', 'open WhatsApp and send hi to Ravi', or 'open Uber and book a cab'.")
-            appendLine("- For booking a cab/ride/auto/bike in Uber, Ola, or Rapido (defaulting to Uber if not specified), ALWAYS pick book_ride(appName, destination). Ride booking is ALLOWED and stops safely before final Confirm/Pay.")
-            appendLine("- For playing any video/song on YouTube (even in Telugu or English), ALWAYS pick play_youtube_video.")
-            appendLine("- For sending a WhatsApp or SMS message, ALWAYS pick send_message with resolved contactOrNumber, messagingApp, and messageText.")
-            appendLine("- For tapping a single visible button or text on the current screen (e.g., 'click Skip', 'tap Subscribe', 'press Like'), pick tap_on_screen(targetText).")
-            appendLine("- For volume changes, pick set_volume(stream, levelPercent).")
-            appendLine("- For system actions (back, home, recents, notifications, quick settings), pick the matching native tool.")
-            appendLine("- For multi-step workflows inside any app, pick ui_automate.")
+            appendLine("- Greetings, small talk, thanks, or general knowledge questions MUST route to reply_to_user(message) — NEVER open_app or ui_automate!")
+            appendLine("- For booking a cab/ride/auto/bike in Uber, Ola, or Rapido (defaulting to Uber), ALWAYS pick book_ride(appName, destination). Ride booking is ALLOWED and stops safely before final Confirm/Pay.")
             appendLine("- ${SystemPromptBuilder.INDIAN_ENGLISH_VOICE_GRACE_RULE}")
             if (safetyRules.blockSensitiveFinancial) {
                 appendLine("- NEVER route bank transfers, UPI PIN entry, OTP reading, or password actions.")
@@ -1580,18 +2002,163 @@ object HybridToolRouting {
             )
         }
 
+        // 6b. Bilingual Telugu & Tenglish direct tool matchers (NEVER dropped into Chat!)
+        val teYtMatch = tenglishYouTubePlayRegex.matchEntire(text) ?: teluguYouTubePlayRegex.matchEntire(text)
+        if (teYtMatch != null) {
+            val query = teYtMatch.groupValues[1].trim().trim('"', '\'')
+            if (query.isNotBlank()) {
+                return RoutedToolCall(
+                    tool = ToolName.PLAY_YOUTUBE_VIDEO,
+                    query = query,
+                    title = "Play \"$query\" on YouTube",
+                    steps = listOf(
+                        "Open YouTube search results for \"$query\"",
+                        "Wait for video results to load",
+                        "Tap the first non-ad playable video",
+                        "Confirm video playback started"
+                    ),
+                    riskLevel = RiskLevel.LOW,
+                    reason = "Playing $query on YouTube"
+                )
+            }
+        }
+
+        val teRideMatch = tenglishRideRegex.matchEntire(text) ?: teluguRideRegex.matchEntire(text)
+        if (teRideMatch != null) {
+            val rideApp = normalizeRideAppName(teRideMatch.groupValues[1])
+            val dest = teRideMatch.groupValues[2].trim().takeIf { it.isNotBlank() }
+            return RoutedToolCall(
+                tool = ToolName.BOOK_RIDE,
+                appName = rideApp,
+                destination = dest,
+                title = if (dest != null) "Book $rideApp to ${dest.take(36)}" else "Book a ride in $rideApp",
+                steps = listOf(
+                    "Open $rideApp",
+                    "Enter destination \"${dest.orEmpty()}\" and select drop location",
+                    "Reach ride-selection screen and stop before Confirm/Book"
+                ),
+                riskLevel = RiskLevel.MEDIUM,
+                reason = "Booking $rideApp ride"
+            )
+        }
+
+        val teWaMatch = tenglishWhatsAppRegex.matchEntire(text) ?: teluguWhatsAppRegex.matchEntire(text)
+        if (teWaMatch != null) {
+            val contact = teWaMatch.groupValues[1].trim()
+            val body = teWaMatch.groupValues[2].trim().trim('"', '\'')
+            if (contact.isNotBlank() && body.isNotBlank() && contact.lowercase() !in pronounContacts) {
+                return buildSendMessageToolCall(contact, "whatsapp", body)
+            }
+        }
+
+        val teCallMatch = tenglishCallRegex.matchEntire(text)
+            ?: teluguCallRegex.matchEntire(text)
+            ?: englishDirectCallRegex.matchEntire(text)
+        if (teCallMatch != null) {
+            val rawContact = teCallMatch.groupValues[1].trim()
+            val lowerContact = rawContact.lowercase()
+            if (rawContact.isNotBlank() &&
+                lowerContact !in pronounContacts &&
+                !lowerContact.contains("uber") &&
+                !lowerContact.contains("ola") &&
+                !lowerContact.contains("rapido") &&
+                !lowerContact.contains("cab") &&
+                !lowerContact.contains("taxi") &&
+                !lowerContact.contains("ride")
+            ) {
+                return RoutedToolCall(
+                    tool = ToolName.CALL_CONTACT,
+                    contactOrNumber = rawContact,
+                    title = "Call $rawContact",
+                    steps = listOf("Look up phone number for $rawContact", "Place phone call"),
+                    riskLevel = RiskLevel.MEDIUM,
+                    reason = "Calling $rawContact"
+                )
+            }
+        }
+
+        val teScrollMatch = teluguScrollRegex.matchEntire(text)
+        if (teScrollMatch != null) {
+            val rawDir = teScrollMatch.groupValues[1].ifBlank { teScrollMatch.groupValues[2] }.lowercase()
+            val dir = when {
+                rawDir.contains("పై") || rawDir == "up" -> "up"
+                rawDir.contains("ఎడమ") || rawDir == "left" -> "left"
+                rawDir.contains("కుడి") || rawDir == "right" -> "right"
+                else -> "down"
+            }
+            return RoutedToolCall(
+                tool = ToolName.SCROLL_SCREEN,
+                direction = dir,
+                title = "Scroll $dir",
+                steps = listOf("Scroll $dir on current screen"),
+                riskLevel = RiskLevel.LOW,
+                reason = "Scrolling $dir"
+            )
+        }
+        if (teluguBackRegex.matches(text)) {
+            return RoutedToolCall(
+                tool = ToolName.PRESS_BACK,
+                title = "Go Back",
+                steps = listOf("Press Android Back button"),
+                riskLevel = RiskLevel.LOW,
+                reason = "Going Back"
+            )
+        }
+        if (teluguHomeRegex.matches(text)) {
+            return RoutedToolCall(
+                tool = ToolName.PRESS_HOME,
+                title = "Go to Home screen",
+                steps = listOf("Navigate directly to Android Home screen"),
+                riskLevel = RiskLevel.LOW,
+                reason = "Going Home"
+            )
+        }
+
+        // 6c. Universal Any-App compound requests ("open Claude and research...", "open Amazon and search...",
+        //     "Swiggy open chesi biryani search chey", "క్లాడ్ ఓపెన్ చేసి న్యూ ఏజెంట్స్ గురించి రీసెర్చ్ చేయి")
+        val compoundGoal = extractCompoundAppAndGoal(text)
+        if (compoundGoal != null) {
+            return buildOpenAppAndDoToolCall(compoundGoal.first, compoundGoal.second)
+        }
+
+        // 6d. Pure single-app open in Telugu or Tenglish ("గూగుల్ క్రోమ్ ఓపెన్ చేయి", "chrome open chey")
+        if (!hasCompoundSecondTask(text)) {
+            val teOpen = teluguOpenAppRegex.matchEntire(text) ?: tenglishOpenAppRegex.matchEntire(text)
+            if (teOpen != null) {
+                val rawApp = teOpen.groupValues[1].trim()
+                if (rawApp.isNotBlank() && rawApp.length <= 36) {
+                    val pretty = FastPathMatcher.prettifyAppName(rawApp)
+                    return RoutedToolCall(
+                        tool = ToolName.OPEN_APP,
+                        appName = rawApp,
+                        title = "Open $pretty",
+                        steps = listOf("Launch $pretty directly on-device"),
+                        riskLevel = RiskLevel.LOW,
+                        reason = "Opening $pretty"
+                    )
+                }
+            }
+        }
+
         // 7. Single-step fast-path (pure open_app, pure search_youtube, press_home, press_back)
         val fast = FastPathMatcher.match(text)
         if (fast != null) {
             return when (fast.type) {
-                FastPathType.OPEN_APP -> RoutedToolCall(
-                    tool = ToolName.OPEN_APP,
-                    appName = fast.arg,
-                    title = fast.title,
-                    steps = fast.steps,
-                    riskLevel = RiskLevel.LOW,
-                    reason = fast.runningPhaseLabel
-                )
+                FastPathType.OPEN_APP -> {
+                    // Hard guard: open_app is strictly forbidden whenever the prompt contains a second task
+                    if (hasCompoundSecondTask(text)) {
+                        null
+                    } else {
+                        RoutedToolCall(
+                            tool = ToolName.OPEN_APP,
+                            appName = fast.arg,
+                            title = fast.title,
+                            steps = fast.steps,
+                            riskLevel = RiskLevel.LOW,
+                            reason = fast.runningPhaseLabel
+                        )
+                    }
+                }
                 FastPathType.YOUTUBE_SEARCH -> RoutedToolCall(
                     tool = ToolName.SEARCH_YOUTUBE,
                     query = fast.arg,
@@ -1740,6 +2307,7 @@ object HybridToolRouting {
         }
 
         val appName = str("appName", "app_name", "app")
+        val promptText = str("promptText", "prompt_text", "prompt")
         val query = str("query", "searchQuery", "video")
         val destination = str("destination", "place", "location")
         val hour = intVal("hour")
@@ -1766,6 +2334,7 @@ object HybridToolRouting {
             "reply_to_user", "reply", "chat", "respond", "answer" -> ToolName.REPLY_TO_USER
             "play_youtube", "play_youtube_video", "youtube_play" -> ToolName.PLAY_YOUTUBE_VIDEO
             "open_app", "launch_app" -> ToolName.OPEN_APP
+            "open_app_and_do", "open_and_do", "open_app_and_prompt", "open_and_prompt", "prompt_app", "ask_app" -> ToolName.OPEN_APP_AND_DO
             "search_youtube", "youtube_search" -> ToolName.SEARCH_YOUTUBE
             "search_web", "web_search", "google_search" -> ToolName.SEARCH_WEB
             "open_maps", "navigate", "maps" -> ToolName.OPEN_MAPS
@@ -1793,12 +2362,18 @@ object HybridToolRouting {
         } else {
             "SMS"
         }
-        val normalizedRideApp = if (canonicalTool == ToolName.BOOK_RIDE) normalizeRideAppName(appName) else appName
+        val normalizedApp = when (canonicalTool) {
+            ToolName.BOOK_RIDE -> normalizeRideAppName(appName)
+            ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT -> FastPathMatcher.prettifyAppName(appName ?: "App")
+            else -> appName
+        }
+        val resolvedPromptText = promptText ?: goal ?: query ?: messageText
 
         val defaultTitle = str("title") ?: when (canonicalTool) {
             ToolName.REPLY_TO_USER -> "Reply"
             ToolName.PLAY_YOUTUBE_VIDEO -> "Play \"${query ?: fallbackGoal}\" on YouTube"
             ToolName.OPEN_APP -> "Open ${FastPathMatcher.prettifyAppName(appName ?: "App")}"
+            ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT -> "Open ${normalizedApp ?: "App"} & ${(resolvedPromptText ?: "task").take(36)}"
             ToolName.SEARCH_YOUTUBE -> "Search YouTube: ${query ?: fallbackGoal}"
             ToolName.SEARCH_WEB -> "Search Web: ${query ?: fallbackGoal}"
             ToolName.OPEN_MAPS -> "Navigate to ${destination ?: fallbackGoal}"
@@ -1808,9 +2383,9 @@ object HybridToolRouting {
             ToolName.CALL_CONTACT -> "Call ${contactOrNumber ?: "Contact"}"
             ToolName.SEND_MESSAGE -> "Send $appPretty to ${contactOrNumber ?: "Contact"}"
             ToolName.BOOK_RIDE -> if (!destination.isNullOrBlank()) {
-                "Book $normalizedRideApp to ${destination.take(36)}"
+                "Book $normalizedApp to ${destination.take(36)}"
             } else {
-                "Book a ride in $normalizedRideApp"
+                "Book a ride in $normalizedApp"
             }
             ToolName.TAP_ON_SCREEN -> "Tap \"${targetText ?: fallbackGoal}\""
             ToolName.SCROLL_SCREEN -> "Scroll ${direction ?: "down"}"
@@ -1834,6 +2409,11 @@ object HybridToolRouting {
                     "Verify playback opened"
                 )
                 ToolName.OPEN_APP -> listOf("Launch ${FastPathMatcher.prettifyAppName(appName ?: "app")} directly on-device")
+                ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT -> listOf(
+                    "Launch ${normalizedApp ?: "app"} and wait for it to load",
+                    "Complete inside ${normalizedApp ?: "app"}: \"${(resolvedPromptText ?: fallbackGoal).take(80)}\"",
+                    "Verify final screen state before completing"
+                )
                 ToolName.SEARCH_YOUTUBE -> listOf("Open YouTube search for \"${query ?: fallbackGoal}\"")
                 ToolName.SEARCH_WEB -> listOf("Search the web for \"${query ?: fallbackGoal}\"")
                 ToolName.OPEN_MAPS -> listOf("Open Maps navigation to \"${destination ?: fallbackGoal}\"")
@@ -1850,7 +2430,7 @@ object HybridToolRouting {
                     "Tap the Send button and verify delivery"
                 )
                 ToolName.BOOK_RIDE -> buildList {
-                    add("Open $normalizedRideApp")
+                    add("Open $normalizedApp")
                     if (!destination.isNullOrBlank()) {
                         add("Enter destination \"$destination\" and pick drop location")
                         add("Reach ride selection screen and stop before Confirm/Book")
@@ -1882,7 +2462,8 @@ object HybridToolRouting {
 
         return RoutedToolCall(
             tool = canonicalTool,
-            appName = normalizedRideApp,
+            appName = normalizedApp,
+            promptText = resolvedPromptText,
             query = query,
             destination = destination,
             hour = hour,
@@ -2087,6 +2668,87 @@ object ConfirmationFormatter {
 
     fun formatFailure(reason: String, elapsed: String? = null): String {
         return formatStrictFailure(reason, elapsed)
+    }
+
+    private val timingSuffixRegex = Regex("""\s*\(\d+(?:\.\d+)?s\)\s*$""")
+    private val phoneNumberRegex = Regex("""\+?\d[\d\s\-()]{5,}\d""")
+    private val urlRegex = Regex("""https?://\S+""", RegexOption.IGNORE_CASE)
+
+    /**
+     * Produces a crisp, natural spoken confirmation capped strictly to 3–6 words.
+     * Never reads phone numbers, URLs, timing suffixes, or long bulleted lists aloud.
+     */
+    fun formatShortSpokenConfirmation(
+        rawMessage: String,
+        isSuccess: Boolean = true,
+        preferTelugu: Boolean = false
+    ): String {
+        val cleaned = rawMessage
+            .lineSequence()
+            .firstOrNull { it.trim().isNotBlank() }
+            .orEmpty()
+            .let { urlRegex.replace(it, "") }
+            .let { phoneNumberRegex.replace(it, "") }
+            .let { timingSuffixRegex.replace(it, "") }
+            .replace(Regex("""\(\s*\)"""), "")
+            .replace(Regex("""[•*_`#]+"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .trimEnd('.', '!', ':')
+
+        if (preferTelugu) {
+            if (!isSuccess) {
+                return "క్షమించండి, అది పూర్తి చేయలేకపోయాను."
+            }
+            val lower = cleaned.lowercase()
+            val openedMatch = Regex("""opened\s+([a-zA-Z0-9 ]{2,24})""", RegexOption.IGNORE_CASE).find(cleaned)
+            return when {
+                openedMatch != null -> "${openedMatch.groupValues[1].trim()} ఓపెన్ చేశాను."
+                lower.contains("playing") -> "ప్లే చేస్తున్నాను."
+                lower.contains("sent") -> "మెసేజ్ పంపాను."
+                lower.contains("alarm") -> "అలారం సెట్ చేశాను."
+                lower.contains("timer") -> "టైమర్ స్టార్ట్ చేశాను."
+                lower.contains("review") && lower.contains("confirm") -> "రైడ్ సిద్ధంగా ఉంది, కన్ఫర్మ్ చేయండి."
+                else -> "పూర్తయింది!"
+            }
+        }
+
+        if (!isSuccess) {
+            if (cleaned.contains("Accessibility Service is turned off", ignoreCase = true)) {
+                return "Please turn on Accessibility Service."
+            }
+            val stripped = cleaned
+                .removePrefix("I couldn't complete that")
+                .trimStart(' ', '—', '-', ':')
+                .trim()
+            val words = stripped.split(Regex("\\s+")).filter { it.isNotBlank() }
+            return if (words.isEmpty()) {
+                "Couldn't complete that."
+            } else {
+                ("Couldn't " + words.take(4).joinToString(" ").replaceFirstChar { it.lowercase() }).trimEnd('.') + "."
+            }
+        }
+
+        val body = cleaned
+            .replace(Regex("""^yes,?\s*completed[!:,.\-\s]*""", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        if (body.isBlank()) return "Done, completed."
+
+        val words = body.split(Regex("\\s+")).filter { it.isNotBlank() }
+        // Cap strictly to 3–6 words total ("Done, <up to 5 words>.")
+        val lowerBody = body.lowercase()
+        val finalWords = when {
+            lowerBody.startsWith("i've set your destination") -> listOf("Ride", "ready,", "please", "confirm.")
+            lowerBody.startsWith("i've navigated up to") -> listOf("Ready", "to", "review", "and", "confirm.")
+            words.size <= 5 -> listOf("Done,") + words.mapIndexed { idx, w ->
+                if (idx == 0) w.replaceFirstChar { it.lowercase() } else w
+            }
+            else -> listOf("Done,") + words.take(4).mapIndexed { idx, w ->
+                if (idx == 0) w.replaceFirstChar { it.lowercase() } else w
+            }
+        }
+        return finalWords.joinToString(" ").trimEnd('.', ',', ';', ':') + "."
     }
 }
 
@@ -2392,10 +3054,28 @@ object SmartIntentClassifier {
         RegexOption.IGNORE_CASE
     )
 
+    private val clearDeviceActionStarterPattern = Regex(
+        """^(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:open|launch|start|play|search|send|book|call|dial|set\s+(?:an?\s+)?(?:alarm|timer)|scroll|swipe|tap|click|press|navigate|turn\s+(?:on|off)|toggle|mute|unmute|ask\s+(?:claude|chatgpt|perplexity|copilot|deepseek|grok|gemini))\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val teluguTenglishActionPattern = Regex(
+        """(?:ఓపెన్\s*(?:చేయి|చెయ్|చేసి|చేయండి)|తెరువు|తెరిచి|ప్లే\s*(?:చేయి|చెయ్|చేయండి)|కాల్\s*(?:చేయి|చెయ్|చేయండి)|ఫోన్\s*(?:చేయి|చెయ్)|పంపు|పంపించు|బుక్\s*(?:చేయి|చెయ్)|స్క్రోల్\s*(?:చేయి|చెయ్)|రీసెర్చ్\s*(?:చేయి|చెయ్)|సెర్చ్\s*(?:చేయి|చెయ్)|బ్యాక్\s*(?:వెళ్ళు|వెళ్లు)|హోమ్\s*(?:కి\s*వెళ్ళు|వెళ్ళు)|\b(?:open\s+chey|open\s+cheyi|open\s+chesi|play\s+chey|play\s+cheyi|call\s+chey|call\s+cheyi|phone\s+chey|search\s+chey|order\s+chey|book\s+chey|send\s+chey|scroll\s+(?:down|up)\s+chey|pampu)\b)""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun isClearDeviceAction(rawInput: String): Boolean {
+        val text = rawInput.trim()
+        if (text.isBlank()) return false
+        if (HybridToolRouting.extractCompoundAppAndGoal(text) != null) return true
+        if (teluguTenglishActionPattern.containsMatchIn(text)) return true
+        if (explicitPhoneImperativePattern.containsMatchIn(text)) return true
+        return clearDeviceActionStarterPattern.containsMatchIn(text)
+    }
+
     /**
-     * Unified Smart Mode router: decides without any manual Chat/Agent switch whether
-     * an utterance goes directly to rich formatted chat, instant deterministic local tool,
-     * or the AI Hybrid Tool Router.
+     * Unified Smart Mode router: evaluates the CURRENT message's intent first so prior conversational
+     * history never overrides a clear device/app action request.
      */
     fun decideUnifiedRoute(
         rawInput: String,
@@ -2411,6 +3091,11 @@ object SmartIntentClassifier {
             } else {
                 UnifiedRouteDecision.LOCAL_TOOL
             }
+        }
+
+        // Clear device/app actions ALWAYS execute via tool/accessibility — never answered with plain chat
+        if (isClearDeviceAction(text)) {
+            return UnifiedRouteDecision.AI_TOOL_ROUTER
         }
 
         if (conversationalStarterPattern.containsMatchIn(text)) {

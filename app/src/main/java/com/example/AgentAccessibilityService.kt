@@ -57,7 +57,8 @@ data class ScreenNode(
     val centerY: Int,
     val topY: Int,
     val heightPx: Int,
-    val viewIdResourceName: String = ""
+    val viewIdResourceName: String = "",
+    val isScrollable: Boolean = false
 )
 
 data class ScreenSnapshot(
@@ -75,6 +76,7 @@ data class ActionExecutionResult(
 data class ServiceCompletionEvent(
     val eventId: String = UUID.randomUUID().toString(),
     val actionId: String,
+    val sessionId: String = "",
     val status: ApprovalStatus,
     val completedSteps: Int,
     val message: String,
@@ -87,6 +89,7 @@ data class ServiceCompletionEvent(
 data class ServiceExecutionState(
     val isRunning: Boolean = false,
     val actionId: String? = null,
+    val sessionId: String = "",
     val phaseLabel: String = "",
     val phaseStartMillis: Long = 0L,
     val completedSteps: Int = 0,
@@ -243,12 +246,15 @@ class AgentAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val networkClient = NetworkClient()
     private val localStorage by lazy { LocalStorage(applicationContext) }
+    private val sqlRepository by lazy { AgentSqlRepository(PersonalAgentDatabase.getInstance(applicationContext)) }
     private var activeTaskJob: Job? = null
     private var lastCapturedNodes: List<ScreenNode> = emptyList()
     @Volatile
     private var latestVoiceSettings: VoiceSettings = VoiceSettings()
     @Volatile
     private var lastCompletedActionId: String? = null
+    @Volatile
+    private var activeTaskSessionId: String = ""
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -378,6 +384,7 @@ class AgentAccessibilityService : AccessibilityService() {
     ) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
 
         val startMillis = System.currentTimeMillis()
         val totalPlanSteps = plan.steps.size.coerceAtLeast(3)
@@ -674,6 +681,7 @@ class AgentAccessibilityService : AccessibilityService() {
     ) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
         val startMillis = System.currentTimeMillis()
 
         activeTaskJob = serviceScope.launch {
@@ -826,6 +834,7 @@ class AgentAccessibilityService : AccessibilityService() {
     fun startDirectScroll(plan: ActionPlan, direction: String) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
         val startMillis = System.currentTimeMillis()
 
         activeTaskJob = serviceScope.launch {
@@ -939,6 +948,7 @@ class AgentAccessibilityService : AccessibilityService() {
     fun startDirectAction(plan: ActionPlan, toolCall: RoutedToolCall) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
         val startMillis = System.currentTimeMillis()
 
         activeTaskJob = serviceScope.launch {
@@ -1005,6 +1015,7 @@ class AgentAccessibilityService : AccessibilityService() {
     ) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
 
         val startMillis = System.currentTimeMillis()
         val prettyApp = HybridToolRouting.normalizeRideAppName(rideApp)
@@ -1121,6 +1132,602 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Universal Any-App Automation Engine (`open_app_and_do(appName, goal)`):
+     * Works dynamically across ANY installed app (Claude, ChatGPT, Chrome, Amazon, Flipkart,
+     * Swiggy, Zomato, Spotify, Instagram, Gmail, Telegram, Settings, etc.):
+     * 1. Launch target app (skipping relaunch if already foreground) and wait up to 4s to load.
+     * 2. For AI prompt apps (Claude, ChatGPT, Perplexity, etc.), attempt ultra-fast deterministic
+     *    prompt entry (with Clipboard Paste fallback) + Send verification; if input isn't directly
+     *    visible, seamlessly fall through into the 15-step Universal Observe-Think-Act loop.
+     * 3. For all other apps, run the 15-step Observe-Think-Act loop (`runAiAutomationLoop`) with
+     *    Safe Final Stop enabled for shopping, food delivery, and ride apps.
+     */
+    fun startOpenAppAndDo(
+        plan: ActionPlan,
+        appName: String,
+        goal: String,
+        provider: AiProvider?,
+        blockSensitive: Boolean,
+        conversationHistory: List<ChatMessage> = emptyList(),
+        initialDelayMs: Long = 160L
+    ) {
+        activeTaskJob?.cancel()
+        clearStopRequest()
+        val taskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
+        activeTaskSessionId = taskSessionId
+
+        val startMillis = System.currentTimeMillis()
+        val prettyApp = FastPathMatcher.prettifyAppName(appName.ifBlank { "App" })
+        val cleanGoal = goal.trim()
+        val totalPlanSteps = plan.steps.size.coerceAtLeast(3)
+
+        activeTaskJob = serviceScope.launch {
+            val openPhase = "Opening $prettyApp…"
+            publishRunningState(plan.actionId, openPhase, startMillis, completedSteps = 0, activeStep = 0)
+            updateOverlayAndNotification(openPhase)
+            speakImmediateAck("Opening $prettyApp.")
+
+            try {
+                if (initialDelayMs > 0L) delay(initialDelayMs)
+                if (isStopRequested()) {
+                    emitCancelled(plan.actionId, "Stopped by user.", taskSessionId)
+                    return@launch
+                }
+
+                // Step 1: Resolve & launch target app (skip relaunch if already foreground)
+                val resolved = withContext(Dispatchers.Main) {
+                    NativeToolExecutor.resolveAppLaunch(this@AgentAccessibilityService, appName)
+                }
+                if (resolved == null) {
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.Failed("Could not find installed app matching \"$prettyApp\""),
+                        completedSteps = 0,
+                        elapsed = elapsed,
+                        sessionId = taskSessionId
+                    )
+                    return@launch
+                }
+
+                val targetDisplayName = resolved.displayName.ifBlank { prettyApp }
+                val alreadyInApp = withContext(Dispatchers.Main) {
+                    val cur = rootInActiveWindow?.packageName?.toString()?.trim().orEmpty()
+                    cur.equals(resolved.packageName, ignoreCase = true) ||
+                        HybridToolRouting.isPackageMatchingAppName(cur, targetDisplayName)
+                }
+
+                if (!alreadyInApp) {
+                    val launchRes = withContext(Dispatchers.Main) {
+                        NativeToolExecutor.openApp(this@AgentAccessibilityService, appName)
+                    }
+                    if (!launchRes.success) {
+                        val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                        emitToolResult(
+                            actionId = plan.actionId,
+                            result = ToolExecutionResult.Failed(launchRes.summary),
+                            completedSteps = 0,
+                            elapsed = elapsed,
+                            sessionId = taskSessionId
+                        )
+                        return@launch
+                    }
+                }
+
+                val waitPhase = "Waiting for $targetDisplayName to load…"
+                publishRunningState(plan.actionId, waitPhase, startMillis, completedSteps = 1, activeStep = 1)
+                updateOverlayAndNotification(waitPhase)
+
+                val ownPkg = packageName
+                var appLoaded = false
+                var inputBoxFound = false
+
+                // Poll every 500ms up to 4 seconds (8 ticks) until target app content loads
+                for (poll in 0 until 8) {
+                    if (!isActive || isStopRequested()) break
+                    delay(500L)
+                    if (!isActive || isStopRequested()) break
+
+                    val snap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                    if (blockSensitive) {
+                        val violation = SafetyGuardrail.detectSensitiveScreen(
+                            packageName = snap.packageName,
+                            ownPackageName = ownPkg,
+                            nodes = snap.nodes
+                        )
+                        if (violation != null) {
+                            emitBlocked(plan.actionId, violation, taskSessionId)
+                            return@launch
+                        }
+                    }
+
+                    val inTarget = snap.packageName.equals(resolved.packageName, ignoreCase = true) ||
+                        HybridToolRouting.isPackageMatchingAppName(snap.packageName, targetDisplayName) ||
+                        (snap.packageName != ownPkg && snap.packageName != "unknown" && !snap.packageName.contains("launcher", ignoreCase = true))
+                    if (inTarget) {
+                        appLoaded = true
+                        val hasInput = withContext(Dispatchers.Main) { findPromptInputNodeInLiveTree() != null }
+                        if (hasInput) {
+                            inputBoxFound = true
+                            break
+                        }
+                        if (poll >= 3 && snap.nodes.size >= 3) {
+                            break
+                        }
+                    }
+                }
+
+                if (!isActive || isStopRequested()) {
+                    emitCancelled(plan.actionId, "Stopped while opening $targetDisplayName.", taskSessionId)
+                    return@launch
+                }
+
+                if (!appLoaded) {
+                    val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                    emitToolResult(
+                        actionId = plan.actionId,
+                        result = ToolExecutionResult.Failed("$targetDisplayName did not open on screen"),
+                        completedSteps = 0,
+                        elapsed = elapsed,
+                        sessionId = taskSessionId
+                    )
+                    return@launch
+                }
+
+                // Fast-track deterministic prompt submission for AI chat apps (Claude, ChatGPT, Perplexity, etc.)
+                val normPkg = resolved.packageName.lowercase()
+                val isAiChatApp = normPkg.contains("anthropic.claude") ||
+                    normPkg.contains("openai.chatgpt") ||
+                    normPkg.contains("perplexity") ||
+                    normPkg.contains("microsoft.copilot") ||
+                    normPkg.contains("deepseek") ||
+                    normPkg.contains("x.grok") ||
+                    normPkg.contains("poe")
+
+                if (isAiChatApp) {
+                    val typePhase = "Entering prompt in $targetDisplayName…"
+                    publishRunningState(plan.actionId, typePhase, startMillis, completedSteps = 1, activeStep = 1)
+                    updateOverlayAndNotification(typePhase)
+
+                    if (!inputBoxFound) {
+                        val placeholderNode = withContext(Dispatchers.Main) { findClickablePromptPlaceholder() }
+                        if (placeholderNode != null) {
+                            performSmartTap(placeholderNode, placeholderNode.centerX, placeholderNode.centerY)
+                            delay(500L)
+                        }
+                    }
+
+                    val enteredResult = enterPromptWithPasteFallback(cleanGoal)
+                    if (enteredResult.first) {
+                        val sendPhase = "Sending prompt in $targetDisplayName…"
+                        publishRunningState(plan.actionId, sendPhase, startMillis, completedSteps = 2, activeStep = 2)
+                        updateOverlayAndNotification(sendPhase)
+
+                        for (tick in 0 until 6) {
+                            if (!isActive || isStopRequested()) break
+                            delay(100L)
+                        }
+                        if (!isActive || isStopRequested()) {
+                            emitCancelled(plan.actionId, "Stopped before sending prompt.", taskSessionId)
+                            return@launch
+                        }
+
+                        val beforeSendSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                        val inputRect = enteredResult.second
+                        val sendButton = withContext(Dispatchers.Main) {
+                            findPromptSendButtonInLiveTree(inputRect)
+                        }
+
+                        var sendAttempted = false
+                        if (sendButton != null) {
+                            val tapRes = performSmartTap(sendButton, sendButton.centerX, sendButton.centerY)
+                            if (!tapRes.success && !isStopRequested()) {
+                                dispatchTapGesture(sendButton.centerX.toFloat(), sendButton.centerY.toFloat())
+                            }
+                            sendAttempted = true
+                        } else {
+                            sendAttempted = withContext(Dispatchers.Main) {
+                                triggerImeEnterOnPromptInput()
+                            }
+                        }
+
+                        for (tick in 0 until 9) {
+                            if (!isActive || isStopRequested()) break
+                            delay(100L)
+                        }
+                        if (!isActive || isStopRequested()) {
+                            emitCancelled(plan.actionId, "Stopped while verifying prompt submission.", taskSessionId)
+                            return@launch
+                        }
+
+                        var afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                        var stillInInput = withContext(Dispatchers.Main) { hasUnsentDraftTextInLiveTree(cleanGoal) }
+                        var submitted = !stillInInput ||
+                            (sendAttempted && afterSnap.treeHash != beforeSendSnap.treeHash && hasGeneratingOrResponseCue(afterSnap))
+
+                        if (!submitted && !isStopRequested()) {
+                            val retrySendBtn = withContext(Dispatchers.Main) {
+                                findPromptSendButtonInLiveTree(inputRect)
+                            } ?: sendButton
+                            if (retrySendBtn != null) {
+                                dispatchTapGesture(retrySendBtn.centerX.toFloat(), retrySendBtn.centerY.toFloat())
+                            } else {
+                                withContext(Dispatchers.Main) { triggerImeEnterOnPromptInput() }
+                            }
+                            for (tick in 0 until 8) {
+                                if (!isActive || isStopRequested()) break
+                                delay(100L)
+                            }
+                            afterSnap = withContext(Dispatchers.Main) { captureCurrentScreenSnapshot() }
+                            stillInInput = withContext(Dispatchers.Main) { hasUnsentDraftTextInLiveTree(cleanGoal) }
+                            submitted = !stillInInput ||
+                                (afterSnap.treeHash != beforeSendSnap.treeHash && hasGeneratingOrResponseCue(afterSnap))
+                        }
+
+                        if (submitted) {
+                            val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                            val summaryLabel = if (cleanGoal.contains("research", ignoreCase = true)) {
+                                "Opened $targetDisplayName and sent your research prompt"
+                            } else {
+                                "Opened $targetDisplayName and sent your prompt"
+                            }
+                            emitToolResult(
+                                actionId = plan.actionId,
+                                result = ToolExecutionResult.VerifiedSuccess(summaryLabel),
+                                completedSteps = totalPlanSteps,
+                                elapsed = elapsed,
+                                durationTagOverride = "Sent · $elapsed",
+                                sessionId = taskSessionId
+                            )
+                            return@launch
+                        }
+                    }
+                    // If deterministic AI-app prompt entry couldn't complete, fall through into 15-step Observe-Think-Act loop!
+                }
+
+                // Universal 15-step Observe-Think-Act loop for ANY app (Amazon, Flipkart, Swiggy, Zomato,
+                // Chrome, Spotify, Instagram, Gmail, Telegram, Settings, or fallback for Claude/ChatGPT)
+                val needsSafeCheckoutStop = HybridToolRouting.isCommerceOrRideApp(
+                    appName = targetDisplayName,
+                    packageName = resolved.packageName,
+                    goal = cleanGoal
+                )
+                val automationGoal = buildString {
+                    append("$targetDisplayName (${resolved.packageName}) is ALREADY open on screen. Do NOT relaunch it. ")
+                    append("Complete the user's goal inside $targetDisplayName: \"$cleanGoal\". ")
+                    if (needsSafeCheckoutStop) {
+                        append("Navigate up to the final cart/checkout/confirmation screen and STOP before tapping any final Pay, Place Order, or Confirm Booking button.")
+                    } else {
+                        append("Type, submit, tap, or scroll as needed until the requested result is visibly loaded on screen, then return done with exact visible evidence.")
+                    }
+                }
+
+                runAiAutomationLoop(
+                    plan = plan,
+                    goal = automationGoal,
+                    provider = provider,
+                    blockSensitive = blockSensitive,
+                    maxSteps = 15,
+                    loopStartMillis = startMillis,
+                    initialHistory = listOf("Opened $targetDisplayName (${resolved.packageName})"),
+                    conversationHistory = conversationHistory,
+                    stopBeforeConfirmButton = needsSafeCheckoutStop,
+                    rideBookingAppName = if (needsSafeCheckoutStop && resolved.packageName in setOf("com.ubercab", "com.olacabs.customer", "com.rapido.passenger")) {
+                        targetDisplayName
+                    } else {
+                        null
+                    },
+                    checkoutStopAppName = if (needsSafeCheckoutStop) targetDisplayName else null,
+                    fallbackPartialOnFail = "opened $targetDisplayName" to "complete \"$cleanGoal\"",
+                    muteMediaOnVerifiedSuccess = AudioSilenceGuard.isMediaAppPackage(resolved.packageName) &&
+                        (cleanGoal.contains("play", ignoreCase = true) || cleanGoal.contains("song", ignoreCase = true) || cleanGoal.contains("music", ignoreCase = true) || cleanGoal.contains("ప్లే"))
+                )
+            } catch (_: CancellationException) {
+                emitCancelled(plan.actionId, "Stopped by user.", taskSessionId)
+            } catch (e: Exception) {
+                val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
+                emitToolResult(
+                    actionId = plan.actionId,
+                    result = ToolExecutionResult.Failed(e.localizedMessage ?: "Unexpected error automating $prettyApp"),
+                    completedSteps = 0,
+                    elapsed = elapsed,
+                    sessionId = taskSessionId
+                )
+            } finally {
+                dismissOverlayAndNotification()
+            }
+        }
+    }
+
+    /** Backwards-compatible wrapper delegating to [startOpenAppAndDo]. */
+    fun startOpenAppAndPrompt(
+        plan: ActionPlan,
+        appName: String,
+        promptText: String,
+        blockSensitive: Boolean,
+        initialDelayMs: Long = 160L
+    ) {
+        startOpenAppAndDo(
+            plan = plan,
+            appName = appName,
+            goal = promptText,
+            provider = null,
+            blockSensitive = blockSensitive,
+            conversationHistory = emptyList(),
+            initialDelayMs = initialDelayMs
+        )
+    }
+
+    private fun findPromptInputNodeInLiveTree(): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        val rect = Rect()
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestScore = -1
+
+        val promptHints = listOf(
+            "message", "ask", "reply", "search", "how can i help",
+            "chat", "prompt", "type", "anything", "claude", "chatgpt", "question"
+        )
+
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 24 || !node.isVisibleToUser) return
+            val cls = node.className?.toString().orEmpty()
+            val isEditClass = cls.contains("EditText", ignoreCase = true)
+            val editable = node.isEditable || isEditClass
+            if (editable) {
+                node.getBoundsInScreen(rect)
+                val validBounds = rect.width() > 20 && rect.height() > 16 &&
+                    rect.right > 0 && rect.bottom > 0 &&
+                    rect.left < screenW && rect.top < screenH
+                if (validBounds) {
+                    val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        node.hintText?.toString().orEmpty()
+                    } else {
+                        ""
+                    }
+                    val combined = listOf(
+                        node.text?.toString().orEmpty(),
+                        node.contentDescription?.toString().orEmpty(),
+                        hint,
+                        runCatching { node.viewIdResourceName?.toString().orEmpty() }.getOrDefault("")
+                    ).joinToString(" ").lowercase()
+
+                    var score = 50
+                    if (node.isEditable) score += 25
+                    if (isEditClass) score += 15
+                    if (promptHints.any { combined.contains(it) }) score += 35
+                    if (node.isFocused) score += 10
+                    // AI chat composers are frequently in the lower half of the screen
+                    if (rect.centerY() > (screenH * 0.45f).toInt()) score += 10
+
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestNode = node
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) {
+                walk(node.getChild(i), depth + 1)
+            }
+        }
+
+        walk(root, 0)
+        return bestNode
+    }
+
+    private fun findClickablePromptPlaceholder(): ScreenNode? {
+        val root = rootInActiveWindow ?: return null
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        val rect = Rect()
+        val cues = listOf(
+            "how can i help", "message claude", "ask anything", "ask claude",
+            "ask chatgpt", "message chatgpt", "ask follow-up", "search or type",
+            "reply to", "message", "ask", "search"
+        )
+        var best: ScreenNode? = null
+        var bestScore = 0
+
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 24 || !node.isVisibleToUser) return
+            val text = node.text?.toString()?.trim().orEmpty()
+            val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            val combined = "$text $desc".lowercase()
+            if (combined.isNotBlank() && cues.any { combined.contains(it) }) {
+                node.getBoundsInScreen(rect)
+                val valid = rect.width() > 30 && rect.height() > 16 &&
+                    rect.right > 0 && rect.bottom > 0 &&
+                    rect.left < screenW && rect.top < screenH
+                if (valid) {
+                    var score = 40
+                    if (node.isClickable) score += 25
+                    if (combined.contains("how can i help") || combined.contains("message") || combined.contains("ask")) {
+                        score += 30
+                    }
+                    if (score > bestScore) {
+                        bestScore = score
+                        best = ScreenNode(
+                            index = 0,
+                            text = text.take(64),
+                            contentDescription = desc.take(64),
+                            aggregatedLabel = text.ifBlank { desc }.ifBlank { "Input" },
+                            className = node.className?.toString()?.substringAfterLast('.').orEmpty(),
+                            isClickable = node.isClickable,
+                            isEditable = node.isEditable,
+                            centerX = rect.centerX().coerceIn(1, screenW - 1),
+                            centerY = rect.centerY().coerceIn(1, screenH - 1),
+                            topY = rect.top,
+                            heightPx = rect.height()
+                        )
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) {
+                walk(node.getChild(i), depth + 1)
+            }
+        }
+
+        walk(root, 0)
+        return best
+    }
+
+    private suspend fun enterPromptWithPasteFallback(promptText: String): Pair<Boolean, Rect?> {
+        val inputMeta = withContext(Dispatchers.Main) {
+            val node = findPromptInputNodeInLiveTree() ?: return@withContext null
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            rect
+        } ?: return false to null
+
+        // Tap center lightly to ensure keyboard/composer activates cleanly on Compose/React Native UIs
+        dispatchTapGesture(inputMeta.centerX().toFloat(), inputMeta.centerY().toFloat())
+        delay(220L)
+
+        // Attempt 1: ACTION_SET_TEXT
+        val setTextOk = withContext(Dispatchers.Main) {
+            val node = findPromptInputNodeInLiveTree()
+                ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: return@withContext false
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, promptText)
+            }
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        }
+        delay(250L)
+
+        val verifiedAfterSetText = setTextOk && withContext(Dispatchers.Main) {
+            hasUnsentDraftTextInLiveTree(promptText)
+        }
+        if (verifiedAfterSetText) {
+            return true to inputMeta
+        }
+
+        // Attempt 2: Clipboard Paste fallback (ClipboardManager + ACTION_PASTE)
+        val pasteOk = withContext(Dispatchers.Main) {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                ?: return@withContext false
+            clipboard.setPrimaryClip(ClipData.newPlainText("agent_prompt", promptText))
+            val node = findPromptInputNodeInLiveTree()
+                ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: return@withContext false
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        }
+        delay(250L)
+
+        val verifiedAfterPaste = withContext(Dispatchers.Main) {
+            hasUnsentDraftTextInLiveTree(promptText)
+        }
+        return (verifiedAfterPaste || pasteOk || setTextOk) to inputMeta
+    }
+
+    private fun findPromptSendButtonInLiveTree(inputRect: Rect?): ScreenNode? {
+        val root = rootInActiveWindow ?: return null
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        val rect = Rect()
+        var bestNode: ScreenNode? = null
+        var bestScore = 0
+
+        val forbidden = listOf("send money", "send payment", "attach", "camera", "photo", "voice", "microphone", "mic", "close", "clear", "cancel", "menu")
+        val exactLabels = setOf("send", "submit", "search", "go", "ask", "up arrow", "arrow up", "send message", "send prompt")
+
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 24 || !node.isVisibleToUser) return
+            val text = node.text?.toString()?.trim().orEmpty()
+            val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            val viewId = runCatching { node.viewIdResourceName?.toString().orEmpty() }.getOrDefault("")
+            val tLower = text.lowercase()
+            val dLower = desc.lowercase()
+            val idLower = viewId.lowercase()
+            val combined = "$tLower $dLower $idLower"
+
+            if (forbidden.none { combined.contains(it) }) {
+                node.getBoundsInScreen(rect)
+                val validBounds = rect.width() > 10 && rect.height() > 10 &&
+                    rect.right > 0 && rect.bottom > 0 &&
+                    rect.left < screenW && rect.top < screenH
+                if (validBounds && !node.isEditable) {
+                    var score = SendButtonMatcher.scoreCandidate(text, desc, viewId, node.isClickable)
+                    if (dLower in exactLabels || tLower in exactLabels) score = maxOf(score, 110)
+                    if (dLower.contains("send") || dLower.contains("submit") || dLower.contains("up arrow") || dLower.contains("arrow up") || dLower.contains("search")) {
+                        score = maxOf(score, 95)
+                    }
+                    if (idLower.contains("send") || idLower.contains("submit") || idLower.contains("enter")) {
+                        score = maxOf(score, 95)
+                    }
+                    // Bottom-right clickable button adjacent to the input box (common in Claude/ChatGPT/Perplexity)
+                    if (score == 0 && node.isClickable && inputRect != null) {
+                        val sameBandY = abs(rect.centerY() - inputRect.centerY()) <= (inputRect.height().coerceAtLeast(80) * 2)
+                        val isRightSide = rect.centerX() >= (screenW * 0.75f).toInt()
+                        val isCompactIcon = rect.width() in 24..(screenW / 3) && rect.height() in 24..(screenH / 5)
+                        if (sameBandY && isRightSide && isCompactIcon) {
+                            score = 68
+                        }
+                    }
+
+                    if (score >= 65 && node.isClickable) {
+                        score += 15
+                    }
+                    if (score > bestScore && score >= 65) {
+                        bestScore = score
+                        bestNode = ScreenNode(
+                            index = 0,
+                            text = text.take(64),
+                            contentDescription = desc.take(64),
+                            aggregatedLabel = desc.ifBlank { text }.ifBlank { "Send" },
+                            className = node.className?.toString()?.substringAfterLast('.').orEmpty(),
+                            isClickable = node.isClickable,
+                            isEditable = false,
+                            centerX = rect.centerX().coerceIn(1, screenW - 1),
+                            centerY = rect.centerY().coerceIn(1, screenH - 1),
+                            topY = rect.top,
+                            heightPx = rect.height(),
+                            viewIdResourceName = viewId
+                        )
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) {
+                walk(node.getChild(i), depth + 1)
+            }
+        }
+
+        walk(root, 0)
+        return bestNode
+    }
+
+    private fun triggerImeEnterOnPromptInput(): Boolean {
+        val node = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?: findPromptInputNodeInLiveTree()
+            ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        } else {
+            false
+        }
+    }
+
+    private fun hasGeneratingOrResponseCue(snapshot: ScreenSnapshot): Boolean {
+        val lower = snapshot.compactSummary.lowercase()
+        return lower.contains("stop generating") ||
+            lower.contains("stop response") ||
+            lower.contains("thinking") ||
+            lower.contains("searching") ||
+            lower.contains("copy") ||
+            lower.contains("retry")
+    }
+
+    /**
      * Background-safe dedicated YouTube Play workflow:
      * 1. Open YouTube search results directly.
      * 2. Poll every 500ms up to 4s until video cards appear.
@@ -1136,6 +1743,7 @@ class AgentAccessibilityService : AccessibilityService() {
     ) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
 
         val startMillis = System.currentTimeMillis()
         val totalPlanSteps = plan.steps.size.coerceAtLeast(4)
@@ -1259,6 +1867,9 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
 
                 if (playbackConfirmed) {
+                    // Auto-mute TTS right when YouTube video playback begins so agent NEVER talks over the video
+                    AudioSilenceGuard.markMediaPlaybackStarted()
+                    AgentSpeechFeedback.stopSpeaking()
                     val elapsed = formatElapsed(System.currentTimeMillis() - startMillis)
                     val detail = if (tappedLabel.isNotBlank()) {
                         "Playing \"$tappedLabel\" on YouTube"
@@ -1288,7 +1899,8 @@ class AgentAccessibilityService : AccessibilityService() {
                             "Opened YouTube search for \"$query\""
                         ) + if (tappedLabel.isNotBlank()) listOf("Attempted tap on \"$tappedLabel\"") else emptyList(),
                         conversationHistory = conversationHistory,
-                        fallbackPartialOnFail = "opened YouTube search" to "tap the video to play it"
+                        fallbackPartialOnFail = "opened YouTube search" to "tap the video to play it",
+                        muteMediaOnVerifiedSuccess = true
                     )
                 }
             } catch (_: CancellationException) {
@@ -1324,6 +1936,7 @@ class AgentAccessibilityService : AccessibilityService() {
     ) {
         activeTaskJob?.cancel()
         clearStopRequest()
+        activeTaskSessionId = plan.sessionId.ifBlank { ConversationRepository.activeSessionId.value }
 
         val loopStartMillis = System.currentTimeMillis()
         activeTaskJob = serviceScope.launch {
@@ -1368,7 +1981,9 @@ class AgentAccessibilityService : AccessibilityService() {
         conversationHistory: List<ChatMessage> = emptyList(),
         stopBeforeConfirmButton: Boolean = false,
         rideBookingAppName: String? = null,
-        fallbackPartialOnFail: Pair<String, String>? = null
+        checkoutStopAppName: String? = null,
+        fallbackPartialOnFail: Pair<String, String>? = null,
+        muteMediaOnVerifiedSuccess: Boolean = false
     ) {
         val stepLog = initialHistory.toMutableList()
         val totalPlanSteps = plan.steps.size.coerceAtLeast(1)
@@ -1493,7 +2108,8 @@ class AgentAccessibilityService : AccessibilityService() {
                         }
                     }
 
-                    // Safe Final Check for ride booking: NEVER tap Confirm / Book / Request / Pay!
+                    // Safe Final Stop for ride, shopping, and food delivery apps:
+                    // NEVER auto-tap final Confirm Booking / Place Order / Pay buttons!
                     if (stopBeforeConfirmButton && nextAction.action == "tap") {
                         val candidateNode = nextAction.index?.let { idx ->
                             snapshot.nodes.firstOrNull { it.index == idx }
@@ -1504,9 +2120,13 @@ class AgentAccessibilityService : AccessibilityService() {
                             candidateNode?.aggregatedLabel,
                             nextAction.reason
                         )
-                        if (candidateLabels.any { HybridToolRouting.isRideConfirmButton(it) }) {
+                        if (candidateLabels.any { HybridToolRouting.isFinalCheckoutOrBookingButton(it) }) {
                             rideReadyStoppedSafely = true
-                            finishedSummary = HybridToolRouting.buildRideReadyMessage(rideBookingAppName ?: "Uber")
+                            finishedSummary = if (rideBookingAppName != null) {
+                                HybridToolRouting.buildRideReadyMessage(rideBookingAppName)
+                            } else {
+                                HybridToolRouting.buildSafeCheckoutStopMessage(checkoutStopAppName ?: "the app")
+                            }
                             break
                         }
                     }
@@ -1642,6 +2262,10 @@ class AgentAccessibilityService : AccessibilityService() {
                 )
             }
             finishedSummary != null && anyScreenChanged -> {
+                if (muteMediaOnVerifiedSuccess) {
+                    AudioSilenceGuard.markMediaPlaybackStarted()
+                    AgentSpeechFeedback.stopSpeaking()
+                }
                 emitToolResult(
                     actionId = plan.actionId,
                     result = ToolExecutionResult.VerifiedSuccess(finishedSummary),
@@ -1776,7 +2400,7 @@ class AgentAccessibilityService : AccessibilityService() {
         val metrics = resources.displayMetrics
         val screenW = metrics.widthPixels.coerceAtLeast(1)
         val screenH = metrics.heightPixels.coerceAtLeast(1)
-        val maxNodes = 45
+        val maxNodes = 50
 
         fun collectChildLabels(parent: AccessibilityNodeInfo, maxDepth: Int = 3): String {
             val parts = LinkedHashSet<String>()
@@ -1806,6 +2430,7 @@ class AgentAccessibilityService : AccessibilityService() {
             val desc = node.contentDescription?.toString()?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
             val clickable = node.isClickable
             val editable = node.isEditable
+            val scrollable = node.isScrollable
             val rect = Rect()
             node.getBoundsInScreen(rect)
 
@@ -1866,7 +2491,8 @@ class AgentAccessibilityService : AccessibilityService() {
                             centerY = cy,
                             topY = rect.top,
                             heightPx = rect.height(),
-                            viewIdResourceName = viewId
+                            viewIdResourceName = viewId,
+                            isScrollable = scrollable
                         )
                     )
                 }
@@ -1889,12 +2515,14 @@ class AgentAccessibilityService : AccessibilityService() {
                 collected.forEach { n ->
                     val textField = n.text.ifBlank { n.aggregatedLabel }.replace("|", " ")
                     val descField = n.contentDescription.replace("|", " ")
+                    val resIdShort = n.viewIdResourceName.substringAfterLast('/').replace("|", " ")
                     val flags = buildList {
                         if (n.isClickable) add("clickable")
                         if (n.isEditable) add("editable")
+                        if (n.isScrollable) add("scrollable")
                     }.joinToString(",")
                     val coord = "@(${n.centerX},${n.centerY})"
-                    appendLine("[${n.index}] $textField | $descField | $flags $coord")
+                    appendLine("[${n.index}] $textField | $descField | $resIdShort | $flags $coord")
                 }
             }
         }.trim()
@@ -1922,11 +2550,15 @@ class AgentAccessibilityService : AccessibilityService() {
             }
             "type_text" -> performSmartTypeText(action.index, action.text.orEmpty(), action.submit)
             "scroll" -> performScroll(action.direction ?: "down")
-            "back" -> {
+            "wait" -> {
+                delay(1200L)
+                ActionExecutionResult(true, "Waited for screen to load")
+            }
+            "back", "press_back" -> {
                 val ok = performGlobalAction(GLOBAL_ACTION_BACK)
                 ActionExecutionResult(ok, if (ok) "Pressed Back" else "Could not press Back")
             }
-            "home" -> {
+            "home", "press_home" -> {
                 val ok = performGlobalAction(GLOBAL_ACTION_HOME)
                 ActionExecutionResult(ok, if (ok) "Returned to Home screen" else "Could not go Home")
             }
@@ -2037,12 +2669,24 @@ class AgentAccessibilityService : AccessibilityService() {
             }
             var ok = editableNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
-            // Fallback to clipboard paste if ACTION_SET_TEXT is rejected by custom WebView / search bar
-            if (!ok) {
+            // Verify text actually appeared (Claude / Compose / WebView boxes often ignore ACTION_SET_TEXT)
+            val probeWord = textToType.trim().take(12)
+            val appearedAfterSetText = if (ok && probeWord.isNotBlank()) {
+                runCatching { editableNode.refresh() }
+                val currentVal = editableNode.text?.toString().orEmpty()
+                currentVal.contains(probeWord, ignoreCase = true)
+            } else {
+                ok
+            }
+
+            // Automatic Clipboard Paste fallback when ACTION_SET_TEXT fails or leaves input unchanged
+            if (!ok || !appearedAfterSetText) {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                 if (clipboard != null) {
                     clipboard.setPrimaryClip(ClipData.newPlainText("agent_input", textToType))
-                    ok = editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                    editableNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                    editableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    ok = editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE) || ok
                 }
             }
 
@@ -2187,6 +2831,7 @@ class AgentAccessibilityService : AccessibilityService() {
             it.copy(
                 isRunning = true,
                 actionId = actionId,
+                sessionId = activeTaskSessionId,
                 phaseLabel = phaseLabel,
                 phaseStartMillis = phaseStartMillis,
                 completedSteps = completedSteps,
@@ -2195,7 +2840,11 @@ class AgentAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun emitBlocked(actionId: String, violation: String) {
+    private fun emitBlocked(
+        actionId: String,
+        violation: String,
+        sessionId: String = activeTaskSessionId
+    ) {
         emitCompletion(
             actionId = actionId,
             status = ApprovalStatus.BLOCKED,
@@ -2203,18 +2852,24 @@ class AgentAccessibilityService : AccessibilityService() {
             message = "Stopped immediately by Safety Guardrail ($violation) while inspecting the live screen.",
             notes = "Stopped live: $violation",
             durationLabel = "Blocked",
-            blockedReason = violation
+            blockedReason = violation,
+            sessionId = sessionId
         )
     }
 
-    private fun emitCancelled(actionId: String, reason: String) {
+    private fun emitCancelled(
+        actionId: String,
+        reason: String,
+        sessionId: String = activeTaskSessionId
+    ) {
         emitCompletion(
             actionId = actionId,
             status = ApprovalStatus.CANCELLED,
             completedSteps = 0,
             message = reason,
             notes = reason,
-            durationLabel = "Stopped"
+            durationLabel = "Stopped",
+            sessionId = sessionId
         )
     }
 
@@ -2223,7 +2878,8 @@ class AgentAccessibilityService : AccessibilityService() {
         result: ToolExecutionResult,
         completedSteps: Int,
         elapsed: String,
-        durationTagOverride: String? = null
+        durationTagOverride: String? = null,
+        sessionId: String = activeTaskSessionId
     ) {
         val message = result.toUserMessage(elapsed)
         val status = if (result.isVerifiedSuccess) ApprovalStatus.COMPLETED else ApprovalStatus.FAILED
@@ -2244,7 +2900,8 @@ class AgentAccessibilityService : AccessibilityService() {
             message = message,
             notes = notes,
             durationLabel = duration,
-            isError = !result.isVerifiedSuccess
+            isError = !result.isVerifiedSuccess,
+            sessionId = sessionId
         )
     }
 
@@ -2256,20 +2913,25 @@ class AgentAccessibilityService : AccessibilityService() {
         notes: String,
         durationLabel: String?,
         blockedReason: String? = null,
-        isError: Boolean = false
+        isError: Boolean = false,
+        sessionId: String = activeTaskSessionId
     ) {
         if (lastCompletedActionId == actionId) return
         lastCompletedActionId = actionId
 
+        val effectiveSessionId = sessionId.ifBlank { ConversationRepository.activeSessionId.value }
+
         _executionState.value = ServiceExecutionState(
             isRunning = false,
             actionId = null,
+            sessionId = effectiveSessionId,
             phaseLabel = "",
             phaseStartMillis = 0L,
             completedSteps = 0,
             activeStep = -1,
             completionEvent = ServiceCompletionEvent(
                 actionId = actionId,
+                sessionId = effectiveSessionId,
                 status = status,
                 completedSteps = completedSteps,
                 message = message,
@@ -2280,8 +2942,7 @@ class AgentAccessibilityService : AccessibilityService() {
             )
         )
 
-        // Persist outcome directly to DataStore AND singleton ConversationRepository so conversation & action logs
-        // stay 100% synced even when triggered from Quick Settings Tile or Notification while MainActivity is closed!
+        // Strictly isolate outcome to its original sessionId so background completions NEVER bleed into a newly opened New Chat!
         val chatMsg = ChatMessage(
             sender = MessageSender.AGENT,
             text = message,
@@ -2292,10 +2953,27 @@ class AgentAccessibilityService : AccessibilityService() {
         )
         ConversationRepository.recordActionLog(
             summary = notes.ifBlank { message },
-            status = status.label
+            status = status.label,
+            targetSessionId = effectiveSessionId.takeIf { it.isNotBlank() }
         )
-        ConversationRepository.appendMessagesInMemory(listOf(chatMsg))
+        if (effectiveSessionId.isNotBlank()) {
+            ConversationRepository.appendToSessionInMemory(effectiveSessionId, listOf(chatMsg))
+        } else {
+            ConversationRepository.appendMessagesInMemory(listOf(chatMsg))
+        }
         serviceScope.launch {
+            if (effectiveSessionId.isNotBlank()) {
+                sqlRepository.updateActionInSession(
+                    sessionId = effectiveSessionId,
+                    actionId = actionId,
+                    status = status,
+                    completedSteps = completedSteps,
+                    activeStep = -1,
+                    blockedReason = blockedReason,
+                    durationLabel = durationLabel,
+                    appendChatMessage = chatMsg
+                )
+            }
             localStorage.updateActionStatusInStorage(
                 actionId = actionId,
                 status = status,
@@ -2304,7 +2982,8 @@ class AgentAccessibilityService : AccessibilityService() {
                 blockedReason = blockedReason,
                 notes = notes,
                 durationLabel = durationLabel,
-                appendChatMessage = chatMsg
+                appendChatMessage = chatMsg,
+                targetSessionId = effectiveSessionId.takeIf { it.isNotBlank() }
             )
         }
 

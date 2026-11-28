@@ -115,8 +115,9 @@ class LocalStorage(private val context: Context) {
                     runCatching { AgentMode.valueOf(raw) }.getOrNull()
                 }
             ) {
-                AgentMode.AGENT_CONTROL -> AgentMode.AGENT_CONTROL
-                else -> AgentMode.CHAT_ONLY
+                AgentMode.AGENT_CONTROL -> AgentMode.SMART_AUTO
+                AgentMode.CHAT_ONLY -> AgentMode.SMART_AUTO
+                else -> AgentMode.SMART_AUTO
             }
 
             val voiceLanguage = prefs[Keys.VOICE_LANGUAGE]?.let { raw ->
@@ -190,10 +191,16 @@ class LocalStorage(private val context: Context) {
         }
     }
 
-    suspend fun saveChatMessages(messages: List<ChatMessage>) = withContext(Dispatchers.IO) {
-        val json = chatListAdapter.toJson(messages)
+    suspend fun saveChatMessages(
+        messages: List<ChatMessage>,
+        targetSessionId: String? = null
+    ) = withContext(Dispatchers.IO) {
+        val json = chatListAdapter.toJson(messages.takeLast(DATASTORE_RECENT_CACHE_LIMIT))
         context.personalAgentDataStore.edit { prefs ->
-            prefs[Keys.CHAT_MESSAGES_JSON] = json
+            val activeId = prefs[Keys.SESSION_ID]
+            if (targetSessionId.isNullOrBlank() || activeId.isNullOrBlank() || activeId == targetSessionId) {
+                prefs[Keys.CHAT_MESSAGES_JSON] = json
+            }
         }
     }
 
@@ -206,12 +213,16 @@ class LocalStorage(private val context: Context) {
 
     suspend fun saveChatAndApprovals(
         messages: List<ChatMessage>,
-        records: List<ApprovalRecord>
+        records: List<ApprovalRecord>,
+        targetSessionId: String? = null
     ) = withContext(Dispatchers.IO) {
-        val chatJson = chatListAdapter.toJson(messages)
+        val chatJson = chatListAdapter.toJson(messages.takeLast(DATASTORE_RECENT_CACHE_LIMIT))
         val approvalsJson = approvalListAdapter.toJson(records)
         context.personalAgentDataStore.edit { prefs ->
-            prefs[Keys.CHAT_MESSAGES_JSON] = chatJson
+            val activeId = prefs[Keys.SESSION_ID]
+            if (targetSessionId.isNullOrBlank() || activeId.isNullOrBlank() || activeId == targetSessionId) {
+                prefs[Keys.CHAT_MESSAGES_JSON] = chatJson
+            }
             prefs[Keys.APPROVAL_HISTORY_JSON] = approvalsJson
         }
     }
@@ -253,12 +264,18 @@ class LocalStorage(private val context: Context) {
 
     suspend fun appendChatAndApproval(
         newMessages: List<ChatMessage>,
-        newApproval: ApprovalRecord? = null
+        newApproval: ApprovalRecord? = null,
+        targetSessionId: String? = null
     ) = withContext(Dispatchers.IO) {
         context.personalAgentDataStore.edit { prefs ->
-            val existingMessages = decodeList(prefs[Keys.CHAT_MESSAGES_JSON], chatListAdapter)
-            val updatedMessages = existingMessages + newMessages
-            prefs[Keys.CHAT_MESSAGES_JSON] = chatListAdapter.toJson(updatedMessages)
+            val activeId = prefs[Keys.SESSION_ID]
+            if (targetSessionId.isNullOrBlank() || activeId.isNullOrBlank() || activeId == targetSessionId) {
+                val existingMessages = decodeList(prefs[Keys.CHAT_MESSAGES_JSON], chatListAdapter)
+                val existingIds = existingMessages.mapTo(HashSet()) { it.id }
+                val updatedMessages = (existingMessages + newMessages.filter { it.id !in existingIds })
+                    .takeLast(DATASTORE_RECENT_CACHE_LIMIT)
+                prefs[Keys.CHAT_MESSAGES_JSON] = chatListAdapter.toJson(updatedMessages)
+            }
 
             if (newApproval != null) {
                 val existingApprovals = decodeList(prefs[Keys.APPROVAL_HISTORY_JSON], approvalListAdapter)
@@ -276,26 +293,31 @@ class LocalStorage(private val context: Context) {
         blockedReason: String? = null,
         notes: String? = null,
         durationLabel: String? = null,
-        appendChatMessage: ChatMessage? = null
+        appendChatMessage: ChatMessage? = null,
+        targetSessionId: String? = null
     ) = withContext(Dispatchers.IO) {
         context.personalAgentDataStore.edit { prefs ->
-            val existingMessages = decodeList(prefs[Keys.CHAT_MESSAGES_JSON], chatListAdapter)
-            val mappedMessages = existingMessages.map { msg ->
-                if (msg.actionPlan?.actionId == actionId) {
-                    msg.copy(
-                        approvalStatus = status,
-                        completedStepsCount = completedSteps,
-                        activeStepIndex = activeStep,
-                        isBlockedBySafety = status == ApprovalStatus.BLOCKED || msg.isBlockedBySafety,
-                        blockedReason = blockedReason ?: msg.blockedReason,
-                        durationLabel = durationLabel ?: msg.durationLabel
-                    )
-                } else {
-                    msg
+            val activeId = prefs[Keys.SESSION_ID]
+            if (targetSessionId.isNullOrBlank() || activeId.isNullOrBlank() || activeId == targetSessionId) {
+                val existingMessages = decodeList(prefs[Keys.CHAT_MESSAGES_JSON], chatListAdapter)
+                val mappedMessages = existingMessages.map { msg ->
+                    if (msg.actionPlan?.actionId == actionId) {
+                        msg.copy(
+                            approvalStatus = status,
+                            completedStepsCount = completedSteps,
+                            activeStepIndex = activeStep,
+                            isBlockedBySafety = status == ApprovalStatus.BLOCKED || msg.isBlockedBySafety,
+                            blockedReason = blockedReason ?: msg.blockedReason,
+                            durationLabel = durationLabel ?: msg.durationLabel
+                        )
+                    } else {
+                        msg
+                    }
                 }
+                val finalMessages = (if (appendChatMessage != null) mappedMessages + appendChatMessage else mappedMessages)
+                    .takeLast(DATASTORE_RECENT_CACHE_LIMIT)
+                prefs[Keys.CHAT_MESSAGES_JSON] = chatListAdapter.toJson(finalMessages)
             }
-            val finalMessages = if (appendChatMessage != null) mappedMessages + appendChatMessage else mappedMessages
-            prefs[Keys.CHAT_MESSAGES_JSON] = chatListAdapter.toJson(finalMessages)
 
             val existingApprovals = decodeList(prefs[Keys.APPROVAL_HISTORY_JSON], approvalListAdapter)
             val finalApprovals = existingApprovals.map { rec ->
@@ -337,25 +359,34 @@ class LocalStorage(private val context: Context) {
         }
     }
 
-    suspend fun startNewChatSession(): String = withContext(Dispatchers.IO) {
-        val newId = UUID.randomUUID().toString()
+    suspend fun startNewChatSession(
+        newSessionId: String = UUID.randomUUID().toString()
+    ): String = withContext(Dispatchers.IO) {
         val emptyJson = chatListAdapter.toJson(emptyList())
         context.personalAgentDataStore.edit { prefs ->
             prefs[Keys.CHAT_MESSAGES_JSON] = emptyJson
-            prefs[Keys.SESSION_ID] = newId
+            prefs[Keys.SESSION_ID] = newSessionId
         }
-        newId
+        newSessionId
     }
 
     suspend fun switchActiveChatSession(
         sessionId: String,
         messages: List<ChatMessage>
     ) = withContext(Dispatchers.IO) {
-        val json = chatListAdapter.toJson(messages)
+        val json = chatListAdapter.toJson(messages.takeLast(DATASTORE_RECENT_CACHE_LIMIT))
         context.personalAgentDataStore.edit { prefs ->
             prefs[Keys.SESSION_ID] = sessionId
             prefs[Keys.CHAT_MESSAGES_JSON] = json
         }
+    }
+
+    suspend fun encodeChatMessagesIo(messages: List<ChatMessage>): String = withContext(Dispatchers.IO) {
+        chatListAdapter.toJson(messages)
+    }
+
+    suspend fun decodeChatMessagesIo(json: String?): List<ChatMessage> = withContext(Dispatchers.IO) {
+        decodeList(json, chatListAdapter)
     }
 
     fun encodeChatMessages(messages: List<ChatMessage>): String {
@@ -372,5 +403,9 @@ class LocalStorage(private val context: Context) {
     ): List<T> {
         if (json.isNullOrBlank()) return emptyList()
         return runCatching { adapter.fromJson(json).orEmpty() }.getOrElse { emptyList() }
+    }
+
+    companion object {
+        private const val DATASTORE_RECENT_CACHE_LIMIT = 30
     }
 }

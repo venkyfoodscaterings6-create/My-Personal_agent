@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,9 +34,11 @@ data class AgentUiState(
     val installedAppsCount: Int = 0,
     val quickActionChips: List<String> = DefaultQuickChips.items,
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
-    val agentMode: AgentMode = AgentMode.CHAT_ONLY,
+    val agentMode: AgentMode = AgentMode.SMART_AUTO,
     val connectionTestPassed: Boolean = false,
     val isSending: Boolean = false,
+    val hasMoreOlderMessages: Boolean = false,
+    val isLoadingOlderMessages: Boolean = false,
     val isAgentLoopRunning: Boolean = false,
     val liveAgentStatusText: String = "",
     val livePhaseStartMillis: Long = 0L,
@@ -114,7 +117,10 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     private val sqlRepository = AgentSqlRepository(PersonalAgentDatabase.getInstance(appContext))
     private val sqlSearchFlow = MutableStateFlow("")
     private val threadSearchFlow = MutableStateFlow("")
-    private var seededInitialThread = false
+    private var initialSessionLoadedFromSql = false
+    private var activeGenerationJob: Job? = null
+    @Volatile
+    private var activeUiSessionId: String = ""
 
     private val _uiState = MutableStateFlow(AgentUiState())
     val uiState: StateFlow<AgentUiState> = _uiState.asStateFlow()
@@ -148,12 +154,13 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         // Observe background-safe execution progress from AgentAccessibilityService
-        // (final completion records & messages are persisted directly by the service into LocalStorage)
+        // Strictly scoped to the active sessionId so background actions for an old chat never pollute New Chat.
         viewModelScope.launch {
             AgentAccessibilityService.executionState.collect { exec ->
                 if (exec.isRunning) {
                     _uiState.update { current ->
-                        val updatedMessages = if (exec.actionId != null) {
+                        val sameSession = exec.sessionId.isBlank() || exec.sessionId == current.sessionId
+                        val updatedMessages = if (sameSession && exec.actionId != null) {
                             current.chatMessages.map { msg ->
                                 if (msg.actionPlan?.actionId == exec.actionId) {
                                     msg.copy(
@@ -194,35 +201,84 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             storage.ensureSessionId()
             storage.stateFlow.collect { persisted ->
-                ConversationRepository.syncFromPersisted(persisted.sessionId, persisted.chatMessages)
-                _uiState.update { current ->
-                    current.copy(
-                        isLoaded = true,
-                        sessionId = persisted.sessionId,
-                        providers = persisted.providers,
-                        providerResolvedUrls = persisted.providerResolvedUrls,
-                        chatMessages = persisted.chatMessages,
-                        approvalHistory = persisted.approvalHistory,
-                        safetyRules = persisted.safetyRules,
-                        voiceSettings = persisted.voiceSettings,
-                        quickActionChips = persisted.quickActionChips,
-                        themePreference = persisted.themePreference,
-                        agentMode = persisted.agentMode,
-                        connectionTestPassed = persisted.connectionTestPassed,
-                        builtInGeminiSettings = persisted.builtInGeminiSettings
-                    )
-                }
-                AgentSpeechFeedback.updateCachedSettings(persisted.voiceSettings)
-                if (!seededInitialThread && persisted.chatMessages.isNotEmpty() && persisted.sessionId.isNotBlank()) {
-                    seededInitialThread = true
-                    if (sqlRepository.countThreads() == 0) {
-                        sqlRepository.upsertThread(
-                            id = persisted.sessionId,
-                            messages = persisted.chatMessages,
-                            messagesJson = storage.encodeChatMessages(persisted.chatMessages)
+                // Ignore stale DataStore emissions belonging to a previous session after explicit New Chat / switch
+                val isStaleSessionEmission = activeUiSessionId.isNotBlank() &&
+                    persisted.sessionId != activeUiSessionId
+
+                if (isStaleSessionEmission) {
+                    _uiState.update { current ->
+                        current.copy(
+                            isLoaded = true,
+                            providers = persisted.providers,
+                            providerResolvedUrls = persisted.providerResolvedUrls,
+                            approvalHistory = persisted.approvalHistory,
+                            safetyRules = persisted.safetyRules,
+                            voiceSettings = persisted.voiceSettings,
+                            quickActionChips = persisted.quickActionChips,
+                            themePreference = persisted.themePreference,
+                            agentMode = AgentMode.SMART_AUTO,
+                            connectionTestPassed = persisted.connectionTestPassed,
+                            builtInGeminiSettings = persisted.builtInGeminiSettings
                         )
                     }
+                } else {
+                    if (!initialSessionLoadedFromSql) {
+                        initialSessionLoadedFromSql = true
+                        activeUiSessionId = persisted.sessionId
+                        val page = sqlRepository.loadRecentMessagesPage(persisted.sessionId, limit = PAGE_SIZE)
+                        val initialMessages = if (page.messages.isNotEmpty()) {
+                            page.messages
+                        } else {
+                            if (persisted.chatMessages.isNotEmpty()) {
+                                sqlRepository.saveMessagesToSession(persisted.sessionId, persisted.chatMessages)
+                            }
+                            persisted.chatMessages.takeLast(PAGE_SIZE)
+                        }
+                        val hasMore = page.hasMoreOlder || persisted.chatMessages.size > initialMessages.size
+                        ConversationRepository.resetSessionExplicitly(persisted.sessionId, initialMessages)
+                        _uiState.update { current ->
+                            current.copy(
+                                isLoaded = true,
+                                sessionId = persisted.sessionId,
+                                providers = persisted.providers,
+                                providerResolvedUrls = persisted.providerResolvedUrls,
+                                chatMessages = initialMessages,
+                                hasMoreOlderMessages = hasMore,
+                                approvalHistory = persisted.approvalHistory,
+                                safetyRules = persisted.safetyRules,
+                                voiceSettings = persisted.voiceSettings,
+                                quickActionChips = persisted.quickActionChips,
+                                themePreference = persisted.themePreference,
+                                agentMode = AgentMode.SMART_AUTO,
+                                connectionTestPassed = persisted.connectionTestPassed,
+                                builtInGeminiSettings = persisted.builtInGeminiSettings
+                            )
+                        }
+                    } else {
+                        // Same active session: merge any external updates (e.g. from VoiceOverlayActivity / AccessibilityService)
+                        // without dropping older paginated messages already loaded in memory.
+                        _uiState.update { current ->
+                            val merged = mergeExternalRecentMessages(current.chatMessages, persisted.chatMessages)
+                            ConversationRepository.syncFromPersisted(persisted.sessionId, merged)
+                            current.copy(
+                                isLoaded = true,
+                                sessionId = persisted.sessionId,
+                                providers = persisted.providers,
+                                providerResolvedUrls = persisted.providerResolvedUrls,
+                                chatMessages = merged,
+                                approvalHistory = persisted.approvalHistory,
+                                safetyRules = persisted.safetyRules,
+                                voiceSettings = persisted.voiceSettings,
+                                quickActionChips = persisted.quickActionChips,
+                                themePreference = persisted.themePreference,
+                                agentMode = AgentMode.SMART_AUTO,
+                                connectionTestPassed = persisted.connectionTestPassed,
+                                builtInGeminiSettings = persisted.builtInGeminiSettings
+                            )
+                        }
+                    }
                 }
+                AgentSpeechFeedback.updateCachedSettings(persisted.voiceSettings)
                 AgentNotificationHelper.syncPersistentNotification(
                     context = appContext,
                     enabled = persisted.voiceSettings.persistentAskNotificationEnabled,
@@ -288,10 +344,52 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setAgentMode(mode: AgentMode) {
-        if (_uiState.value.agentMode == mode) return
-        _uiState.update { it.copy(agentMode = mode) }
+        val unified = AgentMode.SMART_AUTO
+        if (_uiState.value.agentMode == unified) return
+        _uiState.update { it.copy(agentMode = unified) }
         viewModelScope.launch {
-            storage.saveAgentMode(mode)
+            storage.saveAgentMode(unified)
+        }
+    }
+
+    private fun mergeExternalRecentMessages(
+        currentLoaded: List<ChatMessage>,
+        persistedRecent: List<ChatMessage>
+    ): List<ChatMessage> {
+        if (persistedRecent.isEmpty()) return currentLoaded
+        if (currentLoaded.isEmpty()) return persistedRecent
+        val byId = LinkedHashMap<String, ChatMessage>(currentLoaded.size + persistedRecent.size)
+        currentLoaded.forEach { byId[it.id] = it }
+        persistedRecent.forEach { byId[it.id] = it }
+        return byId.values.toList()
+    }
+
+    fun loadOlderMessages() {
+        val state = _uiState.value
+        val targetSessionId = state.sessionId
+        if (targetSessionId.isBlank() || state.isLoadingOlderMessages || !state.hasMoreOlderMessages) return
+        val oldestTimestamp = state.chatMessages.firstOrNull()?.timestampMillis ?: return
+
+        _uiState.update { it.copy(isLoadingOlderMessages = true) }
+        viewModelScope.launch {
+            val page = sqlRepository.loadOlderMessagesPage(
+                sessionId = targetSessionId,
+                beforeTimestamp = oldestTimestamp,
+                loadedCountSoFar = state.chatMessages.size,
+                limit = PAGE_SIZE
+            )
+            if (activeUiSessionId != targetSessionId || _uiState.value.sessionId != targetSessionId) return@launch
+            _uiState.update { current ->
+                val existingIds = current.chatMessages.mapTo(HashSet()) { it.id }
+                val olderUnique = page.messages.filter { it.id !in existingIds }
+                val combined = olderUnique + current.chatMessages
+                ConversationRepository.syncFromPersisted(targetSessionId, combined)
+                current.copy(
+                    chatMessages = combined,
+                    hasMoreOlderMessages = page.hasMoreOlder,
+                    isLoadingOlderMessages = false
+                )
+            }
         }
     }
 
@@ -487,19 +585,39 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectChatThread(threadId: String) {
+        activeGenerationJob?.cancel()
+        activeGenerationJob = null
         if (_uiState.value.isAgentLoopRunning) {
             stopRunningAgent()
         }
+        activeUiSessionId = threadId
+        _uiState.update {
+            it.copy(
+                destination = AppDestination.CHAT,
+                sessionId = threadId,
+                chatMessages = emptyList(),
+                hasMoreOlderMessages = false,
+                isLoadingOlderMessages = false,
+                streamingAssistantText = "",
+                liveAgentStatusText = "",
+                livePhaseStartMillis = 0L,
+                memorySuggestions = emptyMap(),
+                livePendingApprovalPlan = null,
+                isSending = false
+            )
+        }
         viewModelScope.launch {
-            val entity = sqlRepository.getThreadById(threadId) ?: return@launch
-            val decoded = storage.decodeChatMessages(entity.messagesJson)
-            storage.switchActiveChatSession(entity.id, decoded)
-            ConversationRepository.resetSessionExplicitly(entity.id, decoded)
+            val page = sqlRepository.loadRecentMessagesPage(threadId, limit = PAGE_SIZE)
+            if (activeUiSessionId != threadId) return@launch
+            ConversationRepository.resetSessionExplicitly(threadId, page.messages)
+            storage.switchActiveChatSession(threadId, page.messages)
             _uiState.update {
                 it.copy(
                     destination = AppDestination.CHAT,
-                    sessionId = entity.id,
-                    chatMessages = decoded,
+                    sessionId = threadId,
+                    chatMessages = page.messages,
+                    hasMoreOlderMessages = page.hasMoreOlder,
+                    isLoadingOlderMessages = false,
                     memorySuggestions = emptyMap(),
                     livePendingApprovalPlan = null,
                     isSending = false
@@ -585,22 +703,62 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun persistMessagesAndThread(
         messages: List<ChatMessage>,
-        approvals: List<ApprovalRecord>? = null
+        approvals: List<ApprovalRecord>? = null,
+        targetSessionId: String? = null,
+        messagesToUpsert: List<ChatMessage> = messages.takeLast(6)
     ) {
-        ConversationRepository.syncFromPersisted(_uiState.value.sessionId, messages)
-        if (approvals != null) {
-            storage.saveChatAndApprovals(messages, approvals)
-        } else {
-            storage.saveChatMessages(messages)
+        val effectiveSessionId = targetSessionId?.takeIf { it.isNotBlank() } ?: _uiState.value.sessionId
+        if (effectiveSessionId.isNotBlank()) {
+            if (effectiveSessionId == activeUiSessionId) {
+                ConversationRepository.syncFromPersisted(effectiveSessionId, messages)
+            } else if (messagesToUpsert.isNotEmpty()) {
+                ConversationRepository.appendToSessionInMemory(effectiveSessionId, messagesToUpsert)
+            }
         }
-        val activeSession = _uiState.value.sessionId
-        if (activeSession.isNotBlank() && messages.isNotEmpty()) {
-            sqlRepository.upsertThread(
-                id = activeSession,
-                messages = messages,
-                messagesJson = storage.encodeChatMessages(messages)
+        if (approvals != null) {
+            storage.saveChatAndApprovals(messages, approvals, targetSessionId = effectiveSessionId.takeIf { it.isNotBlank() })
+        } else {
+            storage.saveChatMessages(messages, targetSessionId = effectiveSessionId.takeIf { it.isNotBlank() })
+        }
+        if (effectiveSessionId.isNotBlank() && messagesToUpsert.isNotEmpty()) {
+            sqlRepository.saveMessagesToSession(
+                sessionId = effectiveSessionId,
+                messagesToUpsert = messagesToUpsert
             )
         }
+    }
+
+    private suspend fun commitSessionMessage(
+        requestSessionId: String,
+        message: ChatMessage,
+        clearSending: Boolean = true
+    ): Boolean {
+        val isStillActive = activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId
+        if (isStillActive) {
+            val updated = _uiState.value.chatMessages + message
+            _uiState.update {
+                it.copy(
+                    isSending = if (clearSending) false else it.isSending,
+                    streamingAssistantText = if (clearSending) "" else it.streamingAssistantText,
+                    liveAgentStatusText = if (clearSending) "" else it.liveAgentStatusText,
+                    livePhaseStartMillis = if (clearSending) 0L else it.livePhaseStartMillis,
+                    chatMessages = updated
+                )
+            }
+            persistMessagesAndThread(
+                messages = updated,
+                targetSessionId = requestSessionId,
+                messagesToUpsert = listOf(message)
+            )
+        } else if (requestSessionId.isNotBlank()) {
+            // User already switched to a New Chat / different thread: save ONLY to the original session in SQL!
+            ConversationRepository.appendToSessionInMemory(requestSessionId, listOf(message))
+            sqlRepository.saveMessagesToSession(
+                sessionId = requestSessionId,
+                messagesToUpsert = listOf(message)
+            )
+        }
+        return isStillActive
     }
 
     // Live Voice + 3D Conversation Engine
@@ -1014,7 +1172,11 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private suspend fun tryHandleDirectSqlIntent(rawText: String, modeTag: String): String? {
+    private suspend fun tryHandleDirectSqlIntent(
+        rawText: String,
+        modeTag: String,
+        requestSessionId: String = _uiState.value.sessionId
+    ): String? {
         val intent = withContext(Dispatchers.Default) { SqlMemoryCommandParser.parse(rawText) }
             ?: return null
 
@@ -1028,7 +1190,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 "Added task to your SQL database: \"${intent.title}\""
             }
             SqlDirectIntent.ListTasks -> {
-                val pending = PersonalAgentDatabase.getInstance(appContext).taskDao().getPendingTasks(10)
+                val pending = sqlRepository.getPendingTasks(10)
                 if (pending.isEmpty()) {
                     "You have no open tasks in your SQL database right now."
                 } else {
@@ -1036,7 +1198,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             SqlDirectIntent.ListMemories -> {
-                val mems = PersonalAgentDatabase.getInstance(appContext).memoryDao().getTopMemories(10)
+                val mems = sqlRepository.getTopMemories(10)
                 if (mems.isEmpty()) {
                     "No personal memories are saved yet. Tell me 'Remember that...' anytime!"
                 } else {
@@ -1050,11 +1212,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             text = reply,
             modelBadge = "SQL Memory"
         )
-        val updated = _uiState.value.chatMessages + replyMsg
-        _uiState.update { it.copy(chatMessages = updated) }
-        persistMessagesAndThread(updated)
+        commitSessionMessage(requestSessionId, replyMsg, clearSending = true)
         sqlRepository.recordInteractionLog(
-            sessionId = _uiState.value.sessionId,
+            sessionId = requestSessionId,
             mode = modeTag,
             userPrompt = rawText,
             agentResponse = reply,
@@ -1314,6 +1474,12 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         if (text.isBlank() || _uiState.value.isSending || _uiState.value.isAgentLoopRunning) return
 
         val state = _uiState.value
+        val requestSessionId = state.sessionId.ifBlank {
+            val generated = UUID.randomUUID().toString()
+            activeUiSessionId = generated
+            _uiState.update { it.copy(sessionId = generated) }
+            generated
+        }
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
             text = text
@@ -1322,23 +1488,32 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(chatMessages = withUser) }
         maybeAttachMemorySuggestion(text, userMsg.id)
 
-        viewModelScope.launch {
+        activeGenerationJob?.cancel()
+        activeGenerationJob = viewModelScope.launch {
             try {
-                persistMessagesAndThread(withUser)
-                when (state.agentMode) {
-                    AgentMode.CHAT_ONLY -> handleChatOnlyDispatch(withUser, skipPreflight = false)
-                    AgentMode.AGENT_CONTROL -> handleOnDeviceAgentPlan(text, withUser)
-                    AgentMode.SMART_AUTO -> handleSmartAutoDispatch(text, withUser)
-                }
+                persistMessagesAndThread(
+                    messages = withUser,
+                    targetSessionId = requestSessionId,
+                    messagesToUpsert = listOf(userMsg)
+                )
+                // Unified Smart Agent: evaluate the current request's intent directly
+                // so clear app/device actions always execute tools and never fall into plain chat.
+                handleSmartAutoDispatch(text, withUser, requestSessionId)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                reportUnexpectedFailure(e.localizedMessage ?: "Something went wrong while processing your request")
+                reportUnexpectedFailure(
+                    reason = e.localizedMessage ?: "Something went wrong while processing your request",
+                    requestSessionId = requestSessionId
+                )
             }
         }
     }
 
-    private suspend fun reportUnexpectedFailure(reason: String) {
+    private suspend fun reportUnexpectedFailure(
+        reason: String,
+        requestSessionId: String = _uiState.value.sessionId
+    ) {
         val failText = ConfirmationFormatter.formatStrictFailure(reason)
         val errMsg = ChatMessage(
             sender = MessageSender.AGENT,
@@ -1346,34 +1521,27 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             isError = true,
             excludeFromContext = true
         )
-        val updated = _uiState.value.chatMessages + errMsg
-        _uiState.update {
-            it.copy(
-                isSending = false,
-                isAgentLoopRunning = false,
-                streamingAssistantText = "",
-                liveAgentStatusText = "",
-                livePhaseStartMillis = 0L,
-                chatMessages = updated
+        val stillActive = commitSessionMessage(requestSessionId, errMsg, clearSending = true)
+        if (stillActive) {
+            _uiState.update { it.copy(isAgentLoopRunning = false) }
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = failText,
+                isSuccess = false,
+                voiceSettings = _uiState.value.voiceSettings,
+                showToastWhenOutsideApp = false
             )
         }
-        persistMessagesAndThread(updated)
-        AgentSpeechFeedback.announceOutcome(
-            context = appContext,
-            message = failText,
-            isSuccess = false,
-            voiceSettings = _uiState.value.voiceSettings,
-            showToastWhenOutsideApp = false
-        )
     }
 
     private suspend fun handleSmartAutoDispatch(
         userGoal: String,
-        messagesWithUser: List<ChatMessage>
+        messagesWithUser: List<ChatMessage>,
+        requestSessionId: String = _uiState.value.sessionId
     ) {
         val state = _uiState.value
         val currentForegroundApp = AgentAccessibilityService.getCurrentForegroundApp(appContext.packageName)
-        val recentHistory = ConversationRepository.mergeWithPersisted(messagesWithUser)
+        val recentHistory = ConversationRepository.mergeWithPersisted(messagesWithUser, sessionId = requestSessionId)
 
         // 1. Safety Guardrail check first
         if (state.safetyRules.blockSensitiveFinancial) {
@@ -1381,31 +1549,33 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 SafetyGuardrail.detectSensitiveViolation(userGoal)
             }
             if (violation != null) {
-                recordHardBlockedRequest(userGoal, violation, recentHistory)
+                recordHardBlockedRequest(userGoal, violation, recentHistory, requestSessionId = requestSessionId)
                 return
             }
         }
 
         // 2. Direct SQL memory / task commands
-        val sqlReply = tryHandleDirectSqlIntent(userGoal, modeTag = "SMART")
+        val sqlReply = tryHandleDirectSqlIntent(userGoal, modeTag = "SMART", requestSessionId = requestSessionId)
         if (sqlReply != null) {
-            AgentSpeechFeedback.announceOutcome(
-                context = appContext,
-                message = sqlReply,
-                isSuccess = true,
-                voiceSettings = state.voiceSettings,
-                showToastWhenOutsideApp = false
-            )
+            if (activeUiSessionId == requestSessionId) {
+                AgentSpeechFeedback.announceOutcome(
+                    context = appContext,
+                    message = sqlReply,
+                    isSuccess = true,
+                    voiceSettings = state.voiceSettings,
+                    showToastWhenOutsideApp = false
+                )
+            }
             return
         }
 
-        // 3. Unified Smart Intent Classifier (foreground-aware!)
+        // 3. Unified Smart Intent Classifier (evaluates current request FIRST, foreground-aware!)
         val routeDecision = withContext(Dispatchers.Default) {
             SmartIntentClassifier.decideUnifiedRoute(userGoal, currentForegroundApp)
         }
         when (routeDecision) {
             UnifiedRouteDecision.DIRECT_CHAT -> {
-                handleChatOnlyDispatch(recentHistory, skipPreflight = true)
+                handleChatOnlyDispatch(recentHistory, skipPreflight = true, requestSessionId = requestSessionId)
                 return
             }
             UnifiedRouteDecision.LOCAL_TOOL -> {
@@ -1416,7 +1586,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     handleFileGenerationDispatch(
                         userGoal = localTool.query ?: userGoal,
                         targetFormat = com.example.files.GeneratedFileFormat.fromString(localTool.label),
-                        messagesWithUser = recentHistory
+                        messagesWithUser = recentHistory,
+                        requestSessionId = requestSessionId
                     )
                     return
                 }
@@ -1424,7 +1595,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     dispatchRoutedToolCall(
                         toolCall = localTool,
                         userGoal = userGoal,
-                        planDurationLabel = "Instant · 0.0s"
+                        planDurationLabel = "Instant · 0.0s",
+                        requestSessionId = requestSessionId
                     )
                     return
                 }
@@ -1434,12 +1606,14 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
         // 5. Route action-like prompts via AI Hybrid Tool Router; if it decides REPLY_TO_USER, hand off to streaming chat
         val routeStartMillis = System.currentTimeMillis()
-        _uiState.update {
-            it.copy(
-                isSending = true,
-                liveAgentStatusText = "Smart routing…",
-                livePhaseStartMillis = routeStartMillis
-            )
+        if (activeUiSessionId == requestSessionId) {
+            _uiState.update {
+                it.copy(
+                    isSending = true,
+                    liveAgentStatusText = "Smart routing…",
+                    livePhaseStartMillis = routeStartMillis
+                )
+            }
         }
         val installedNames = InstalledAppCache.getCached().map { it.displayName }
         val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
@@ -1456,26 +1630,57 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             currentForegroundApp = currentForegroundApp
         )
         val routeElapsed = formatElapsed(System.currentTimeMillis() - routeStartMillis)
-        _uiState.update {
-            it.copy(
-                isSending = false,
-                liveAgentStatusText = "",
-                livePhaseStartMillis = 0L
-            )
+        if (activeUiSessionId == requestSessionId) {
+            _uiState.update {
+                it.copy(
+                    isSending = false,
+                    liveAgentStatusText = "",
+                    livePhaseStartMillis = 0L
+                )
+            }
         }
+        if (activeUiSessionId != requestSessionId) return
 
         when (routeResult) {
             is ToolRouteApiResult.Error -> {
-                handleChatOnlyDispatch(recentHistory, skipPreflight = true)
+                // If user asked for a clear device/app action and routing failed, don't answer with fake chat text
+                if (SmartIntentClassifier.isClearDeviceAction(userGoal)) {
+                    val fallbackPlanTool = HybridToolRouting.extractCompoundAppAndPrompt(userGoal)?.let {
+                        HybridToolRouting.buildOpenAppAndPromptToolCall(it.first, it.second)
+                    } ?: RoutedToolCall(
+                        tool = ToolName.UI_AUTOMATE,
+                        goal = userGoal,
+                        title = userGoal.take(56),
+                        steps = listOf("Execute requested action: ${userGoal.take(80)}"),
+                        riskLevel = RiskLevel.LOW,
+                        reason = "Direct action fallback"
+                    )
+                    dispatchRoutedToolCall(
+                        toolCall = fallbackPlanTool,
+                        userGoal = userGoal,
+                        planDurationLabel = "Smart · $routeElapsed",
+                        requestSessionId = requestSessionId
+                    )
+                } else {
+                    handleChatOnlyDispatch(recentHistory, skipPreflight = true, requestSessionId = requestSessionId)
+                }
             }
             is ToolRouteApiResult.Success -> {
                 if (routeResult.toolCall.tool == ToolName.REPLY_TO_USER) {
-                    handleChatOnlyDispatch(recentHistory, skipPreflight = true)
+                    handleChatOnlyDispatch(recentHistory, skipPreflight = true, requestSessionId = requestSessionId)
+                } else if (routeResult.toolCall.tool == ToolName.GENERATE_FILE) {
+                    handleFileGenerationDispatch(
+                        userGoal = routeResult.toolCall.query ?: userGoal,
+                        targetFormat = com.example.files.GeneratedFileFormat.fromString(routeResult.toolCall.label),
+                        messagesWithUser = recentHistory,
+                        requestSessionId = requestSessionId
+                    )
                 } else {
                     dispatchRoutedToolCall(
                         toolCall = routeResult.toolCall,
                         userGoal = userGoal,
-                        planDurationLabel = "Smart · $routeElapsed"
+                        planDurationLabel = "Smart · $routeElapsed",
+                        requestSessionId = requestSessionId
                     )
                 }
             }
@@ -1556,29 +1761,27 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun handleChatOnlyDispatch(
         messagesWithUser: List<ChatMessage>,
-        skipPreflight: Boolean = false
+        skipPreflight: Boolean = false,
+        requestSessionId: String = _uiState.value.sessionId
     ) {
         val state = _uiState.value
         val latestUserText = messagesWithUser.lastOrNull()?.text.orEmpty()
 
         if (!skipPreflight) {
-            // 1. Keep Safety Guardrail active even for SQL memory saves
             if (state.safetyRules.blockSensitiveFinancial) {
                 val violation = withContext(Dispatchers.Default) {
                     SafetyGuardrail.detectSensitiveViolation(latestUserText)
                 }
                 if (violation != null) {
-                    recordHardBlockedRequest(latestUserText, violation, messagesWithUser)
+                    recordHardBlockedRequest(latestUserText, violation, messagesWithUser, requestSessionId = requestSessionId)
                     return
                 }
             }
 
-            // 2. Direct on-device SQL memory / task commands ("Remember that...", "Add task...")
-            if (tryHandleDirectSqlIntent(latestUserText, modeTag = "CHAT") != null) {
+            if (tryHandleDirectSqlIntent(latestUserText, modeTag = "CHAT", requestSessionId = requestSessionId) != null) {
                 return
             }
 
-            // 2b. Executive on-device file generation (PDF / Excel / Word / CSV) works directly in Chat mode too
             val detectedFile = withContext(Dispatchers.Default) {
                 com.example.files.FileRequestDetector.detect(latestUserText)
             }
@@ -1586,7 +1789,8 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 handleFileGenerationDispatch(
                     userGoal = detectedFile.cleanGoal,
                     targetFormat = detectedFile.format,
-                    messagesWithUser = messagesWithUser
+                    messagesWithUser = messagesWithUser,
+                    requestSessionId = requestSessionId
                 )
                 return
             }
@@ -1601,13 +1805,15 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         if (state.isUsingBuiltInGemini || state.activeProvider == null) {
             val startMillis = System.currentTimeMillis()
             val searchEnabled = state.builtInGeminiSettings.googleSearchEnabled
-            _uiState.update {
-                it.copy(
-                    isSending = true,
-                    streamingAssistantText = "",
-                    liveAgentStatusText = if (searchEnabled) "Searching Google & thinking…" else "Thinking with Gemini…",
-                    livePhaseStartMillis = startMillis
-                )
+            if (activeUiSessionId == requestSessionId) {
+                _uiState.update {
+                    it.copy(
+                        isSending = true,
+                        streamingAssistantText = "",
+                        liveAgentStatusText = if (searchEnabled) "Searching Google & thinking…" else "Thinking with Gemini…",
+                        livePhaseStartMillis = startMillis
+                    )
+                }
             }
 
             val result = firebaseAiService.streamChat(
@@ -1619,7 +1825,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 voiceLanguage = state.voiceSettings.voiceLanguage,
                 isLiveVoice = false,
                 onPartialText = { partial ->
-                    _uiState.update { it.copy(streamingAssistantText = partial) }
+                    if (activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId) {
+                        _uiState.update { it.copy(streamingAssistantText = partial) }
+                    }
                 }
             )
 
@@ -1631,7 +1839,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         if (result.groundingSources.isNotEmpty()) append(" · Google Search")
                     }
                     sqlRepository.recordInteractionLog(
-                        sessionId = state.sessionId,
+                        sessionId = requestSessionId,
                         mode = "CHAT",
                         userPrompt = latestUserText,
                         agentResponse = result.text,
@@ -1668,7 +1876,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         ) {
                             is ChatApiResult.Success -> {
                                 sqlRepository.recordInteractionLog(
-                                    sessionId = state.sessionId,
+                                    sessionId = requestSessionId,
                                     mode = "CHAT",
                                     userPrompt = latestUserText,
                                     agentResponse = fallbackRes.reply,
@@ -1703,29 +1911,19 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
-            val updated = _uiState.value.chatMessages + replyMsg
-            _uiState.update {
-                it.copy(
-                    isSending = false,
-                    streamingAssistantText = "",
-                    liveAgentStatusText = "",
-                    livePhaseStartMillis = 0L,
-                    chatMessages = updated
+            val stillActive = commitSessionMessage(requestSessionId, replyMsg, clearSending = true)
+            if (stillActive) {
+                AgentSpeechFeedback.announceOutcome(
+                    context = appContext,
+                    message = replyMsg.text,
+                    isSuccess = !replyMsg.isError,
+                    voiceSettings = _uiState.value.voiceSettings,
+                    showToastWhenOutsideApp = false
                 )
             }
-            persistMessagesAndThread(updated)
-            AgentSpeechFeedback.announceOutcome(
-                context = appContext,
-                message = replyMsg.text,
-                isSuccess = !replyMsg.isError,
-                voiceSettings = _uiState.value.voiceSettings,
-                showToastWhenOutsideApp = false
-            )
             return
         }
 
-        // Custom Base URL + API Key provider path (preserved 100%, with Google Search Grounding for Gemini Native,
-        // temperature = 0.3 for OpenAI-compatible providers like Groq, and automatic Built-in Gemini fallback on 429)
         val provider = state.activeProvider!!
         val searchForGeminiNative = state.builtInGeminiSettings.googleSearchEnabled &&
             provider.apiFormat == ApiFormat.GEMINI_NATIVE
@@ -1736,13 +1934,15 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             isLiveVoice = false,
             hasLiveWebSearch = searchForGeminiNative
         )
-        _uiState.update {
-            it.copy(
-                isSending = true,
-                streamingAssistantText = "",
-                liveAgentStatusText = if (searchForGeminiNative) "Searching Google & thinking…" else "Thinking…",
-                livePhaseStartMillis = System.currentTimeMillis()
-            )
+        if (activeUiSessionId == requestSessionId) {
+            _uiState.update {
+                it.copy(
+                    isSending = true,
+                    streamingAssistantText = "",
+                    liveAgentStatusText = if (searchForGeminiNative) "Searching Google & thinking…" else "Thinking…",
+                    livePhaseStartMillis = System.currentTimeMillis()
+                )
+            }
         }
         val result = networkClient.sendChatMessage(
             provider = provider,
@@ -1754,7 +1954,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         val replyMsg = when (result) {
             is ChatApiResult.Success -> {
                 sqlRepository.recordInteractionLog(
-                    sessionId = state.sessionId,
+                    sessionId = requestSessionId,
                     mode = "CHAT",
                     userPrompt = latestUserText,
                     agentResponse = result.reply,
@@ -1783,13 +1983,15 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                         voiceLanguage = state.voiceSettings.voiceLanguage,
                         isLiveVoice = false,
                         onPartialText = { partial ->
-                            _uiState.update { it.copy(streamingAssistantText = partial) }
+                            if (activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId) {
+                                _uiState.update { it.copy(streamingAssistantText = partial) }
+                            }
                         }
                     )
                     when (geminiFallback) {
                         is GeminiStreamResult.Success -> {
                             sqlRepository.recordInteractionLog(
-                                sessionId = state.sessionId,
+                                sessionId = requestSessionId,
                                 mode = "CHAT",
                                 userPrompt = latestUserText,
                                 agentResponse = geminiFallback.text,
@@ -1818,24 +2020,16 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        val updated = _uiState.value.chatMessages + replyMsg
-        _uiState.update {
-            it.copy(
-                isSending = false,
-                streamingAssistantText = "",
-                liveAgentStatusText = "",
-                livePhaseStartMillis = 0L,
-                chatMessages = updated
+        val stillActive = commitSessionMessage(requestSessionId, replyMsg, clearSending = true)
+        if (stillActive) {
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = replyMsg.text,
+                isSuccess = !replyMsg.isError,
+                voiceSettings = _uiState.value.voiceSettings,
+                showToastWhenOutsideApp = false
             )
         }
-        persistMessagesAndThread(updated)
-        AgentSpeechFeedback.announceOutcome(
-            context = appContext,
-            message = replyMsg.text,
-            isSuccess = !replyMsg.isError,
-            voiceSettings = _uiState.value.voiceSettings,
-            showToastWhenOutsideApp = false
-        )
     }
 
     private suspend fun handleOnDeviceAgentPlan(
@@ -1966,14 +2160,15 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         userGoal: String,
         violation: String,
         messagesWithUser: List<ChatMessage>,
-        plan: ActionPlan? = null
+        plan: ActionPlan? = null,
+        requestSessionId: String = _uiState.value.sessionId
     ) {
         val actionId = plan?.actionId ?: UUID.randomUUID().toString()
         val blockedText = "Blocked on-device by your Safety Guardrail ($violation). Banking, UPI, OTP, and password actions are hard-blocked while this protection is ON in Settings."
         val blockedMsg = ChatMessage(
             sender = MessageSender.AGENT,
             text = blockedText,
-            actionPlan = plan?.copy(riskLevel = RiskLevel.HIGH),
+            actionPlan = plan?.copy(riskLevel = RiskLevel.HIGH, sessionId = requestSessionId),
             isBlockedBySafety = true,
             blockedReason = violation,
             approvalStatus = ApprovalStatus.BLOCKED,
@@ -1987,25 +2182,31 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             status = ApprovalStatus.BLOCKED,
             notes = "Blocked by on-device financial/credential guardrail."
         )
-        val nextMessages = messagesWithUser + blockedMsg
         val nextApprovals = listOf(blockedRecord) + _uiState.value.approvalHistory
-        _uiState.update {
-            it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
+        if (activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId) {
+            val nextMessages = messagesWithUser + blockedMsg
+            _uiState.update {
+                it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
+            }
+            persistMessagesAndThread(nextMessages, nextApprovals, targetSessionId = requestSessionId, messagesToUpsert = listOf(blockedMsg))
+            AgentSpeechFeedback.announceOutcome(
+                context = appContext,
+                message = blockedText,
+                isSuccess = false,
+                voiceSettings = _uiState.value.voiceSettings,
+                showToastWhenOutsideApp = false
+            )
+        } else {
+            sqlRepository.saveMessagesToSession(requestSessionId, listOf(blockedMsg))
+            storage.saveApprovalHistory(nextApprovals)
         }
-        persistMessagesAndThread(nextMessages, nextApprovals)
-        AgentSpeechFeedback.announceOutcome(
-            context = appContext,
-            message = blockedText,
-            isSuccess = false,
-            voiceSettings = _uiState.value.voiceSettings,
-            showToastWhenOutsideApp = false
-        )
     }
 
     private suspend fun dispatchRoutedToolCall(
         toolCall: RoutedToolCall,
         userGoal: String,
-        planDurationLabel: String
+        planDurationLabel: String,
+        requestSessionId: String = _uiState.value.sessionId
     ): ActionPlan? {
         val state = _uiState.value
 
@@ -2018,16 +2219,16 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 sender = MessageSender.AGENT,
                 text = warmReply
             )
-            val nextMessages = _uiState.value.chatMessages + replyMsg
-            _uiState.update { it.copy(chatMessages = nextMessages) }
-            persistMessagesAndThread(nextMessages)
-            AgentSpeechFeedback.announceOutcome(
-                context = appContext,
-                message = warmReply,
-                isSuccess = true,
-                voiceSettings = state.voiceSettings,
-                showToastWhenOutsideApp = false
-            )
+            val stillActive = commitSessionMessage(requestSessionId, replyMsg, clearSending = true)
+            if (stillActive) {
+                AgentSpeechFeedback.announceOutcome(
+                    context = appContext,
+                    message = warmReply,
+                    isSuccess = true,
+                    voiceSettings = state.voiceSettings,
+                    showToastWhenOutsideApp = false
+                )
+            }
             return null
         }
 
@@ -2037,6 +2238,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                 SafetyGuardrail.detectSensitiveViolation(
                     toolCall.title,
                     toolCall.appName,
+                    toolCall.promptText,
                     toolCall.query,
                     toolCall.messageText,
                     toolCall.targetText,
@@ -2050,9 +2252,10 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     title = toolCall.title.ifBlank { userGoal.take(56) },
                     riskLevel = RiskLevel.HIGH,
                     steps = toolCall.steps,
-                    routedToolJson = toolCall.toJsonString()
+                    routedToolJson = toolCall.toJsonString(),
+                    sessionId = requestSessionId
                 )
-                recordHardBlockedRequest(userGoal, violation, _uiState.value.chatMessages, blockedPlan)
+                recordHardBlockedRequest(userGoal, violation, _uiState.value.chatMessages, blockedPlan, requestSessionId = requestSessionId)
                 return null
             }
         }
@@ -2063,13 +2266,10 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             riskLevel = toolCall.riskLevel,
             steps = toolCall.steps.ifEmpty { listOf(toolCall.reason.ifBlank { userGoal.take(80) }) },
             isDemo = false,
-            routedToolJson = toolCall.toJsonString()
+            routedToolJson = toolCall.toJsonString(),
+            sessionId = requestSessionId
         )
 
-        // Approval Policy:
-        // - LOW and MEDIUM risk actions auto-run without approval (when autoRunLowAndMediumRisk is enabled).
-        // - HIGH risk actions ALWAYS require an Approval Card.
-        // - Financial/UPI/OTP/password actions remain hard-blocked above.
         val shouldAutoRun = toolCall.shouldAutoRun(state.safetyRules)
 
         val initialStatus = if (shouldAutoRun) ApprovalStatus.RUNNING else ApprovalStatus.PENDING
@@ -2092,12 +2292,22 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             steps = plan.steps,
             status = initialStatus
         )
-        val nextMessages = _uiState.value.chatMessages + cardMsg
         val nextApprovals = listOf(record) + _uiState.value.approvalHistory
-        _uiState.update {
-            it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
+        if (activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId) {
+            val nextMessages = _uiState.value.chatMessages + cardMsg
+            _uiState.update {
+                it.copy(chatMessages = nextMessages, approvalHistory = nextApprovals)
+            }
+            persistMessagesAndThread(
+                messages = nextMessages,
+                approvals = nextApprovals,
+                targetSessionId = requestSessionId,
+                messagesToUpsert = listOf(cardMsg)
+            )
+        } else {
+            sqlRepository.saveMessagesToSession(requestSessionId, listOf(cardMsg))
+            storage.saveApprovalHistory(nextApprovals)
         }
-        persistMessagesAndThread(nextMessages, nextApprovals)
 
         if (shouldAutoRun) {
             executeRoutedToolPlan(plan, toolCall)
@@ -2334,22 +2544,55 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // Immediate spoken acknowledgment when multi-step/phone commands start
+        // Immediate spoken acknowledgment when multi-step/phone commands start (never before calls or media)
         if (voiceSettings.speakRepliesAloud &&
-            toolCall.tool !in setOf(ToolName.BOOK_RIDE, ToolName.PLAY_YOUTUBE_VIDEO, ToolName.SEND_MESSAGE)
-        ) {
-            AgentSpeechFeedback.speak(
-                context = appContext,
-                text = HybridToolRouting.buildImmediateAckPhrase(toolCall),
-                voiceSettings = voiceSettings
+            toolCall.tool !in setOf(
+                ToolName.BOOK_RIDE,
+                ToolName.PLAY_YOUTUBE_VIDEO,
+                ToolName.SEND_MESSAGE,
+                ToolName.OPEN_APP_AND_DO,
+                ToolName.OPEN_APP_AND_PROMPT,
+                ToolName.CALL_CONTACT
             )
+        ) {
+            val ack = HybridToolRouting.buildImmediateAckPhrase(toolCall)
+            if (ack.isNotBlank()) {
+                AgentSpeechFeedback.speak(
+                    context = appContext,
+                    text = ack,
+                    voiceSettings = voiceSettings
+                )
+            }
         }
 
         try {
             val activeService = service!!
-            val mergedHistory = ConversationRepository.mergeWithPersisted(_uiState.value.chatMessages)
+            val mergedHistory = ConversationRepository.mergeWithPersisted(_uiState.value.chatMessages, sessionId = plan.sessionId.ifBlank { _uiState.value.sessionId })
 
             when (toolCall.tool) {
+                ToolName.OPEN_APP_AND_DO, ToolName.OPEN_APP_AND_PROMPT -> {
+                    val targetApp = toolCall.appName?.takeIf { it.isNotBlank() } ?: "App"
+                    val goal = toolCall.goal?.takeIf { it.isNotBlank() }
+                        ?: toolCall.promptText?.takeIf { it.isNotBlank() }
+                        ?: toolCall.query?.takeIf { it.isNotBlank() }
+                        ?: plan.title
+                    updateActionStatus(
+                        actionId = plan.actionId,
+                        status = ApprovalStatus.RUNNING,
+                        completedSteps = 0,
+                        activeStep = 0,
+                        persistNow = true
+                    )
+                    activeService.startOpenAppAndDo(
+                        plan = plan,
+                        appName = targetApp,
+                        goal = goal,
+                        provider = effectiveProvider,
+                        blockSensitive = blockSensitive,
+                        conversationHistory = mergedHistory
+                    )
+                }
+
                 ToolName.BOOK_RIDE -> {
                     updateActionStatus(
                         actionId = plan.actionId,
@@ -2571,22 +2814,31 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startNewChat() {
+        activeGenerationJob?.cancel()
+        activeGenerationJob = null
         if (_uiState.value.isAgentLoopRunning) {
             stopRunningAgent()
         }
+        val newSession = UUID.randomUUID().toString()
+        activeUiSessionId = newSession
+        ConversationRepository.resetSessionExplicitly(newSession, emptyList())
         _uiState.update {
             it.copy(
                 destination = AppDestination.CHAT,
+                sessionId = newSession,
                 chatMessages = emptyList(),
+                hasMoreOlderMessages = false,
+                isLoadingOlderMessages = false,
+                streamingAssistantText = "",
+                liveAgentStatusText = "",
+                livePhaseStartMillis = 0L,
                 memorySuggestions = emptyMap(),
                 livePendingApprovalPlan = null,
                 isSending = false
             )
         }
         viewModelScope.launch {
-            val newSession = storage.startNewChatSession()
-            ConversationRepository.resetSessionExplicitly(newSession, emptyList())
-            _uiState.update { it.copy(sessionId = newSession) }
+            storage.startNewChatSession(newSession)
         }
     }
 
@@ -2648,16 +2900,19 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
         userGoal: String,
         targetFormat: com.example.files.GeneratedFileFormat,
         messagesWithUser: List<ChatMessage>,
-        announceViaSpeech: Boolean = true
+        announceViaSpeech: Boolean = true,
+        requestSessionId: String = _uiState.value.sessionId
     ): Boolean {
         val state = _uiState.value
         val startMillis = System.currentTimeMillis()
-        _uiState.update {
-            it.copy(
-                isSending = true,
-                liveAgentStatusText = "Designing ${targetFormat.badgeLabel} blueprint…",
-                livePhaseStartMillis = startMillis
-            )
+        if (activeUiSessionId == requestSessionId) {
+            _uiState.update {
+                it.copy(
+                    isSending = true,
+                    liveAgentStatusText = "Designing ${targetFormat.badgeLabel} blueprint…",
+                    livePhaseStartMillis = startMillis
+                )
+            }
         }
 
         val sqlContext = if (state.builtInGeminiSettings.injectSqlMemory) {
@@ -2682,7 +2937,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             conversationContext = recentContext,
             personalMemoryContext = sqlContext,
             onStatusUpdate = { status ->
-                _uiState.update { it.copy(liveAgentStatusText = status) }
+                if (activeUiSessionId == requestSessionId && _uiState.value.sessionId == requestSessionId) {
+                    _uiState.update { it.copy(liveAgentStatusText = status) }
+                }
             }
         )
 
@@ -2696,25 +2953,16 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     modelBadge = "${result.format.badgeLabel} Export",
                     generatedFile = result.attachment
                 )
-                val updated = _uiState.value.chatMessages + replyMsg
-                _uiState.update {
-                    it.copy(
-                        chatMessages = updated,
-                        isSending = false,
-                        liveAgentStatusText = "",
-                        livePhaseStartMillis = 0L
-                    )
-                }
-                persistMessagesAndThread(updated)
+                val stillActive = commitSessionMessage(requestSessionId, replyMsg, clearSending = true)
                 sqlRepository.recordInteractionLog(
-                    sessionId = _uiState.value.sessionId,
+                    sessionId = requestSessionId,
                     mode = "FILE_GEN",
                     userPrompt = userGoal,
                     agentResponse = "Generated ${result.attachment.fileName}",
                     toolUsed = ToolName.GENERATE_FILE,
                     usedGoogleSearch = false
                 )
-                if (announceViaSpeech) {
+                if (announceViaSpeech && stillActive) {
                     AgentSpeechFeedback.announceOutcome(
                         context = appContext,
                         message = "Yes, completed! Your ${result.format.spokenLabel} file is ready.",
@@ -2733,16 +2981,7 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
                     isError = true,
                     excludeFromContext = true
                 )
-                val updated = _uiState.value.chatMessages + errMsg
-                _uiState.update {
-                    it.copy(
-                        chatMessages = updated,
-                        isSending = false,
-                        liveAgentStatusText = "",
-                        livePhaseStartMillis = 0L
-                    )
-                }
-                persistMessagesAndThread(updated)
+                commitSessionMessage(requestSessionId, errMsg, clearSending = true)
                 false
             }
         }
@@ -2772,5 +3011,9 @@ class AgentViewModel(application: Application) : AndroidViewModel(application) {
             .onFailure { err ->
                 showMessage("Could not share file: ${err.localizedMessage ?: "Share error"}")
             }
+    }
+
+    companion object {
+        private const val PAGE_SIZE = 30
     }
 }

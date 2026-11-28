@@ -87,11 +87,27 @@ object AgentSpeechFeedback {
     private val _usingNeuralVoiceNow = MutableStateFlow(false)
     val usingNeuralVoiceNow: StateFlow<Boolean> = _usingNeuralVoiceNow.asStateFlow()
 
+    @Volatile
+    private var lastSpokenNormalized: String = ""
+
+    @Volatile
+    private var lastSpokenTimestampMs: Long = 0L
+
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        ) {
+            stopSpeaking()
+        }
+    }
+
     fun updateCachedSettings(settings: VoiceSettings) {
         lastKnownSettings = settings
     }
 
-    fun playWakeChime() {
+    fun playWakeChime(context: Context? = null) {
+        if (context != null && AudioSilenceGuard.shouldMuteNow(context) != null) return
         runCatching {
             val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
             toneGen.startTone(ToneGenerator.TONE_PROP_BEEP2, 160)
@@ -174,12 +190,37 @@ object AgentSpeechFeedback {
         onDone: (() -> Unit)? = null
     ) {
         lastKnownSettings = voiceSettings
+        val appCtx = context.applicationContext
+        AudioSilenceGuard.registerAudioStateWatchers(appCtx)
+
+        val silenceReason = AudioSilenceGuard.shouldMuteNow(appCtx)
+        if (silenceReason != null) {
+            Log.d(VOICE_ENGINE_TAG, "TTS muted by AudioSilenceGuard ($silenceReason)")
+            stopSpeaking()
+            if (onDone != null) mainHandler.post { onDone() }
+            return
+        }
+
         val chunks = SpeechTextCleaner.splitIntoSpeakableChunks(text)
         if (chunks.isEmpty()) {
             if (onDone != null) mainHandler.post { onDone() }
             return
         }
-        beginSpeechStream(context, voiceSettings, onDone)
+
+        // Deduplicate rapid repeated utterances so the agent never repeats itself
+        val normalizedUtterance = chunks.joinToString(" ").trim().lowercase()
+        val now = System.currentTimeMillis()
+        if (normalizedUtterance.isNotBlank() &&
+            normalizedUtterance == lastSpokenNormalized &&
+            (now - lastSpokenTimestampMs) < 2_500L
+        ) {
+            if (onDone != null) mainHandler.post { onDone() }
+            return
+        }
+        lastSpokenNormalized = normalizedUtterance
+        lastSpokenTimestampMs = now
+
+        beginSpeechStream(appCtx, voiceSettings, onDone)
         chunks.forEach { enqueueSentence(it) }
         finishSpeechStream()
     }
@@ -194,10 +235,20 @@ object AgentSpeechFeedback {
         onAllDone: (() -> Unit)? = null
     ) {
         lastKnownSettings = voiceSettings
+        val appCtx = context.applicationContext
+        AudioSilenceGuard.registerAudioStateWatchers(appCtx)
+
+        val silenceReason = AudioSilenceGuard.shouldMuteNow(appCtx)
+        if (silenceReason != null) {
+            Log.d(VOICE_ENGINE_TAG, "Speech stream blocked by AudioSilenceGuard ($silenceReason)")
+            stopSpeaking()
+            if (onAllDone != null) mainHandler.post { onAllDone() }
+            return
+        }
+
         stopSpeakingInternal(abandonFocus = false)
 
         val mySessionId = sessionCounter.incrementAndGet()
-        val appCtx = context.applicationContext
         val channel = Channel<String>(Channel.UNLIMITED)
         activeSentenceChannel = channel
         requestAudioFocus(appCtx)
@@ -250,10 +301,17 @@ object AgentSpeechFeedback {
                     val synthesized = runCatching { audioDeferred.await() }.getOrNull()
                     if (!isActive || sessionCounter.get() != mySessionId) break
 
+                    // Re-check AudioSilenceGuard right before emitting audio in case a call/video started mid-synthesis
+                    if (AudioSilenceGuard.shouldMuteNow(appCtx) != null) {
+                        stopSpeakingInternal(abandonFocus = true)
+                        break
+                    }
+
                     if (synthesized != null) {
                         _usingNeuralVoiceNow.value = true
                         _isSpeaking.value = true
                         playPcmAudioWithEnergy(
+                            context = appCtx,
                             audio = synthesized,
                             speechRate = voiceSettings.speechRate,
                             sessionId = mySessionId
@@ -263,6 +321,7 @@ object AgentSpeechFeedback {
                         val ready = runCatching { ttsWarmup.await() }.getOrDefault(false)
                         if (ready && isActive && sessionCounter.get() == mySessionId) {
                             speakWithOnDeviceTts(
+                                context = appCtx,
                                 text = sentence,
                                 voiceSettings = voiceSettings,
                                 sessionId = mySessionId
@@ -314,10 +373,12 @@ object AgentSpeechFeedback {
     }
 
     private suspend fun playPcmAudioWithEnergy(
+        context: Context,
         audio: SynthesizedAudio,
         speechRate: Float,
         sessionId: Long
     ) = withContext(Dispatchers.IO) {
+        if (AudioSilenceGuard.shouldMuteNow(context) != null) return@withContext
         val effectiveSampleRate = (audio.sampleRateHz * speechRate.coerceIn(0.85f, 1.3f))
             .toInt()
             .coerceIn(8_000, 48_000)
@@ -355,7 +416,12 @@ object AgentSpeechFeedback {
             val bytesPerChunk = ((effectiveSampleRate * 2) / 33).coerceIn(640, 4096) and 0xFFFFFFFE.toInt()
             var offset = 0
             val total = audio.pcmBytes.size
+            var chunkCount = 0
             while (offset < total && isActive && sessionCounter.get() == sessionId) {
+                if (chunkCount % 6 == 0 && AudioSilenceGuard.shouldMuteNow(context) != null) {
+                    break
+                }
+                chunkCount++
                 val len = minOf(bytesPerChunk, total - offset)
                 val energy = computeNormalizedPcmEnergy(audio.pcmBytes, offset, len)
                 _playbackEnergy.value = energy
@@ -407,10 +473,12 @@ object AgentSpeechFeedback {
     }
 
     private suspend fun speakWithOnDeviceTts(
+        context: Context,
         text: String,
         voiceSettings: VoiceSettings,
         sessionId: Long
     ) {
+        if (AudioSilenceGuard.shouldMuteNow(context) != null) return
         val engine = tts ?: return
         val targetLang = SpeechTextCleaner.resolveEffectiveLanguage(text, voiceSettings.voiceLanguage)
         val locale = Locale.forLanguageTag(targetLang.bcp47Tag)
@@ -513,13 +581,14 @@ object AgentSpeechFeedback {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener, mainHandler)
                     .build()
                 activeFocusRequest = req
                 am.requestAudioFocus(req)
             } else {
                 @Suppress("DEPRECATION")
                 am.requestAudioFocus(
-                    null,
+                    audioFocusChangeListener,
                     AudioManager.STREAM_MUSIC,
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                 )
@@ -535,7 +604,7 @@ object AgentSpeechFeedback {
                 activeFocusRequest = null
             } else {
                 @Suppress("DEPRECATION")
-                am.abandonAudioFocus(null)
+                am.abandonAudioFocus(audioFocusChangeListener)
             }
         }
     }
@@ -551,8 +620,32 @@ object AgentSpeechFeedback {
         val cleaned = message.trim()
         if (cleaned.isBlank()) return
 
+        val appCtx = context.applicationContext
+        val silenceReason = AudioSilenceGuard.shouldMuteNow(appCtx)
+
+        if (silenceReason != null) {
+            // Quiet visual fallback: never talk over calls, media, silent/vibrate, DND, or active mic
+            stopSpeaking()
+            val quietToast = if (isSuccess) "✓ Done" else cleaned.take(90)
+            mainHandler.post {
+                runCatching {
+                    Toast.makeText(appCtx, quietToast, Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
+
         if (voiceSettings.speakRepliesAloud) {
-            speak(context, cleaned, voiceSettings)
+            val preferTelugu = voiceSettings.voiceLanguage == VoiceLanguage.TE_IN ||
+                SpeechTextCleaner.containsTeluguScript(cleaned)
+            val conciseSpoken = ConfirmationFormatter.formatShortSpokenConfirmation(
+                rawMessage = cleaned,
+                isSuccess = isSuccess,
+                preferTelugu = preferTelugu
+            )
+            if (conciseSpoken.isNotBlank()) {
+                speak(appCtx, conciseSpoken, voiceSettings)
+            }
         }
 
         if (showToastWhenOutsideApp && !isMainAppInForeground) {
@@ -561,13 +654,13 @@ object AgentSpeechFeedback {
                     .removePrefix("Yes, completed!")
                     .removePrefix("Yes, completed:")
                     .trim()
-                if (withoutPrefix.isNotBlank()) "✓ Yes, completed: $withoutPrefix" else "✓ Yes, completed!"
+                if (withoutPrefix.isNotBlank()) "✓ Done: $withoutPrefix" else "✓ Done"
             } else {
                 cleaned
             }
             mainHandler.post {
                 runCatching {
-                    Toast.makeText(context.applicationContext, toastText.take(140), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(appCtx, toastText.take(140), Toast.LENGTH_SHORT).show()
                 }
             }
         }
